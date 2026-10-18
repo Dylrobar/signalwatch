@@ -55,6 +55,73 @@ class ApiContractTests(unittest.TestCase):
         self.assertNotIn("private-nvd-value", result)
         self.assertNotIn("private-github-value", result)
 
+    def test_company_profile_creation_edit_search_and_collector_refresh(self):
+        profile = {"name": "Profile API Research", "legal_name": "Profile API Research Limited",
+                   "aliases": ["  Profile Alias  ", "Profile Alias"], "brands": ["Profile Brand"],
+                   "notes": "Identity supplied from a corporate page", "source_url": "https://profile-api.example/legal"}
+        created = self.request("/api/companies/profile", profile)
+        company_id = created["id"]
+        self.assertEqual(created["kind"], "company")
+        self.assertEqual(created["company_profile"]["aliases"], ["Profile Alias"])
+        self.assertEqual(created["company_profile"]["legal_name"], profile["legal_name"])
+        self.assertIn(company_id, [row["id"] for row in self.request("/api/search?kind=company&q=Profile%20Alias")["items"]])
+        store = Store(self.root / "monitor.db")
+        store.ingest({"entities": [{"id": company_id, "kind": "company", "name": "Collected label", "metadata": {"wikidata": "Q123"}}]})
+        detail = self.request("/api/entity?id=" + company_id)
+        self.assertEqual(detail["name"], profile["name"])
+        self.assertEqual(detail["company_profile"]["notes"], profile["notes"])
+        parent = self.request("/api/companies/profile", {"name": "Profile Parent"})
+        edited = self.request("/api/companies/profile", {**profile, "company_id": company_id, "parent_company_id": parent["id"]})
+        self.assertEqual(edited["company_profile"]["parent_company"]["id"], parent["id"])
+        self.assertIn(company_id, [row["id"] for row in self.request("/api/entity?id=" + parent["id"])["company_profile"]["subsidiaries"]])
+
+    def test_company_asset_decisions_rollup_and_queue_scope(self):
+        company = self.request("/api/companies/profile", {"name": "Asset Decision API"})
+        company_id = company["id"]
+        store = Store(self.root / "monitor.db")
+        self.request("/api/observations", {"asset_url": "https://asset-decision-api.example", "vendor": "decision-api",
+                                           "product": "service", "version": "1.0", "evidence": "Supplied version record"})
+        decision = {"company_id": company_id, "asset_url": "https://asset-decision-api.example/", "status": "candidate",
+                    "role": "owned", "evidence": "Corporate inventory entry", "source_url": "https://asset-decision-api.example/legal"}
+        candidate = self.request("/api/companies/assets", decision)
+        self.assertFalse(candidate["company_profile"]["assets"][0]["included"])
+        self.assertEqual(candidate["observations"], [])
+        with store.connection() as conn:
+            self.assertIsNone(conn.execute("SELECT url FROM crawl_urls WHERE company_id=?", (company_id,)).fetchone())
+        confirmed = self.request("/api/companies/assets", {**decision, "status": "confirmed"})
+        self.assertTrue(confirmed["company_profile"]["assets"][0]["included"])
+        self.assertEqual(len(confirmed["observations"]), 1)
+        with store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT url FROM crawl_urls WHERE company_id=?", (company_id,)).fetchone()[0], decision["asset_url"])
+        rejected = self.request("/api/companies/assets", {**decision, "status": "rejected", "evidence": "Incorrect corporate association"})
+        self.assertEqual(rejected["observations"], [])
+        self.assertEqual(rejected["company_profile"]["assets"][0]["status"], "rejected")
+        reset = self.request("/api/companies/assets", {"company_id": company_id, "asset_url": decision["asset_url"], "status": "automatic"})
+        self.assertEqual(reset["company_profile"]["assets"], [])
+        service = self.request("/api/companies/assets", {**decision, "asset_url": "https://service-decision-api.example/", "role": "service", "status": "confirmed"})
+        self.assertFalse(service["company_profile"]["assets"][0]["included"])
+        with store.connection() as conn:
+            self.assertIsNone(conn.execute("SELECT url FROM crawl_urls WHERE url='https://service-decision-api.example/'").fetchone())
+
+    def test_invalid_company_inputs_return_client_errors_without_creating_records(self):
+        company = self.request("/api/companies/profile", {"name": "Validation API Company"})
+        cases = [
+            ("/api/companies/profile", {"name": "  "}, 422),
+            ("/api/companies/profile", {"name": "Invalid", "source_url": "file:///etc/passwd"}, 400),
+            ("/api/companies/profile", {"name": "Missing", "company_id": "company:missing-profile-api"}, 404),
+            ("/api/companies/profile", {"name": "Invalid", "company_id": company["id"], "parent_company_id": company["id"]}, 400),
+            ("/api/companies/assets", {"company_id": company["id"], "asset_url": "https://validation-api.example"}, 400),
+            ("/api/companies/assets", {"company_id": company["id"], "asset_url": "file:///etc/passwd", "status": "automatic"}, 400),
+            ("/api/companies/assets", {"company_id": company["id"], "asset_url": "https://validation-api.example", "status": "invalid"}, 422),
+        ]
+        store = Store(self.root / "monitor.db")
+        before = store.stats()
+        for path, payload, expected in cases:
+            with self.subTest(payload=payload), self.assertRaises(urllib.error.HTTPError) as raised:
+                self.request(path, payload)
+            self.assertEqual(raised.exception.code, expected)
+        self.assertEqual(store.stats(), before)
+
     def test_status_exposes_persisted_retry_time_without_clearing_source_error(self):
         store = Store(self.root / "monitor.db")
         retry_at = "2199-01-01T00:00:00+00:00"

@@ -20,6 +20,7 @@ type Props = {
   onChange: (patch: Partial<View>, replace?: boolean) => void;
   onOpen: (row: R, tab: DataTab) => void;
   onCollectors: () => void;
+  onCreateCompany: () => void;
 };
 
 function advisoryTitle(item: R) {
@@ -101,7 +102,15 @@ function headers(tab: DataTab, sort: string) {
   }
 }
 
-export function ListView({ view, gen, stats, onChange, onOpen, onCollectors }: Props) {
+export function ListView({
+  view,
+  gen,
+  stats,
+  onChange,
+  onOpen,
+  onCollectors,
+  onCreateCompany,
+}: Props) {
   const tab = view.tab as DataTab;
   const cfg = VIEWS[tab];
   const [q, setQ] = useState(view.q);
@@ -218,6 +227,11 @@ export function ListView({ view, gen, stats, onChange, onOpen, onCollectors }: P
                 Known exploited only
               </label>
             </>
+          )}
+          {tab === "infrastructure" && (
+            <button type="button" className="sw-btn-primary" onClick={onCreateCompany}>
+              Add company
+            </button>
           )}
           <button type="button" className="sw-btn" onClick={() => query.refetch()} disabled={query.isFetching}>
             <RefreshCw className={`h-3.5 w-3.5 ${query.isFetching ? "animate-spin" : ""}`} aria-hidden /> Refresh

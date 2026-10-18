@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .config import VERSION
 from .engine import Engine, now
@@ -59,6 +59,35 @@ class SBOMRequest(BaseModel):
     asset_url: str
     source_key: str = Field(default="default", min_length=1, max_length=200)
     document: dict
+
+
+class CompanyProfileRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    company_id: str = Field(default="", max_length=300)
+    name: str = Field(min_length=1, max_length=200)
+    legal_name: str = Field(default="", max_length=300)
+    aliases: list[str] = Field(default_factory=list, max_length=50)
+    brands: list[str] = Field(default_factory=list, max_length=50)
+    parent_company_id: str = Field(default="", max_length=300)
+    notes: str = Field(default="", max_length=10000)
+    source_url: str = Field(default="", max_length=2000)
+
+    @field_validator("aliases", "brands")
+    @classmethod
+    def labels(cls, values):
+        if any(len(value) > 200 for value in values):
+            raise ValueError("Each alias or brand must be at most 200 characters")
+        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+class CompanyAssetRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    company_id: str = Field(min_length=1, max_length=300)
+    asset_url: str = Field(min_length=1, max_length=2000)
+    status: Literal["confirmed", "candidate", "rejected", "automatic"] = "confirmed"
+    role: Literal["owned", "service"] = "owned"
+    evidence: str = Field(default="", max_length=10000)
+    source_url: str = Field(default="", max_length=2000)
 
 
 def compact_records(result):
@@ -193,6 +222,36 @@ def create_app(config, auto_collect=True):
         tasks.add(task)
         task.add_done_callback(collection_done)
         return {"queued": True, "sources": names}
+
+    @app.post("/api/companies/profile")
+    def save_company_profile(request: CompanyProfileRequest):
+        values = request.model_dump()
+        try:
+            if values["source_url"]:
+                values["source_url"] = public_url(values["source_url"])
+            return store.save_company_profile(**values)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/companies/assets")
+    def set_company_asset(request: CompanyAssetRequest):
+        values = request.model_dump()
+        try:
+            values["asset_url"] = public_url(values["asset_url"])
+            if values["status"] != "automatic" and (not values["evidence"] or not values["source_url"]):
+                raise ValueError("An evidence description and source URL are required for asset decisions")
+            if values["source_url"]:
+                values["source_url"] = public_url(values["source_url"])
+            result = store.set_company_asset(**values)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if values["status"] == "confirmed" and values["role"] == "owned":
+            store.enqueue_url(values["asset_url"], source_url=values["source_url"], company_id=request.company_id)
+        return result
 
     @app.post("/api/seeds")
     def seeds(request: SeedRequest):

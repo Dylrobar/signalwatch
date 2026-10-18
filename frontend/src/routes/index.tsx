@@ -154,7 +154,7 @@ function App() {
         ) : view.tab === "collectors" ? (
           <Collectors key={conn.gen} status={d!} refresh={() => status.refetch()} />
         ) : (
-          <ListView key={`${conn.gen}:${view.tab}`} view={view} gen={conn.gen} stats={stats} onChange={change} onOpen={(row, tab) => setDrawer({ row, tab })} onCollectors={() => goTab("collectors")} />
+          <ListView key={`${conn.gen}:${view.tab}`} view={view} gen={conn.gen} stats={stats} onChange={change} onOpen={(row, tab) => setDrawer({ row, tab })} onCollectors={() => goTab("collectors")} onCreateCompany={() => setDrawer({ row: { kind: "company", new_company: true }, tab: "infrastructure" })} />
         )}
       </main>
       <footer className="mx-auto flex max-w-[1400px] flex-wrap justify-between gap-2 px-3 pb-6 text-xs text-muted-foreground sm:px-6">

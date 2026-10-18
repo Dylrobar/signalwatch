@@ -119,6 +119,8 @@ class RemoteApiTests(unittest.TestCase):
             "/api/sources/feed": {"name": "Unauthorized", "url": "https://unauthorized.example/feed"},
             "/api/observations": {"asset_url": "https://unauthorized.example", "vendor": "x", "product": "x", "evidence": "x"},
             "/api/import/sbom": {"asset_url": "https://unauthorized.example", "document": {"bomFormat": "CycloneDX", "specVersion": "1.7", "components": []}},
+            "/api/companies/profile": {"name": "Unauthorized"},
+            "/api/companies/assets": {"company_id": "company:unauthorized", "asset_url": "https://unauthorized.example", "status": "automatic"},
         }
         store = Store(self.server.root / "test.db")
         before = store.stats()

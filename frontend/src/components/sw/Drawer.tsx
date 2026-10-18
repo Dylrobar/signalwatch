@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "@/lib/api";
@@ -5,6 +6,8 @@ import { confidence, describe, fmtDate, host, humanize, num, percent, present, s
 import { EVENT_KINDS, type DataTab } from "@/lib/views";
 import { Badge, EventBadge, ExtLink, Severity, Signals } from "./bits";
 import { Modal } from "./Modal";
+import { CompanyIdentityForm, CompanyProfile } from "./CompanyProfile";
+import type { CompanyProfile as Profile } from "@/lib/companies";
 
 type Kind = "intelligence" | "news" | "infrastructure" | "warnings" | "changes" | "unavailable";
 type Frame = { kind: Kind; row: R; detail?: R; loading: boolean; error?: string; id?: string; originalUrl?: string; request?: { path: string; id: string } };
@@ -33,6 +36,7 @@ function merged(f: Frame): R {
 }
 
 export function Drawer({ initial, onClose }: { initial: { row: R; tab: DataTab } | null; onClose: () => void }) {
+  const qc = useQueryClient();
   const [stack, setStack] = useState<Frame[]>([]);
   const ctrl = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -104,7 +108,31 @@ export function Drawer({ initial, onClose }: { initial: { row: R; tab: DataTab }
   };
 
   const top = stack[stack.length - 1];
-  const label = top ? KIND_LABEL[top.kind] : "Details";
+  const label = top?.row["new_company"]
+    ? "Add company"
+    : top?.detail?.["company_profile"]
+      ? "Company profile"
+      : top
+        ? KIND_LABEL[top.kind]
+        : "Details";
+  const saved = (detail: R) => {
+    setStack((s) =>
+      s[s.length - 1] === top
+        ? [
+            ...s.slice(0, -1),
+            {
+              kind: "infrastructure",
+              row: { id: detail["id"], kind: "company" },
+              id: String(detail["id"]),
+              detail,
+              loading: false,
+            },
+          ]
+        : s,
+    );
+    qc.invalidateQueries({ queryKey: ["list"] });
+    qc.invalidateQueries({ queryKey: ["status"] });
+  };
 
   return (
     <Modal open={Boolean(initial)} onClose={onClose} label={`${label} details`} variant="drawer">
@@ -120,7 +148,15 @@ export function Drawer({ initial, onClose }: { initial: { row: R; tab: DataTab }
         </button>
       </div>
       <div ref={scrollRef} className="sw-section min-w-0 flex-1 overflow-y-auto px-4 pb-8 pt-3 text-sm [overflow-wrap:anywhere]">
-        {top && <FrameBody frame={top} go={go} openWarning={openWarning} />}
+        {top && (
+          <FrameBody
+            key={top.id ?? "new-company"}
+            frame={top}
+            go={go}
+            openWarning={openWarning}
+            onSaved={saved}
+          />
+        )}
       </div>
     </Modal>
   );
@@ -137,7 +173,13 @@ const KIND_LABEL: Record<Kind, string> = {
 
 type Nav = { go: (id: unknown, url?: unknown) => void; openWarning: (a: R) => void };
 
-function FrameBody({ frame, go, openWarning }: { frame: Frame } & Nav) {
+function FrameBody({
+  frame,
+  go,
+  openWarning,
+  onSaved,
+}: { frame: Frame; onSaved: (detail: R) => void } & Nav) {
+  if (frame.row["new_company"]) return <CompanyIdentityForm onSaved={onSaved} />;
   if (frame.kind === "unavailable")
     return (
       <div>
@@ -156,7 +198,7 @@ function FrameBody({ frame, go, openWarning }: { frame: Frame } & Nav) {
       ) : frame.kind === "warnings" ? (
         <WarningBody e={e} go={go} />
       ) : frame.kind === "infrastructure" ? (
-        <EntityBody e={e} d={frame.detail} go={go} openWarning={openWarning} />
+        <EntityBody e={e} d={frame.detail} go={go} openWarning={openWarning} onSaved={onSaved} />
       ) : (
         <RecordBody e={e} d={frame.detail} kind={frame.kind} go={go} openWarning={openWarning} />
       )}
@@ -385,11 +427,25 @@ function Related({ d, go, openWarning }: { d?: R | undefined } & Nav) {
   );
 }
 
-function EntityBody({ e, d, go, openWarning }: { e: R; d?: R | undefined } & Nav) {
+function EntityBody({
+  e,
+  d,
+  go,
+  openWarning,
+  onSaved,
+}: { e: R; d?: R | undefined; onSaved: (detail: R) => void } & Nav) {
   const meta = e["metadata"] && typeof e["metadata"] === "object" ? e["metadata"] : {};
   return (
     <>
       <Header title={e["name"] || e["value"] || e["id"]} tags={<Badge tone="ok">{text(e["kind"])}</Badge>} />
+      {d?.["company_profile"] && (
+        <CompanyProfile
+          key={String(e["id"])}
+          profile={d["company_profile"] as Profile}
+          onSaved={onSaved}
+          go={go}
+        />
+      )}
       <Fields
         title="Entity details"
         rows={[

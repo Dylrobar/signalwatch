@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .companies import COMPANY_SCHEMA, asset_identity, company, company_assets, company_profile, labels, validate_parent
 from .matching import cpe_fields, ecosystem_identity, identifier, normalize, osv_version_match, package_identity, rank, version_match
 
 
@@ -258,6 +259,7 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             had_advisory_seen = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='advisory_seen'").fetchone() is not None
             conn.executescript(SCHEMA)
+            conn.executescript(COMPANY_SCHEMA)
             if not had_advisory_seen:
                 conn.execute("INSERT OR IGNORE INTO advisory_seen(canonical_id,first_seen) SELECT canonical_id,min(updated_at) FROM advisories GROUP BY canonical_id")
             if "part" not in {row[1] for row in conn.execute("PRAGMA table_info(observations)")}:
@@ -595,13 +597,65 @@ class Store:
         if q:
             expression = fts_query(q)
             if expression:
-                filters.append("e.rowid IN (SELECT rowid FROM entity_fts WHERE entity_fts MATCH ?)")
-                values.append(expression)
+                filters.append("(e.rowid IN (SELECT rowid FROM entity_fts WHERE entity_fts MATCH ?) OR e.id IN (SELECT p.company_id FROM company_profiles p JOIN company_profile_fts ON p.rowid=company_profile_fts.rowid WHERE company_profile_fts MATCH ?))")
+                values.extend((expression, expression))
         if kind:
             filters.append("e.kind=?")
             values.append(kind)
         with self.connection() as conn:
-            return self._page(conn, "entities e", " AND ".join(filters), values, "e.updated_at DESC,e.id", limit, offset, "e.*")
+            result = self._page(conn, "entities e", " AND ".join(filters), values, "e.updated_at DESC,e.id", limit, offset,
+                                "e.*,(SELECT name FROM company_profiles WHERE company_id=e.id) AS profile_name")
+            for item in result["items"]:
+                name = item.pop("profile_name", None)
+                if name is not None:
+                    item["name"] = name
+            return result
+
+    def save_company_profile(self, company_id="", name="", legal_name="", aliases=None, brands=None,
+                             parent_company_id="", notes="", source_url=""):
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Company name is required")
+        aliases, brands = labels(aliases if aliases is not None else []), labels(brands if brands is not None else [])
+        timestamp = now()
+        with self.connection(write=True) as conn:
+            if company_id:
+                company(conn, company_id)
+            else:
+                company_id = "company:manual:" + uuid.uuid4().hex
+                self._entity(conn, {"id": company_id, "kind": "company", "name": name, "value": name,
+                                    "metadata": {"origin": "manual"}, "source_url": source_url}, timestamp)
+            validate_parent(conn, company_id, parent_company_id)
+            conn.execute("""INSERT INTO company_profiles(company_id,name,legal_name,aliases,brands,parent_company_id,notes,source_url,updated_at)
+             VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET name=excluded.name,legal_name=excluded.legal_name,
+             aliases=excluded.aliases,brands=excluded.brands,parent_company_id=excluded.parent_company_id,
+             notes=excluded.notes,source_url=excluded.source_url,updated_at=excluded.updated_at""",
+                         (company_id, name, str(legal_name).strip(), encode(aliases), encode(brands), parent_company_id,
+                          notes, source_url, timestamp))
+        return self.detail(company_id)
+
+    def set_company_asset(self, company_id, asset_url, status="confirmed", role="owned", evidence="", source_url=""):
+        if status not in {"confirmed", "candidate", "rejected", "automatic"}:
+            raise ValueError("Invalid company asset status")
+        if role not in {"owned", "service"}:
+            raise ValueError("Invalid company asset role")
+        if status != "automatic" and (not evidence.strip() or not source_url):
+            raise ValueError("Manual company asset decisions require evidence and a source URL")
+        asset_id, host = asset_identity(asset_url)
+        timestamp = now()
+        with self.connection(write=True) as conn:
+            company(conn, company_id)
+            if status == "automatic":
+                conn.execute("DELETE FROM company_asset_decisions WHERE company_id=? AND asset_id=?", (company_id, asset_id))
+            else:
+                if conn.execute("SELECT 1 FROM entities WHERE id=?", (asset_id,)).fetchone() is None:
+                    self._entity(conn, {"id": asset_id, "kind": "domain", "name": host, "value": host,
+                                        "metadata": {}, "source_url": source_url}, timestamp)
+                conn.execute("""INSERT INTO company_asset_decisions(company_id,asset_id,status,role,evidence,source_url,updated_at)
+                 VALUES(?,?,?,?,?,?,?) ON CONFLICT(company_id,asset_id) DO UPDATE SET status=excluded.status,
+                 role=excluded.role,evidence=excluded.evidence,source_url=excluded.source_url,updated_at=excluded.updated_at""",
+                             (company_id, asset_id, status, role, evidence.strip(), source_url, timestamp))
+        return self.detail(company_id)
 
     def advisories(self, q="", kev=False, limit=50, offset=0, *, sort="rank"):
         if sort not in {"rank", "newest"}:
@@ -698,7 +752,11 @@ class Store:
              WHERE e.from_id IN (""" + relationship_slots + ") OR e.to_id IN (" + relationship_slots + ") ORDER BY e.observed_at DESC,e.from_id,e.to_id LIMIT 500", (*relationship_ids, *relationship_ids))]
             asset_ids = {entity_id}
             if entity and entity.get("kind") == "company":
-                asset_ids.update(row[0] for row in conn.execute("SELECT to_id FROM edges WHERE from_id=? AND relation='official_website'", (entity_id,)))
+                result["company_profile"] = company_profile(conn, entity)
+                result["name"] = result["company_profile"]["name"]
+                profile = result["company_profile"]
+                profile["assets"], profile["assets_truncated"] = company_assets(conn, entity_id)
+                asset_ids.update(asset["id"] for asset in profile["assets"] if asset["included"])
             placeholders = ",".join("?" for _ in asset_ids)
             asset_ids = sorted(asset_ids)
             result["observations"] = [decoded(row) for row in conn.execute("SELECT * FROM observations WHERE asset_id IN (" + placeholders + ") ORDER BY observed_at DESC LIMIT 500", asset_ids)]
