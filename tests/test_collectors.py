@@ -117,7 +117,7 @@ class ParsingTests(unittest.TestCase):
     def test_url_and_retry_normalization(self):
         self.assertEqual(canonical_url("HTTPS://EXAMPLE.COM:443/a?utm_source=x&x=1#y"), "https://example.com/a?x=1")
         self.assertEqual(canonical_url("javascript:alert(1)"), "")
-        self.assertEqual(retry_delay("120", 0), 60)
+        self.assertEqual(retry_delay("120", 0), 120)
         self.assertEqual(retry_delay("0", 0), 0)
         self.assertIsNone(cpe_parts("not-cpe"))
 

@@ -131,7 +131,7 @@ def create_app(config, auto_collect=True):
 
     @app.get("/api/status")
     def status():
-        fields = ("name", "status", "started_at", "finished_at", "last_success", "duration", "counts", "error",
+        fields = ("name", "status", "started_at", "finished_at", "last_success", "duration", "counts", "error", "retry_at",
                   "coverage", "coverage_scope", "coverage_floor", "coverage_through", "pending", "feed_health", "checked_at", "gap")
         sources = [{key: row[key] for key in fields if key in row} for row in store.sources()
                    if row["name"] in config["sources"] or row["name"].startswith("nvd-")]

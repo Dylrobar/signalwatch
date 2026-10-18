@@ -57,6 +57,17 @@ class Engine:
         return False
 
     async def _source(self, name):
+        state = await asyncio.to_thread(self.store.source_state, name)
+        retry_at = state.get("retry_at")
+        try:
+            retry_time = datetime.fromisoformat(str(retry_at).replace("Z", "+00:00")) if retry_at else None
+            if retry_time and retry_time.tzinfo is None:
+                retry_time = retry_time.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            retry_time = None
+        if retry_time and retry_time > datetime.now(timezone.utc):
+            return {"source": name, "ok": False, "skipped": True, "retry_at": retry_at,
+                    "error": state.get("error") or "Source is waiting for its retry time"}
         start = time.monotonic()
         self.current_sources.add(name)
         await asyncio.to_thread(self.store.update_source, name, status="running", started_at=now(), error=None)

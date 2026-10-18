@@ -55,6 +55,22 @@ class ApiContractTests(unittest.TestCase):
         self.assertNotIn("private-nvd-value", result)
         self.assertNotIn("private-github-value", result)
 
+    def test_status_exposes_persisted_retry_time_without_clearing_source_error(self):
+        store = Store(self.root / "monitor.db")
+        retry_at = "2199-01-01T00:00:00+00:00"
+        previous = store.update_source("wikidata", status="error", error="HTTP 429: rate limited",
+                                       retry_at=retry_at, last_success="2026-10-18T00:00:00+00:00",
+                                       cursor="saved-cursor", retry_failures=2)
+        result = self.request("/api/status")
+        source = next(row for row in result["sources"] if row["name"] == "wikidata")
+        self.assertEqual(source["retry_at"], retry_at)
+        self.assertEqual(source["status"], "error")
+        self.assertEqual(source["error"], "HTTP 429: rate limited")
+        self.assertEqual(source["last_success"], previous["last_success"])
+        self.assertNotIn("cursor", source)
+        self.assertNotIn("retry_failures", source)
+        self.assertEqual(store.source_state("wikidata"), previous)
+
     def test_source_coverage_is_visible_without_private_backlog_records(self):
         store = Store(self.root / "monitor.db")
         store.update_source("csaf", counts={"pending": 17, "records": 2}, coverage_scope="feed_history",

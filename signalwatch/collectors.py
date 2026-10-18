@@ -335,6 +335,11 @@ class Collector:
 
     async def collect_wikidata(self):
         state = await self.state("wikidata")
+        retry_at = state.get("retry_at")
+        if retry_at:
+            remaining = (datetime.fromisoformat(retry_at) - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                raise HTTPError(state.get("retry_status") or 429, WIKIDATA_URL, retry_after=remaining)
         last = state.get("cursor", "")
         last_website = state.get("cursor_website", "")
         batch_size = int(self.config.get("wikidata_batch", 50))
@@ -352,7 +357,18 @@ class Collector:
           {filter_clause}
           OPTIONAL {{ ?company rdfs:label ?companyLabel . FILTER(LANG(?companyLabel) = "en") }}
         }} ORDER BY STR(?company) STR(?website) LIMIT {batch_size}'''
-        result = await self.http.get(WIKIDATA_URL, params={"query": query, "format": "json"}, headers={"Accept": "application/sparql-results+json"}, cache=False)
+        try:
+            # WDQS has a per-client query-time budget. A throttled query should
+            # resume from its current cursor later, rather than consume the
+            # remaining budget through immediate retries.
+            result = await self.http.get(WIKIDATA_URL, params={"query": query, "format": "json"}, headers={"Accept": "application/sparql-results+json"}, cache=False, max_attempts=1)
+        except HTTPError as error:
+            if error.status in (429, 503):
+                failures = min(int(state.get("retry_failures") or 0) + 1, 6)
+                wait = max(error.retry_after or 0, min(24 * 3600, 3600 * 2 ** (failures - 1)))
+                retry_at = datetime.fromtimestamp(min(time.time() + wait, 253402300799), timezone.utc).isoformat()
+                await self.checkpoint("wikidata", retry_at=retry_at, retry_failures=failures, retry_status=error.status)
+            raise
         payload = await asyncio.to_thread(read_json, result.path)
         rows = payload.get("results", {}).get("bindings")
         if not isinstance(rows, list):
@@ -382,11 +398,11 @@ class Collector:
         companies = sum(entity["kind"] == "company" for entity in entities.values())
         if rows:
             cursor, website = max((row["company"]["value"], row["website"]["value"]) for row in rows)
-            await self.checkpoint("wikidata", cursor=cursor, cursor_website=website, type_index=type_index, cycle_completed=None)
+            await self.checkpoint("wikidata", cursor=cursor, cursor_website=website, type_index=type_index, cycle_completed=None, retry_at=None, retry_failures=0, retry_status=None)
         elif type_index + 1 < len(company_types):
-            await self.checkpoint("wikidata", cursor="", cursor_website="", type_index=type_index + 1, cycle_completed=None)
+            await self.checkpoint("wikidata", cursor="", cursor_website="", type_index=type_index + 1, cycle_completed=None, retry_at=None, retry_failures=0, retry_status=None)
         else:
-            await self.checkpoint("wikidata", cursor="", cursor_website="", type_index=0, cycle_completed=now)
+            await self.checkpoint("wikidata", cursor="", cursor_website="", type_index=0, cycle_completed=now, retry_at=None, retry_failures=0, retry_status=None)
         return {"companies": companies, "domains": len(urls), "queued": queued, "queue_rejected": len(urls) - queued,
                 "pending": bool(rows) or type_index + 1 < len(company_types), "coverage": "official_company_sites"}
 

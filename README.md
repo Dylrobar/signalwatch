@@ -116,6 +116,8 @@ signalwatch bootstrap --years all
 
 Full historical collection uses substantially more disk and time. Collection status, errors, counts, and last success timestamps remain visible in Collectors. One failing source does not stop the other collectors. Run any family individually from its row. RSS health includes attempted, successful, unchanged, and failed feeds, with each feed's last successful fetch and error. A successful bounded run can still have a pending backlog.
 
+Wikidata rate limiting pauses that source until its saved retry time; the pause survives restarts and manual collection requests. Other collectors continue. The dashboard shows a compact issue summary, an expandable list of details, and the retry time. Old saved errors are formatted for display too, so encoded queries and HTML error pages do not fill the table. A website collector can be Partial while still saving pages: unavailable domains, timeouts, denied requests, and robots exclusions remain visible as coverage limitations.
+
 CVE Program collection prioritizes recent updates; it is not a full CVE archive. Its coverage floor and any detected gap remain visible. CSAF gradually drains each publisher's available feed history, preserving fixed/not-affected status and remediation in the full record. Only explicit known-affected CPE/PURL identities participate in matching; unsupported product identities remain available as unverified source data. Native CNA version/status rules are retained and marked unverified where they cannot be evaluated.
 
 ## Use

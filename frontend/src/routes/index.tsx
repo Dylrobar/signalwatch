@@ -8,6 +8,7 @@ import { Collectors, runCollect } from "@/components/sw/Collectors";
 import { ConnectionDialog } from "@/components/sw/ConnectionDialog";
 import { Drawer } from "@/components/sw/Drawer";
 import { ListView } from "@/components/sw/ListView";
+import { SourceIssues } from "@/components/sw/SourceIssues";
 import { phaseOf, useStatus, type ConnPhase } from "@/hooks/use-signalwatch";
 import { connection } from "@/lib/api";
 import { describe, num, type R } from "@/lib/format";
@@ -133,7 +134,7 @@ function App() {
           ))}
         </nav>
 
-        {d?.["error"] && <Notice tone="danger" title="Collection failed">{describe(d["error"])}</Notice>}
+        {d?.["error"] && <Notice tone="danger" title="Collection failed"><SourceIssues errors={[describe(d["error"])]} /></Notice>}
 
         {phase === "disconnected" ? (
           <Notice title="No backend connected">

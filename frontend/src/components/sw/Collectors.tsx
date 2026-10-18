@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import { fmtDate, num, safeHref, text, type R } from "@/lib/format";
 import { feedList, mergeSources, sbomLimitMiB, sourceErrors, sourceHealth, sourceRecords, type Health } from "@/lib/sources";
 import { Badge, ExtLink } from "./bits";
+import { SourceIssues } from "./SourceIssues";
 
 const HEALTH: Record<Health, [string, string]> = {
   collecting: ["Collecting…", "ok"], error: ["Error", "kev"], partial: ["Partial", "warn"], interrupted: ["Interrupted", "warn"],
@@ -64,7 +65,7 @@ function Feeds({ s }: { s: R }) {
                 <td><Badge tone={f["status"] === "ok" || f["status"] === "unchanged" ? "ok" : f["status"] === "error" ? "kev" : ""}>{f["status"] === "ok" ? "Updated" : f["status"] === "unchanged" ? "Unchanged" : f["status"] === "error" ? "Failed" : "Not attempted"}</Badge></td>
                 <td>{f["last_success"] ? num(f["articles"]) : "unknown"}</td>
                 <td className="text-xs">{fmtDate(f["last_success"], true)}</td>
-                <td className="text-xs">{fmtDate(f["last_attempt"], true)}{f["error"] && <div className="text-destructive">{String(f["error"])}</div>}</td>
+                <td className="text-xs">{fmtDate(f["last_attempt"], true)}{f["error"] && <SourceIssues errors={[String(f["error"])]} />}</td>
               </tr>
             ))}
           </tbody>
@@ -124,7 +125,7 @@ export function Collectors({ status, refresh }: { status: R; refresh: () => void
           <span className="text-xs text-muted-foreground">{busy ? `Running: ${running.join(", ") || "collection"}` : "Idle"}{historical.length ? ` · ${historical.length} historical NVD year runs` : ""}</span>
           <button type="button" className="sw-btn-primary ml-auto" disabled={busy} onClick={() => runCollect(null, refresh)}>{busy ? "Collection running…" : "Collect all"}</button>
         </div>
-        {status["error"] && <p role="alert" className="border-b border-border p-3 text-xs text-destructive">Last job error: {String(status["error"])}</p>}
+        {status["error"] && <div role="alert" className="border-b border-border p-3 text-xs"><p className="font-semibold">Last job error</p><SourceIssues errors={[String(status["error"])]} /></div>}
         <div className="sw-scroll" tabIndex={0} aria-label="Collector health">
           <table className="sw-table">
             <thead><tr><th>Source</th><th>Health</th><th>Last success</th><th title="Most recent reported batch, not total stored records">Last batch records</th><th>Coverage</th><th /></tr></thead>
@@ -136,7 +137,7 @@ export function Collectors({ status, refresh }: { status: R; refresh: () => void
                 return (
                   <tr key={s["name"]}>
                     <td className="font-mono text-xs">{s["name"]}{s["enabled"] === false && <div className="text-muted-foreground">disabled in config</div>}</td>
-                    <td><Badge tone={h[1]}>{h[0]}</Badge>{errs.map((e) => <div key={e} className="mt-1 max-w-xs text-xs text-destructive">{e}</div>)}</td>
+                    <td><Badge tone={h[1]}>{h[0]}</Badge><SourceIssues errors={errs} retryAt={s["retry_at"]} /></td>
                     <td className="whitespace-nowrap text-xs">{s["persisted"] ? fmtDate(s["last_success"], true, "never") : "not collected"}</td>
                     <td className="text-xs" title={s["counts"] ? Object.entries(s["counts"]).filter(([, v]) => typeof v === "number").map(([k, v]) => `${k}: ${v}`).join(" · ") : undefined}>{rec === null ? "unknown" : num(rec)}</td>
                     <td><Coverage s={s} /></td>

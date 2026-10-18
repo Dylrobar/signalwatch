@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 
 DEFAULTS = {
@@ -23,7 +23,7 @@ DEFAULTS = {
     "crawl_batch": 50,
     "crawl_interval_hours": 24,
     "max_discovered_domains": 10000,
-    "user_agent": f"SignalWatch/{VERSION} (+public-source intelligence collector)",
+    "user_agent": f"SignalWatch/{VERSION} (https://github.com/Dylrobar/signalwatch)",
     "headers": {},
     "interval_minutes": 30,
     "bootstrap_days": 30,
