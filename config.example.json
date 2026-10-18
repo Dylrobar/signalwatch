@@ -1,0 +1,135 @@
+{
+  "db": "data/signalwatch.db",
+  "cache_dir": "data/cache",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "cors_origins": [],
+  "api_token": "",
+  "concurrency": 32,
+  "per_host": 4,
+  "timeout": 30,
+  "max_response_mb": 32,
+  "crawl_pages": 8,
+  "crawl_depth": 1,
+  "crawl_batch": 50,
+  "crawl_interval_hours": 24,
+  "max_discovered_domains": 10000,
+  "user_agent": "SignalWatch/0.5.0 (+public-source intelligence collector)",
+  "headers": {},
+  "interval_minutes": 30,
+  "bootstrap_days": 30,
+  "nvd_api_key": "",
+  "github_token": "",
+  "osv_max_records": 500,
+  "osv_index_chunk_mb": 1,
+  "osv_index_chunks": 8,
+  "osv_index_max_chunks": 32,
+  "cve_max_records": 250,
+  "cve_max_zip_mb": 16,
+  "csaf_max_records": 100,
+  "network_batch": 20,
+  "network_interval_hours": 24,
+  "news_concurrency": 8,
+  "dns_mode": "fallback",
+  "dns_doh_url": "https://dns.google/resolve",
+  "dns_timeout": 5,
+  "dns_concurrency": 4,
+  "sbom_max_mb": 20,
+  "events_max_rows": 50000,
+  "events_retention_days": 90,
+  "sources": {
+    "nvd": true,
+    "kev": true,
+    "epss": true,
+    "github": true,
+    "osv": true,
+    "cve_program": true,
+    "csaf": true,
+    "network": true,
+    "wikidata": true,
+    "news": true,
+    "web": true
+  },
+  "feeds": [
+    {
+      "name": "The Hacker News",
+      "url": "https://feeds.feedburner.com/TheHackersNews"
+    },
+    {
+      "name": "BleepingComputer",
+      "url": "https://www.bleepingcomputer.com/feed/"
+    },
+    {
+      "name": "Krebs on Security",
+      "url": "https://krebsonsecurity.com/feed/"
+    },
+    {
+      "name": "SANS Internet Storm Center",
+      "url": "https://isc.sans.edu/rssfeed_full.xml"
+    },
+    {
+      "name": "CERT-EU",
+      "url": "https://cert.europa.eu/publications/security-advisories-rss"
+    },
+    {
+      "name": "Microsoft Security Response Center",
+      "url": "https://api.msrc.microsoft.com/update-guide/rss"
+    },
+    {
+      "name": "Fortinet PSIRT",
+      "url": "https://filestore.fortinet.com/fortiguard/rss/ir.xml"
+    },
+    {
+      "name": "SecurityWeek",
+      "url": "https://feeds.feedburner.com/securityweek"
+    },
+    {
+      "name": "Debian Security Advisories",
+      "url": "https://www.debian.org/security/dsa"
+    },
+    {
+      "name": "Ubuntu Security Notices",
+      "url": "https://ubuntu.com/security/notices/rss.xml"
+    },
+    {
+      "name": "CERT/CC Vulnerability Notes",
+      "url": "https://www.kb.cert.org/vuls/atomfeed/"
+    },
+    {
+      "name": "Palo Alto Networks PSIRT",
+      "url": "https://security.paloaltonetworks.com/rss.xml"
+    }
+  ],
+  "csaf_feeds": [
+    {
+      "name": "CISA Operational Technology",
+      "url": "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/OT/white/cisa-csaf-ot-feed-tlp-white.json"
+    },
+    {
+      "name": "CISA Information Technology",
+      "url": "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/IT/white/cisa-csaf-it-feed-tlp-white.json"
+    },
+    {
+      "name": "CISA Vulnerability Advisories",
+      "url": "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/VA/white/cisa-csaf-va-feed-tlp-white.json"
+    },
+    {
+      "name": "Siemens ProductCERT",
+      "url": "https://productcert.siemens.com/productcert/csaf/ssa-feed-tlp-white.json"
+    }
+  ],
+  "seed_urls": [
+    "https://www.apache.org/",
+    "https://nginx.org/",
+    "https://www.openssl.org/",
+    "https://www.cisco.com/",
+    "https://www.fortinet.com/",
+    "https://www.tp-link.com/",
+    "https://www.synology.com/",
+    "https://www.qnap.com/",
+    "https://www.microsoft.com/",
+    "https://www.ubuntu.com/",
+    "https://www.redhat.com/",
+    "https://www.siemens.com/"
+  ]
+}

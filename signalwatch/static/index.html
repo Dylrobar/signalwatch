@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SignalWatch · Public intelligence</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b131b'/%3E%3Cpath d='M5 18h5l3-9 5 16 3-10h6' fill='none' stroke='%235ce0d0' stroke-width='2.5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="SignalWatch home"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 18h6l4-12 6 21 4-13h6"/></svg><span>Signal<span class="brand-light">Watch</span></span><span class="brand-tag">PUBLIC INTELLIGENCE</span></a>
+    <div class="top-actions"><span id="run-state" class="run-state"><i></i>Connecting</span><button id="collect-now" class="button primary" type="button">Collect now <span aria-hidden="true">↗</span></button></div>
+  </header>
+
+  <main>
+    <section class="overview" aria-label="Collection overview">
+      <div class="overview-title"><span class="eyebrow">INTELLIGENCE WORKSPACE</span><h1>Infrastructure early warning</h1><p>Public infrastructure evidence connected to advisories, exploitation signals, and security reports.</p></div>
+      <div class="metrics">
+        <button class="metric" data-go="intelligence"><span>Advisories</span><strong id="count-advisories">—</strong></button>
+        <button class="metric" data-go="infrastructure"><span>Entities</span><strong id="count-entities">—</strong></button>
+        <button class="metric" data-go="warnings"><span>Potential matches</span><strong id="count-alerts">—</strong></button>
+        <button class="metric" data-go="news"><span>News reports</span><strong id="count-articles">—</strong></button>
+      </div>
+    </section>
+
+    <div id="error-banner" class="error-banner" role="alert" hidden><span id="error-text"></span><button id="dismiss-error" type="button" aria-label="Dismiss error">×</button></div>
+
+    <section class="workspace">
+      <nav class="tabs" aria-label="Intelligence views">
+        <button type="button" data-tab="intelligence" class="active" aria-current="page"><span class="tab-icon" aria-hidden="true">◈</span>Intelligence</button>
+        <button type="button" data-tab="warnings"><span class="tab-icon" aria-hidden="true">⌁</span>Warnings<span id="warning-badge" class="count-badge" hidden></span></button>
+        <button type="button" data-tab="infrastructure"><span class="tab-icon" aria-hidden="true">▦</span>Infrastructure</button>
+        <button type="button" data-tab="news"><span class="tab-icon" aria-hidden="true">≡</span>News</button>
+        <button type="button" data-tab="changes"><span class="tab-icon" aria-hidden="true">↺</span>Changes</button>
+        <button type="button" data-tab="collectors"><span class="tab-icon" aria-hidden="true">⤓</span>Collectors<span id="source-error-badge" class="error-badge" hidden></span></button>
+      </nav>
+
+      <div class="view-heading"><div><div class="eyebrow" id="view-eyebrow">GLOBAL VULNERABILITY FEED</div><h2 id="view-title">Vulnerability intelligence</h2><p id="view-description">Published advisories ranked by exploitation signals and severity.</p></div><span id="last-refresh" class="last-refresh"></span></div>
+
+      <div class="toolbar" id="data-toolbar">
+        <label class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="search-input" type="search" placeholder="Search advisories, products, CVEs…" aria-label="Search current view" autocomplete="off"><kbd>/</kbd></label>
+        <label class="toggle" id="kev-control"><input id="kev-only" type="checkbox"><span>Known exploited</span></label>
+        <select id="kind-filter" aria-label="Entity type" hidden><option value="">All entity types</option></select>
+        <select id="event-kind-filter" aria-label="Change type" hidden><option value="">All changes</option><option value="advisory_added">Advisory added</option><option value="advisory_changed">Advisory changed</option><option value="kev_added">Added to KEV</option><option value="kev_removed">Removed from KEV</option><option value="warning_opened">Warning opened</option><option value="warning_resolved">Warning resolved</option></select>
+        <select id="version-filter" aria-label="Version match state" hidden><option value="">All version states</option><option value="exact">Exact version</option><option value="affected_range">Affected range</option><option value="unknown">Version unknown</option><option value="version_unverified">Version unverified</option></select>
+        <select id="sort-filter" aria-label="Sort records"><option value="rank">Highest signal first</option><option value="newest">Newest first</option></select>
+        <button id="refresh-data" class="button quiet" type="button" aria-label="Refresh current view">↻ <span>Refresh</span></button>
+        <a id="export-data" class="button quiet" href="/api/export?kind=advisories" download>↓ <span>Export</span></a>
+      </div>
+
+      <div id="data-view">
+        <div class="list-meta"><span id="result-count" aria-live="polite">Loading intelligence…</span><span id="sort-caption">Highest signal first</span></div>
+        <div class="table-scroll"><table id="results-table"><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+        <div id="empty-state" class="empty-state" hidden><div class="empty-glyph" aria-hidden="true">⌁</div><h3 id="empty-title">No intelligence collected yet</h3><p id="empty-description">Run the collectors to populate this workspace.</p><button type="button" class="button" id="empty-action">Open collectors ↗</button></div>
+        <div id="pagination" class="pagination" hidden><span id="page-label"></span><div><button id="previous-page" class="button quiet" type="button">← Previous</button><button id="next-page" class="button quiet" type="button">Next →</button></div></div>
+      </div>
+
+      <div id="collectors-view" hidden>
+        <div class="collector-summary"><div><span class="live-dot"></span><strong id="collector-status">Collector status</strong><span id="current-sources"></span></div><span id="source-count"></span></div>
+        <div class="table-scroll" tabindex="0" aria-label="Source family collection status"><table class="source-table"><thead><tr><th>Source family</th><th>Last successful collection</th><th>Records</th><th>Coverage / backlog</th><th>Status</th><th></th></tr></thead><tbody id="sources-body"></tbody></table></div>
+        <div id="sources-empty" class="small-empty" hidden>No collectors are configured.</div>
+        <div id="feed-health"></div>
+        <div class="input-grid">
+          <details class="input-card"><summary><span><b>Add public URL seeds</b><small>Collect company, product, or infrastructure evidence</small></span><span aria-hidden="true">+</span></summary><form id="seed-form"><label for="seed-urls">One HTTP or HTTPS URL per line</label><textarea id="seed-urls" name="urls" rows="5" placeholder="https://…" required></textarea><button class="button primary" type="submit">Add seeds</button><span class="form-result" role="status"></span></form></details>
+          <details class="input-card"><summary><span><b>Add an RSS / Atom feed</b><small>Extend the news and advisory source list</small></span><span aria-hidden="true">+</span></summary><form id="feed-form"><label for="feed-name">Source name</label><input id="feed-name" name="name" required maxlength="120"><label for="feed-url">Feed URL</label><input id="feed-url" name="url" type="url" placeholder="https://…" required><button class="button primary" type="submit">Add feed</button><span class="form-result" role="status"></span></form></details>
+          <details class="input-card"><summary><span><b>Add a technology observation</b><small>Connect an asset with a product and its evidence</small></span><span aria-hidden="true">+</span></summary><form id="observation-form"><label for="asset-url">Asset URL</label><input id="asset-url" name="asset_url" type="url" placeholder="https://…" required><div class="form-pair"><label>Vendor<input name="vendor" required></label><label>Product<input name="product" required></label></div><label>Version<input name="version"></label><label>Evidence<input name="evidence" placeholder="Source URL or observed evidence" required></label><button class="button primary" type="submit">Add observation</button><span class="form-result" role="status"></span></form></details>
+          <details class="input-card sbom-card"><summary><span><b>Import a JSON SBOM</b><small>CycloneDX or SPDX inventory with explicit package identifiers</small></span><span aria-hidden="true">+</span></summary><form id="sbom-form"><p class="input-note">The full URL identifies the asset. Reusing a source key replaces that source's imported inventory.</p><div class="form-pair"><label for="sbom-asset-url">Asset URL, including application path<input id="sbom-asset-url" name="asset_url" type="url" placeholder="https://…" required></label><label for="sbom-source-key">Source key<input id="sbom-source-key" name="source_key" value="default" required maxlength="200"></label></div><label for="sbom-file"><span id="sbom-limit">JSON document · request limit 20 MiB</span><input id="sbom-file" name="file" type="file" accept=".json,application/json" required></label><button class="button primary" type="submit">Import inventory</button><span class="form-result" role="status"></span></form><div id="sbom-report" class="sbom-report" role="region" aria-label="SBOM import report" hidden></div></details>
+        </div>
+      </div>
+    </section>
+    <footer><span>SignalWatch <span class="footer-divider">/</span> Public evidence. Traceable connections.</span><span id="footer-status">Waiting for service</span></footer>
+  </main>
+
+  <div id="drawer-overlay" class="drawer-overlay" hidden></div>
+  <aside id="detail-drawer" class="detail-drawer" aria-label="Record details" aria-modal="true" role="dialog" tabindex="-1" hidden><div class="drawer-top"><button id="drawer-back" class="button quiet" type="button" hidden>← Back</button><span class="eyebrow" id="drawer-kind">RECORD DETAILS</span><button id="close-drawer" class="icon-button" type="button" aria-label="Close details">×</button></div><div id="drawer-content"></div></aside>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,11 @@
+services:
+  signalwatch:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      - SIGNALWATCH_API_TOKEN
+      - SIGNALWATCH_CORS_ORIGINS
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
