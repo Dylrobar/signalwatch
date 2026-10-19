@@ -384,21 +384,23 @@ def import_device_enrichment(store, records, source_url, version=""):
     with store.connection(write=True) as conn:
         conn.execute("CREATE TEMP TABLE imported_wireless_labels(radio_type TEXT,identifier TEXT,metadata TEXT,provider TEXT,PRIMARY KEY(radio_type,identifier))")
         conn.executemany("INSERT INTO imported_wireless_labels VALUES(?,?,?,?) ON CONFLICT(radio_type,identifier) DO UPDATE SET metadata=excluded.metadata,provider=excluded.provider", prepared)
-        count = conn.execute("""SELECT count(*) FROM wireless_devices d JOIN imported_wireless_labels l
-         ON d.radio_type=l.radio_type AND d.identifier=l.identifier""").fetchone()[0]
+        conn.execute("CREATE TEMP TABLE matched_wireless_labels(device_id TEXT PRIMARY KEY,metadata TEXT,provider TEXT)")
+        conn.execute("""INSERT INTO matched_wireless_labels SELECT d.id,l.metadata,l.provider
+         FROM imported_wireless_labels l CROSS JOIN wireless_devices d INDEXED BY wireless_identifier
+         WHERE d.identifier!='' AND d.radio_type=l.radio_type AND d.identifier=l.identifier""")
+        count = conn.execute("SELECT count(*) FROM matched_wireless_labels").fetchone()[0]
         conn.execute("""UPDATE wireless_devices AS d SET metadata=json_set(d.metadata,'$.imported_enrichment',json(l.metadata)),updated_at=?
-         FROM imported_wireless_labels l WHERE d.radio_type=l.radio_type AND d.identifier=l.identifier""", (timestamp,))
+         FROM matched_wireless_labels l WHERE d.id=l.device_id""", (timestamp,))
         conn.execute("""DELETE FROM wireless_company_links WHERE origin='imported_label' AND device_id IN (
-         SELECT d.id FROM wireless_devices d JOIN imported_wireless_labels l
-          ON d.radio_type=l.radio_type AND d.identifier=l.identifier)""")
-        for row in conn.execute("SELECT DISTINCT provider FROM imported_wireless_labels WHERE provider!=''").fetchall():
+         SELECT device_id FROM matched_wireless_labels)""")
+        for row in conn.execute("SELECT DISTINCT provider FROM matched_wireless_labels WHERE provider!=''").fetchall():
             provider = row[0]
             company_id = _ensure_company(store, conn, provider, source_url,
                                          {"origin": "wireless_advertised_provider", "identity_basis": "Advertised name; corporate identity unverified"})
             conn.execute("""INSERT INTO wireless_company_links
-             SELECT d.id,?,'advertised_provider','claimed','','imported_label',
+             SELECT l.device_id,?,'advertised_provider','claimed','','imported_label',
               json_object('basis','Prior advertised provider label; operator unverified','imported_evidence',json(l.metadata)),?,?,?
-             FROM wireless_devices d JOIN imported_wireless_labels l ON d.radio_type=l.radio_type AND d.identifier=l.identifier
+             FROM matched_wireless_labels l
              WHERE l.provider=? ON CONFLICT(device_id,company_id,role,facility_id,origin) DO UPDATE SET
               evidence=excluded.evidence,source_url=excluded.source_url,observed_at=excluded.observed_at,updated_at=excluded.updated_at""",
                          (company_id, source_url, timestamp, timestamp, provider))
