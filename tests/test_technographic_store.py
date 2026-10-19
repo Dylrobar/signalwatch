@@ -85,6 +85,124 @@ class TechnographicStoreTests(unittest.TestCase):
         self.assertEqual(result["technographic_unattributed"], 1)
         self.assertEqual(self.store.detail("company:other")["technographics"]["total"], 0)
 
+    def test_manual_exclusion_blocks_domain_and_explicit_company_attribution(self):
+        for status, role in (("rejected", "owned"), ("candidate", "owned"), ("confirmed", "service")):
+            with self.subTest(status=status, role=role):
+                self.store.set_company_asset("company:acme", "https://acme.test", status=status, role=role,
+                                             evidence="Reviewed association", source_url="https://acme.test/about")
+                self.assertEqual(self.store.company_enrichment_targets(), [])
+                for company_id in ("", "company:acme"):
+                    counts = self.store.ingest({"entities": [posting("We use Kafka.", company_id=company_id)]})
+                    self.assertEqual(counts["technographic_unattributed"], 1)
+                    self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 0)
+                    self.assertEqual(self.store.detail("company:acme")["observations"], [])
+                self.assertIsNotNone(self.store.detail("job:1"))
+
+    def test_manual_confirmed_domain_is_eligible_without_official_website_edge(self):
+        self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"}]})
+        self.store.set_company_asset("company:other", "https://other.test", evidence="Reviewed ownership",
+                                    source_url="https://other.test/about")
+        doc = posting("We use Kafka.", company_id="")
+        doc["metadata"]["company_context"]["domain"] = "other.test"
+        self.store.ingest({"entities": [doc]})
+        self.assertEqual(self.store.detail("company:other")["technographics"]["documents"], 1)
+        self.assertIn({"domain": "other.test", "company_id": "company:other", "name": "Other"}, self.store.company_enrichment_targets())
+
+    def test_rejection_withdraws_existing_evidence_alerts_and_can_be_reset(self):
+        doc = posting("We use Terraform.")
+        self.store.ingest({"entities": [doc], "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}]})
+        self.store.reconcile()
+        self.assertEqual(len(self.store.detail("company:acme")["alerts"]), 1)
+        rejected = self.store.set_company_asset("company:acme", "https://acme.test", status="rejected",
+                                                evidence="Wrong company", source_url="https://acme.test/about")
+        self.assertEqual(rejected["technographics"]["documents"], 0)
+        self.assertEqual(rejected["observations"], [])
+        self.assertEqual(rejected["alerts"], [])
+        evidence = self.store.detail("job:1")
+        self.assertEqual(evidence["metadata"]["fields"]["description"], "We use Terraform.")
+        self.assertFalse(any(edge["relation"] == "has_public_evidence" or edge["relation"].startswith("technology_") for edge in evidence["relationships"]))
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM technographic_documents").fetchone()[0], 1)
+        restored = self.store.set_company_asset("company:acme", "https://acme.test", status="automatic")
+        self.assertEqual(restored["technographics"]["documents"], 1)
+        self.assertEqual(len(restored["observations"]), 1)
+        self.assertEqual(len(restored["alerts"]), 1)
+
+    def test_manual_decision_reconciles_only_affected_companies_in_same_transaction(self):
+        self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"},
+                                        posting("We use Terraform.")],
+                           "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}],
+                           "observations": [{"asset_id": "company:other", "vendor": "hashicorp", "product": "terraform",
+                                             "origin": "manual", "source_url": "https://other.test"}]})
+        self.store.reconcile()
+        before = self.store.detail("company:other")["alerts"]
+        self.assertEqual(len(before), 1)
+        with patch.object(self.store, "reconcile", wraps=self.store.reconcile) as reconcile:
+            self.store.set_company_asset("company:acme", "https://acme.test", status="rejected",
+                                         evidence="Wrong company", source_url="https://acme.test/about")
+        reconcile.assert_called_once()
+        self.assertEqual(reconcile.call_args.kwargs["asset_ids"], {"company:acme"})
+        self.assertIsNotNone(reconcile.call_args.kwargs["conn"])
+        self.assertEqual(self.store.detail("company:other")["alerts"], before)
+        self.assertEqual(self.store.detail("company:acme")["alerts"], [])
+
+    def test_empty_scoped_reconciliation_does_not_touch_other_alerts(self):
+        self.store.ingest({"entities": [posting("We use Terraform.")],
+                           "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}]})
+        self.store.reconcile()
+        before = self.store.detail("company:acme")["alerts"]
+        self.assertEqual(self.store.reconcile(asset_ids=[]), {"evaluated": 0, "alerts": 0, "removed": 0, "previous": 0})
+        self.assertEqual(self.store.detail("company:acme")["alerts"], before)
+
+    def test_context_change_moves_projection_without_losing_shared_evidence(self):
+        self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"},
+                                        posting("We use Kafka."), posting("We use Kafka.", key="job:2", url="https://jobs.acme.test/2")]})
+        self.store.ingest({"entities": [posting("We use Kafka.", company_id="company:other")]})
+        self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 1)
+        self.assertEqual(self.store.detail("company:other")["technographics"]["documents"], 1)
+        self.assertEqual(len(self.store.detail("company:acme")["observations"]), 1)
+        self.assertEqual(self.store.detail("company:acme")["observations"][0]["source_url"], "https://jobs.acme.test/2")
+        links = [edge for edge in self.store.detail("job:1")["relationships"] if edge["relation"] == "has_public_evidence"]
+        self.assertEqual({edge["from_id"] for edge in links}, {"company:other"})
+        self.store.ingest({"entities": [posting("We use Kafka.", key="job:2", company_id="company:other")]})
+        self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 0)
+        self.assertEqual(self.store.detail("company:acme")["observations"], [])
+        self.assertEqual(len(self.store.detail("company:other")["observations"]), 1)
+
+    def test_lost_company_context_withdraws_old_projection(self):
+        self.store.ingest({"entities": [posting("We use Kafka.")]})
+        doc = posting("We use Kafka.", company_id="company:missing")
+        self.store.ingest({"entities": [doc]})
+        self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 0)
+        self.assertEqual(self.store.detail("company:acme")["observations"], [])
+
+    def test_partial_source_refresh_preserves_retained_document_context(self):
+        self.store.ingest({"entities": [posting("We use Kafka.")]})
+        self.store.ingest({"entities": [{"id": "job:1", "kind": "job_posting", "name": "Refreshed title",
+                                        "metadata": {"collector_refresh": True}}]})
+        self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 1)
+        self.assertEqual(len(self.store.detail("company:acme")["observations"]), 1)
+        self.assertEqual(self.store.detail("job:1")["metadata"]["fields"]["description"], "We use Kafka.")
+
+    def test_rejected_owner_resolves_domain_ambiguity_in_targets_and_evidence(self):
+        self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"}],
+                           "edges": [{"from_id": "company:other", "to_id": "domain:acme.test", "relation": "official_website"}]})
+        self.assertEqual(self.store.company_enrichment_targets()[0]["company_id"], "")
+        self.store.set_company_asset("company:other", "https://acme.test", status="rejected",
+                                    evidence="Wrong company", source_url="https://acme.test/about")
+        self.assertEqual(self.store.company_enrichment_targets()[0]["company_id"], "company:acme")
+        self.store.ingest({"entities": [posting("We use Kafka.", company_id="")]})
+        self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 1)
+        self.assertEqual(self.store.detail("company:other")["technographics"]["documents"], 0)
+
+    def test_www_alias_cannot_bypass_rejected_apex(self):
+        self.store.set_company_asset("company:acme", "https://acme.test", status="rejected",
+                                    evidence="Wrong company", source_url="https://acme.test/about")
+        doc = posting("We use Kafka.")
+        doc["metadata"]["company_context"]["domain"] = "WWW.ACME.TEST."
+        result = self.store.ingest({"entities": [doc]})
+        self.assertEqual(result["technographic_unattributed"], 1)
+
     def test_successful_unchanged_fetch_touches_last_seen_only(self):
         doc = posting("Experience with Okta required.")
         self.store.ingest({"entities": [doc]})

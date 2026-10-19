@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 from urllib.parse import urlencode
 
+from .async_utils import gather, to_thread
 from .extract import read_json, utcnow
 
 
@@ -55,7 +56,7 @@ async def collect_network(config, store, http):
     refresh = float(config.get("network_interval_hours", 24))
     if limit < 1 or refresh <= 0:
         raise ValueError("Network collection limits must be positive")
-    targets = await asyncio.to_thread(store.network_targets, limit, refresh)
+    targets = await to_thread(store.network_targets, limit, refresh)
     semaphore = asyncio.Semaphore(min(8, int(config.get("concurrency", 32))))
 
     async def fetch(target):
@@ -65,18 +66,18 @@ async def collect_network(config, store, http):
                 result = await http.get(source_url)
                 payload = await asyncio.to_thread(read_json, result.path)
                 batch = parse_network(payload, target, source_url, utcnow())
-                await asyncio.to_thread(store.ingest, batch)
+                await to_thread(store.ingest, batch)
                 return {"routed": bool(payload["data"].get("prefix")), "error": None}
             except Exception as exc:
                 return {"routed": False, "error": f"{target['value']}: {exc}"}
 
-    results = await asyncio.gather(*(fetch(target) for target in targets))
+    results = await gather(*(fetch(target) for target in targets))
     errors = [row["error"] for row in results if row["error"]]
-    pending = await asyncio.to_thread(store.network_pending_count, refresh)
+    pending = await to_thread(store.network_pending_count, refresh)
     counts = {"targets": len(targets), "enriched": len(results) - len(errors),
               "routed": sum(row["routed"] for row in results), "pending": pending,
               "errors": errors, "coverage": "observed_public_ips"}
-    await asyncio.to_thread(store.update_source, "network", coverage_scope="observed_public_ips",
+    await to_thread(store.update_source, "network", coverage_scope="observed_public_ips",
                             checked_at=utcnow(), pending=counts["pending"])
     if results and len(errors) == len(results):
         raise RuntimeError("All RIPEstat targets failed: " + "; ".join(errors)[:2000])

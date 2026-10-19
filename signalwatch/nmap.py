@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .async_utils import to_thread
 from .csaf import cpe_identity
 from .extract import utcnow
 
@@ -191,7 +192,7 @@ async def collect_nmap(config, store, http):
                 if hosts is not None and int(hosts.get("total", "0")) == 0:
                     raise RuntimeError("Nmap resolved no targets: " + stderr.decode(errors="replace")[:500])
                 for index, payload in enumerate(scan_documents(root)):
-                    await asyncio.to_thread(queue.enqueue, payload, source="nmap", adapter="nmap_xml", content_type="application/xml", stream_key=f"{profile}:ipv{version}:{index}", metadata={"profile": profile, "address_family": version}, observed_at=utcnow())
+                    await to_thread(queue.enqueue, payload, source="nmap", adapter="nmap_xml", content_type="application/xml", stream_key=f"{profile}:ipv{version}:{index}", metadata={"profile": profile, "address_family": version}, observed_at=utcnow())
                     counts["staged"] += 1
                 counts["scans"] += 1
         except Exception as error:

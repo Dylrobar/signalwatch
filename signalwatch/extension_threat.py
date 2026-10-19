@@ -18,6 +18,7 @@ from urllib.parse import quote, urljoin, urlsplit
 import feedparser
 from bs4 import BeautifulSoup
 
+from .async_utils import gather, to_thread
 from .extract import CVE_RE, canonical_url, utcnow
 from .signal_filter import qualify_signal
 
@@ -642,7 +643,7 @@ async def _collect_misp(config, store, http, stamp, limit, max_bytes, metadata):
     manifest = _misp_manifest(payload)
     queued = await stage_payload(config, store, payload, provider=provider, source_url=source_url,
                                  stream_key=provider + ":manifest", metadata={**metadata, "format": "misp_manifest"})
-    old = await asyncio.to_thread(store.source_state, "provider:" + provider)
+    old = await to_thread(store.source_state, "provider:" + provider)
     versions = dict(old.get("event_versions") or {})
     hashes = dict(old.get("event_hashes") or {})
     retry = dict(old.get("event_retry_at") or {})
@@ -692,7 +693,7 @@ async def _collect_misp(config, store, http, stamp, limit, max_bytes, metadata):
               "qualification_only": True, "error": error, "event_versions": versions, "event_hashes": hashes, "event_retry_at": retry,
               "window_days": 7, "eligible_events": len(eligible), "pending_events": max(0, len(unresolved) - records), "deferred_events": len(deferred),
               "event_document_limit": 2, "event_payload_limit_bytes": min(max_bytes, 4 * 1024 * 1024)}
-    await asyncio.to_thread(store.update_source, "provider:" + provider, **result)
+    await to_thread(store.update_source, "provider:" + provider, **result)
     return result
 
 
@@ -732,9 +733,9 @@ def _reserve_public_greynoise(store, stamp):
 async def _collect_public_greynoise(config, store, http, stamp, metadata, max_bytes):
     from .http import HTTPError
     from .sourcehub import stage_payload
-    address, reserved = await asyncio.to_thread(_reserve_public_greynoise, store, stamp)
+    address, reserved = await to_thread(_reserve_public_greynoise, store, stamp)
     if address is None:
-        await asyncio.to_thread(store.update_source, "provider:greynoise_public", **reserved)
+        await to_thread(store.update_source, "provider:greynoise_public", **reserved)
         return reserved
     url = "https://api.greynoise.io/v3/community/" + address
     try:
@@ -744,7 +745,7 @@ async def _collect_public_greynoise(config, store, http, stamp, metadata, max_by
         if error.status != 404:
             if error.status == 429:
                 retry_at = (datetime.fromisoformat(stamp) + timedelta(seconds=max(86400, error.retry_after or 0))).isoformat()
-                await asyncio.to_thread(store.update_source, "provider:greynoise_public", retry_at=retry_at)
+                await to_thread(store.update_source, "provider:greynoise_public", retry_at=retry_at)
             raise
         outcome = {"status": "ok", "checked_at": stamp, "last_success": stamp, "deferred": False, "requirements": [],
                    "staged": 0, "records": 0, "qualified": 0, "filtered": 0, "error": "", "last_ip": address,
@@ -758,7 +759,7 @@ async def _collect_public_greynoise(config, store, http, stamp, metadata, max_by
         outcome = {"status": "unchanged" if queued.get("duplicate") else "ok", "checked_at": stamp, "last_success": stamp,
                    "deferred": False, "requirements": [], "staged": int(not queued.get("duplicate")), "records": 1,
                    "qualified": 0, "filtered": 1, "error": "", "last_ip": address, "lookup_status": "observed_context", "http_status": 200}
-    await asyncio.to_thread(store.update_source, "provider:greynoise_public", **outcome)
+    await to_thread(store.update_source, "provider:greynoise_public", **outcome)
     return outcome
 
 
@@ -779,7 +780,7 @@ async def collect_threat_sources(config, store, http):
         for required in definition["required"]:
             if required == "api_key" and not credential or required == "watch_products" and not products or required not in {"api_key", "watch_products"} and not settings.get(required):
                 missing.append(required)
-        previous = await asyncio.to_thread(store.source_state, "provider:" + provider)
+        previous = await to_thread(store.source_state, "provider:" + provider)
         if settings.get("enabled") is False:
             health[provider] = {"status": "disabled", "requirements": []}
         elif not settings.get("enabled") or missing:
@@ -789,7 +790,7 @@ async def collect_threat_sources(config, store, http):
         else:
             health[provider] = {**previous, "status": previous.get("status") or "ready", "requirements": []}
             ready.append((provider, settings, credential))
-    state = await asyncio.to_thread(store.source_state, "threat_provider_cursor")
+    state = await to_thread(store.source_state, "threat_provider_cursor")
     offset = int(state.get("offset") or 0) % max(len(ready), 1)
     selected = (ready[offset:] + ready[:offset])[:budget]
     selected_ids = {provider for provider, _, _ in selected}
@@ -811,7 +812,7 @@ async def collect_threat_sources(config, store, http):
                 if provider == "greynoise_public":
                     return provider, await _collect_public_greynoise(config, store, http, stamp, metadata, max_bytes)
                 if provider == "greynoise":
-                    old = await asyncio.to_thread(store.source_state, "provider:" + provider)
+                    old = await to_thread(store.source_state, "provider:" + provider)
                     ips = list(settings.get("ips") or [])
                     index = int(old.get("ip_offset") or 0) % len(ips)
                     local["ips"] = [ips[index]]
@@ -845,7 +846,7 @@ async def collect_threat_sources(config, store, http):
                                    "staged": 0, "records": 0, "qualified": 0, "filtered": 0,
                                    "fallback_used": False, "primary_error": primary_error,
                                    "fallback_source_url": ARCHIVES[provider][0], "error": primary_error + "; " + reason}
-                    await asyncio.to_thread(store.update_source, "provider:" + provider, **outcome)
+                    await to_thread(store.update_source, "provider:" + provider, **outcome)
                     return provider, outcome
                 payload = await asyncio.to_thread(response.path.read_bytes)
                 if provider == "greynoise":
@@ -868,7 +869,7 @@ async def collect_threat_sources(config, store, http):
                     outcome.update(fallback_used=False, primary_error="", fallback_source_url="", errors=[])
                 if provider == "greynoise":
                     outcome["ip_offset"] = index + 1
-                await asyncio.to_thread(store.update_source, "provider:" + provider, **outcome)
+                await to_thread(store.update_source, "provider:" + provider, **outcome)
                 return provider, outcome
             except Exception as error:
                 detail = f"HTTP {error.status}" if hasattr(error, "status") else str(error)
@@ -877,12 +878,12 @@ async def collect_threat_sources(config, store, http):
                 outcome = {"status": "error", "checked_at": stamp, "deferred": False, "requirements": [],
                            "staged": int(staged is not None and not staged.get("duplicate")), "records": 0,
                            "qualified": 0, "filtered": 0, "error": " ".join(detail.split())[:300]}
-                await asyncio.to_thread(store.update_source, "provider:" + provider, **outcome)
+                await to_thread(store.update_source, "provider:" + provider, **outcome)
                 return provider, outcome
 
-    results = await asyncio.gather(*(collect(*value) for value in selected))
+    results = await gather(*(collect(*value) for value in selected))
     health.update(results)
-    await asyncio.to_thread(store.update_source, "threat_provider_cursor", offset=offset + len(selected))
+    await to_thread(store.update_source, "threat_provider_cursor", offset=offset + len(selected))
     errors = [provider + ": " + result["error"] for provider, result in results if result.get("error")]
     return {"targets": len(selected), "staged": sum(result.get("staged", 0) for _, result in results),
             "records": sum(result.get("records", 0) for _, result in results), "qualified": sum(result.get("qualified", 0) for _, result in results),

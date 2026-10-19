@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
+from .async_utils import gather, to_thread
 from .extract import canonical_url, cpe_parts, read_json
 
 
@@ -179,7 +180,7 @@ async def collect_csaf(config, store, http):
     limit = int(config.get("csaf_max_records", 100))
     if limit < 1:
         raise ValueError("csaf_max_records must be positive")
-    state = await asyncio.to_thread(store.source_state, "csaf")
+    state = await to_thread(store.source_state, "csaf")
     revisions = dict(state.get("documents", {}))
     pending = {item["url"]: item for item in state.get("pending_documents", [])}
     feed_digests = dict(state.get("feed_digests", {}))
@@ -234,11 +235,11 @@ async def collect_csaf(config, store, http):
                 previous = revisions.get(entry["url"], {}).get("records", [])
                 identifiers = {item["id"] for item in batch["advisories"]}
                 deleted = [{"id": item["id"], "aliases": item.get("aliases", []), "title": item["id"], "summary": "Removed from the publisher's current CSAF document.", "source": "CSAF", "url": entry["url"], "affected": [], "rejected": True, "withdrawn": True} for item in previous if item["id"] not in identifiers]
-                await asyncio.to_thread(store.ingest, {"advisories": [*batch["advisories"], *deleted]})
+                await to_thread(store.ingest, {"advisories": [*batch["advisories"], *deleted]})
                 return entry, response.digest, batch["advisories"], None
             except Exception as error:
                 return entry, None, [], f"{entry['url']}: {type(error).__name__}: {error}"
-    results = await asyncio.gather(*(fetch(entry) for entry in selected))
+    results = await gather(*(fetch(entry) for entry in selected))
     records = 0
     advisories = 0
     affected_products = 0
@@ -255,7 +256,7 @@ async def collect_csaf(config, store, http):
         affected_products += sum(len(item["affected"]) for item in items)
         unverified_products += sum(len(item["configurations"]["unverified_products"]) for item in items)
     next_pages = [{"url": url, "name": name} for url, name in dict([*(item for item in queue if item[0] not in visited), *failed_pages]).items()]
-    await asyncio.to_thread(store.update_source, "csaf", documents=revisions, pending_documents=sorted(pending.values(), key=order_document), pending_feed_pages=next_pages, feed_digests=feed_digests, feed_health=health)
+    await to_thread(store.update_source, "csaf", documents=revisions, pending_documents=sorted(pending.values(), key=order_document), pending_feed_pages=next_pages, feed_digests=feed_digests, feed_health=health)
     if not successful_feeds and not records and errors:
         raise RuntimeError("; ".join(errors)[:2000])
     if selected and not records and errors:

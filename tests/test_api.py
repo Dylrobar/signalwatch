@@ -84,6 +84,49 @@ class ApiContractTests(unittest.TestCase):
         finally:
             self.request("/api/sources/settings", before)
 
+    def test_source_settings_reject_credentials_in_every_url_field(self):
+        before = self.request("/api/sources/settings")
+        disk_before = self.config.read_bytes()
+        urls = [
+            "example.test/feed?token=must-not-store",
+            "example.test/feed?%61uthorization=must-not-store",
+            "https://example.test/feed?authorization=must-not-store",
+            "example.test/feed?API_KEY=must-not-store",
+            "user:must-not-store@example.test/feed",
+        ]
+        for location in urls:
+            values = [
+                {"provider_settings": {"zdi_published": {"url": location}}},
+                {"provider_settings": {"zdi_published": {"urls": [location]}}},
+                {"provider_settings": {"technographics": {"verifier_url": location}}},
+                {"source_targets": [{"domain": "example.test", "document_urls": [location]}]},
+                {"source_targets": [{"domain": "example.test", "javascript_urls": [location]}]},
+                {"source_targets": [{"domain": "example.test", "sourcemap_urls": [location]}]},
+                {"source_targets": [{"domain": "example.test", "feed_urls": [location]}]},
+                {"source_targets": [{"domain": "example.test", "provider_urls": {"zdi_published": [location]}}]},
+            ]
+            for payload in values:
+                with self.subTest(payload=payload):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        self.request("/api/sources/settings", payload)
+                    self.assertEqual(raised.exception.code, 422)
+                    self.assertNotIn("must-not-store", raised.exception.read().decode())
+                    self.assertEqual(self.request("/api/sources/settings"), before)
+                    self.assertEqual(self.config.read_bytes(), disk_before)
+
+    def test_source_settings_preserve_public_url_queries(self):
+        before = self.request("/api/sources/settings")
+        location = "example.test/feed?format=json&page=2&limit=20"
+        try:
+            result = self.request("/api/sources/settings", {
+                "source_targets": [{"domain": "example.test", "feed_urls": [location]}],
+            })
+            self.assertTrue(result["saved"])
+            self.assertEqual(result["source_targets"][0]["feed_urls"], [location])
+            self.assertEqual(json.loads(self.config.read_text())["source_targets"][0]["feed_urls"], [location])
+        finally:
+            self.request("/api/sources/settings", before)
+
     def test_unified_staging_preserves_bytes_and_processes_in_background(self):
         raw = b"\x00\xff wireless export\r\n"
         request = {"source": "api-staging-bytes", "adapter": "opaque", "payload_encoding": "base64",
@@ -209,6 +252,25 @@ class ApiContractTests(unittest.TestCase):
                 self.request(path, payload)
             self.assertEqual(raised.exception.code, expected)
         self.assertEqual(store.stats(), before)
+
+    def test_observations_share_canonical_identity_with_company_assets(self):
+        cases = [
+            ("https://canonical-api.example/", "https://CANONICAL-API.EXAMPLE./", "domain:canonical-api.example"),
+            ("https://xn--bcher-kva.example/", "https://b\u00fccher.example/", "domain:xn--bcher-kva.example"),
+            ("https://[2001:db8::1]/", "https://[2001:0db8:0:0:0:0:0:1]/", "domain:2001:db8::1"),
+        ]
+        for index, (asset_url, observation_url, asset_id) in enumerate(cases):
+            with self.subTest(asset_url=asset_url):
+                company = self.request("/api/companies/profile", {"name": f"Canonical Asset API {index}"})
+                self.request("/api/companies/assets", {"company_id": company["id"], "asset_url": asset_url,
+                             "evidence": "Supplied corporate inventory", "source_url": "https://canonical-api.example/legal"})
+                result = self.request("/api/observations", {"asset_url": observation_url, "vendor": "canonical-api",
+                                      "product": "service", "version": "1.0", "evidence": "Supplied version record"})
+                self.assertEqual(result["id"], asset_id)
+                detail = self.request("/api/entity?id=" + company["id"])
+                self.assertEqual(len(detail["observations"]), 1)
+                self.assertEqual(detail["observations"][0]["asset_id"], asset_id)
+                self.assertEqual(detail["company_profile"]["assets"][0]["id"], asset_id)
 
     def test_status_exposes_persisted_retry_time_without_clearing_source_error(self):
         store = Store(self.root / "monitor.db")

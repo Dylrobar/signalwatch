@@ -15,6 +15,7 @@ from urllib.robotparser import RobotFileParser
 import ijson
 from bs4 import BeautifulSoup
 
+from .async_utils import gather, to_thread
 from .extract import canonical_url, fingerprint_page, open_payload, parse_feed, parse_nvd, product_entities, read_json, utcnow
 from .http import HTTPError, PublicHTTP, display_url
 
@@ -115,7 +116,7 @@ class Collector:
 
     async def __aexit__(self, *exc):
         try:
-            await asyncio.to_thread(self._save_discovery)
+            await to_thread(self._save_discovery)
         finally:
             await self.http.__aexit__(*exc)
 
@@ -139,20 +140,20 @@ class Collector:
         return True
 
     async def emit(self, batch):
-        return await asyncio.to_thread(self.store.ingest, batch)
+        return await to_thread(self.store.ingest, batch)
 
     async def state(self, name):
-        return await asyncio.to_thread(self.store.source_state, name)
+        return await to_thread(self.store.source_state, name)
 
     async def checkpoint(self, name, **fields):
-        await asyncio.to_thread(self.store.update_source, name, **fields)
+        await to_thread(self.store.update_source, name, **fields)
 
     async def run_source(self, name):
         handler = getattr(self, f"collect_{name}", None)
         if handler is None:
             raise ValueError(f"Unknown source: {name}")
         result = await handler()
-        await asyncio.to_thread(self._save_discovery)
+        await to_thread(self._save_discovery)
         return {"source": name, **result}
 
     def _ingest_nvd_path(self, path):
@@ -194,7 +195,7 @@ class Collector:
         if digest and digest == previous_hash:
             return {"advisories": 0, "entities": 0}, digest
         result = await self.http.get(f"{NVD_BASE}{label}.json.gz", max_bytes=1024 ** 3)
-        counts = await asyncio.to_thread(self._ingest_nvd_path, result.path)
+        counts = await to_thread(self._ingest_nvd_path, result.path)
         if counts["advisories"] == 0:
             raise ValueError(f"NVD {label} feed has no CVE records")
         return counts, digest or result.digest
@@ -312,7 +313,7 @@ class Collector:
         result = await self.http.get(EPSS_URL, max_bytes=256 * 1024 * 1024)
         if state.get("digest") == result.digest:
             return {"epss": 0}
-        count, date = await asyncio.to_thread(self._ingest_epss, result.path)
+        count, date = await to_thread(self._ingest_epss, result.path)
         await self.checkpoint("epss", digest=result.digest, score_date=date)
         return {"epss": count, "date": date}
 
@@ -410,7 +411,7 @@ class Collector:
         await self.emit({"entities": list(entities.values()), "edges": edges})
         queued = 0
         for url, source_url, company_id in sorted(urls):
-            queued += bool(await asyncio.to_thread(self._enqueue, url, source_url=source_url, company_id=company_id))
+            queued += bool(await to_thread(self._enqueue, url, source_url=source_url, company_id=company_id))
         companies = sum(entity["kind"] == "company" for entity in entities.values())
         if rows:
             cursor, website = max((row["company"]["value"], row["website"]["value"]) for row in rows)
@@ -452,7 +453,7 @@ class Collector:
             for index, feed in pending:
                 outcomes[index] = await collect(feed)
         workers = min(len(feeds), max(1, min(int(self.config["concurrency"]), int(self.config.get("news_concurrency", 8)))))
-        await asyncio.gather(*(worker() for _ in range(workers)))
+        await gather(*(worker() for _ in range(workers)))
         merged = {}
         for articles, _, _ in outcomes:
             for article in articles:
@@ -514,7 +515,7 @@ class Collector:
     async def _crawl(self, target):
         seed = canonical_url(target["url"])
         if not seed:
-            await asyncio.to_thread(self.store.finish_url, target["url"], error="Invalid HTTP URL")
+            await to_thread(self.store.finish_url, target["url"], error="Invalid HTTP URL")
             return {"pages": 0, "observations": 0, "error": "Invalid HTTP URL"}
         host = urlsplit(seed).hostname
         queue = [(seed, 0)]
@@ -576,7 +577,7 @@ class Collector:
             except Exception as error:
                 errors.append(str(error))
         error = "; ".join(dict.fromkeys(errors))[:2000] if errors else None
-        await asyncio.to_thread(self.store.finish_url, target["url"], error=error)
+        await to_thread(self.store.finish_url, target["url"], error=error)
         return {"pages": pages, "observations": observed, "error": error}
 
     async def collect_web(self):
@@ -586,15 +587,15 @@ class Collector:
         for url in self.config.get("seed_urls", []):
             url = canonical_url(url)
             if url:
-                await asyncio.to_thread(self._enqueue, url, source_url=url)
-        candidates = await asyncio.to_thread(self.store.company_crawl_candidates,
+                await to_thread(self._enqueue, url, source_url=url)
+        candidates = await to_thread(self.store.company_crawl_candidates,
                                             [target.get("domain") for target in self.config.get("source_targets", [])],
                                             int(self.config["crawl_batch"]))
         discovered = 0
         scope_edges = []
         scope_domains = {}
         for candidate in candidates:
-            accepted = await asyncio.to_thread(self._enqueue, "https://" + candidate["domain"] + "/", source_url=candidate["source_url"])
+            accepted = await to_thread(self._enqueue, "https://" + candidate["domain"] + "/", source_url=candidate["source_url"])
             if accepted:
                 discovered += 1
                 scope_domains[candidate["scope"]] = {"id": "domain:" + candidate["scope"], "kind": "domain",
@@ -605,12 +606,12 @@ class Collector:
                                     "observed_at": candidate["observed_at"], "confidence": 1.0})
         if scope_edges:
             await self.emit({"entities": list(scope_domains.values()), "edges": scope_edges})
-        targets = await asyncio.to_thread(self.store.crawl_targets, int(self.config["crawl_batch"]), float(self.config["crawl_interval_hours"]))
+        targets = await to_thread(self.store.crawl_targets, int(self.config["crawl_batch"]), float(self.config["crawl_interval_hours"]))
         semaphore = asyncio.Semaphore(int(self.config["concurrency"]))
         async def crawl(target):
             async with semaphore:
                 return await self._crawl(target)
-        results = await asyncio.gather(*(crawl(target) for target in targets))
+        results = await gather(*(crawl(target) for target in targets))
         errors = [row["error"] for row in results if row["error"]]
         if results and not any(row["pages"] for row in results) and errors:
             raise RuntimeError("All crawl targets failed: " + "; ".join(errors)[:2000])

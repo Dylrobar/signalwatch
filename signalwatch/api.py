@@ -276,22 +276,30 @@ def create_app(config, auto_collect=True):
             if any(not math.isfinite(value) or not 0 < value <= 525600 for value in supplied.get("source_intervals", {}).values()):
                 raise ValueError("Source intervals must be positive minutes, at most one year")
 
+            def validate_location(value):
+                location = public_url(value)
+                if any(re.search(r"(?:key|token|secret|password|signature|credential|authorization)", key, re.I)
+                       for key, _ in parse_qsl(urlsplit(location).query, keep_blank_values=True)):
+                    raise ValueError("Public source URLs must not include credentials")
+
             def validate(value):
                 if isinstance(value, dict):
                     for key, child in value.items():
                         if re.search(r"(?:password|secret|token|api[_-]?key|authorization|credentials|headers)|^key$", key, re.I):
                             raise ValueError("Configure provider credentials through environment variables")
+                        is_url = key == "url" or key.endswith("_url")
+                        is_urls = key == "urls" or key.endswith("_urls") and key != "provider_urls"
                         if key == "enabled" and type(child) is not bool:
                             raise ValueError("Provider enabled must be a boolean")
-                        if key in {"url", "query", "user_agent"} and not isinstance(child, str):
+                        if (is_url or key in {"query", "user_agent"}) and not isinstance(child, str):
                             raise ValueError(f"Provider {key} must be a string")
-                        if key == "urls" and (not isinstance(child, list) or any(not isinstance(location, str) for location in child)):
-                            raise ValueError("Provider urls must be an array of strings")
-                        if key == "url" and child:
-                            public_url(child)
-                        if key == "urls":
+                        if is_urls and (not isinstance(child, list) or any(not isinstance(location, str) for location in child)):
+                            raise ValueError(f"Provider {key} must be an array of strings")
+                        if is_url and child:
+                            validate_location(child)
+                        if is_urls:
                             for location in child:
-                                public_url(location)
+                                validate_location(location)
                         validate(child)
                 elif isinstance(value, list):
                     for child in value:
@@ -300,9 +308,7 @@ def create_app(config, auto_collect=True):
                     if len(value) > 4000:
                         raise ValueError("Source setting strings must be at most 4000 characters")
                     if re.match(r"https?://", value.strip(), re.I):
-                        location = public_url(value.strip())
-                        if any(re.search(r"(?:key|token|secret|password|signature|credential)", key, re.I) for key, _ in parse_qsl(urlsplit(location).query, keep_blank_values=True)):
-                            raise ValueError("Public source URLs must not include credentials")
+                        validate_location(value)
                 elif isinstance(value, float) and not math.isfinite(value):
                     raise ValueError("Source settings must contain finite numbers")
 
@@ -323,13 +329,13 @@ def create_app(config, auto_collect=True):
                         raise ValueError(f"Target {key} must be an array of strings")
                 for key in ("document_urls", "javascript_urls", "sourcemap_urls", "feed_urls"):
                     for location in target.get(key, []):
-                        public_url(location)
+                        validate_location(location)
                 if "provider_urls" in target:
                     if not isinstance(target["provider_urls"], dict) or any(not isinstance(locations, list) or any(not isinstance(location, str) for location in locations) for locations in target["provider_urls"].values()):
                         raise ValueError("Target provider_urls must map providers to URL arrays")
                     for locations in target["provider_urls"].values():
                         for location in locations:
-                            public_url(location)
+                            validate_location(location)
         except (ValidationError, ValueError, UnicodeError, RecursionError) as error:
             raise HTTPException(422, str(error)[:300] if isinstance(error, ValueError) and not isinstance(error, ValidationError) else "Invalid source settings") from error
         with config_lock:
@@ -529,13 +535,14 @@ def create_app(config, auto_collect=True):
 
     @app.post("/api/observations")
     def add_observation(request: ObservationRequest):
+        from .companies import asset_identity
+
         try:
             url = public_url(request.asset_url)
+            asset, host = asset_identity(url)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        host = urlsplit(url).hostname
         stamp = now()
-        asset = "domain:" + host
         result = store.ingest({
             "entities": [{"id": asset, "kind": "domain", "name": host, "value": host, "metadata": {}, "observed_at": stamp, "source_url": url, "confidence": 1.0}],
             "observations": [{"asset_id": asset, "vendor": request.vendor, "product": request.product, "version": request.version,

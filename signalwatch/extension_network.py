@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from .async_utils import gather, to_thread
 from .normalization import NormalizationError
 from .http import HTTPError, public_error, retry_delay
 
@@ -296,7 +297,7 @@ async def collect_network_sources(config, store, http):
     semaphore = asyncio.Semaphore(max(1, min(32, int(config.get("public_source_concurrency", 4)))))
     health, errors = {}, []
     payload_limit = int(float(config.get("staging_max_payload_mb", 8)) * 1024 * 1024)
-    ct_state = await asyncio.to_thread(store.source_state, "exposure_ct") if store is not None else {}
+    ct_state = await to_thread(store.source_state, "exposure_ct") if store is not None else {}
     ct_covered = set()
 
     async def collect_provider(definition):
@@ -329,7 +330,7 @@ async def collect_network_sources(config, store, http):
             status["coverage"] = "unexpired_issuances" if provider == "certspotter" else "valid_or_expired_within_90_days;maximum_10_pages"
             status["page_limit"] = 1
         provider_targets = targets[:1] if settings.get("query") and "{domain}" not in str(settings["query"]) or provider not in ENDPOINTS else targets
-        state = await asyncio.to_thread(store.source_state, "exposure_cursors") if store is not None else {}
+        state = await to_thread(store.source_state, "exposure_cursors") if store is not None else {}
         cursor = int(state.get(provider, 0)) % len(provider_targets)
         selected = (provider_targets[cursor:] + provider_targets[:cursor])[:batch_size]
         if incremental:
@@ -400,7 +401,7 @@ async def collect_network_sources(config, store, http):
                     provenance_url = safe_url + ("?" + urlencode(public_params) if public_params else "")
                     async with semaphore:
                         if provider == "passive_dns":
-                            budget = await asyncio.to_thread(_passive_dns_budget, store, time.time(), reserve=True)
+                            budget = await to_thread(_passive_dns_budget, store, time.time(), reserve=True)
                             status["daily_requests_remaining"] = budget["remaining"]
                             if not budget["allowed"]:
                                 budget_deferred = True
@@ -456,7 +457,7 @@ async def collect_network_sources(config, store, http):
             except Exception as exc:
                 if provider == "passive_dns" and isinstance(exc, HTTPError) and exc.status == 429:
                     delay = exc.retry_after if exc.retry_after is not None else 86400
-                    budget = await asyncio.to_thread(_passive_dns_budget, store, time.time(),
+                    budget = await to_thread(_passive_dns_budget, store, time.time(),
                                                      retry_at=time.time() + max(1, delay))
                     status.update(reason="HackerTarget query quota reached; collection is deferred",
                                   retry_at=datetime.fromtimestamp(min(budget["retry_at"], 253402300799), timezone.utc).isoformat())
@@ -478,9 +479,9 @@ async def collect_network_sources(config, store, http):
         if store is not None:
             advanced = traversed if provider == "passive_dns" else len(selected)
             if provider != "passive_dns" or advanced:
-                await asyncio.to_thread(store.update_source, "exposure_cursors", **{provider: (cursor + advanced) % len(provider_targets)})
+                await to_thread(store.update_source, "exposure_cursors", **{provider: (cursor + advanced) % len(provider_targets)})
             if incremental:
-                await asyncio.to_thread(store.update_source, "exposure_ct", **{provider: {**progress, "targets": domain_states, "request_times": request_times}})
+                await to_thread(store.update_source, "exposure_ct", **{provider: {**progress, "targets": domain_states, "request_times": request_times}})
         if provider == "ctlogs":
             status["pending_pages"] = sum(bool(value.get("after")) for value in domain_states.values())
         if provider == "passive_dns":
@@ -491,5 +492,5 @@ async def collect_network_sources(config, store, http):
 
     for provider in CT_PROVIDERS:
         await collect_provider(next(row for row in SOURCE_DEFINITIONS if row["id"] == provider))
-    await asyncio.gather(*(collect_provider(definition) for definition in SOURCE_DEFINITIONS if definition["id"] not in CT_PROVIDERS))
+    await gather(*(collect_provider(definition) for definition in SOURCE_DEFINITIONS if definition["id"] not in CT_PROVIDERS))
     return {key: sum(row[key] for row in health.values()) for key in ("staged", "unchanged", "records", "requests", "pending_targets")} | {"provider_health": health, "errors": errors}

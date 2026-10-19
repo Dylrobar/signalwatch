@@ -1,10 +1,10 @@
-import asyncio
 import hashlib
 import importlib
 import json
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from .async_utils import to_thread
 from .ingestion import staging_queue
 
 
@@ -65,7 +65,7 @@ async def stage_payload(config, store, payload, *, provider, source_url="", cont
     location = scrub_source_url(source_url)
     context = json.dumps([location, values, content_type, observed_at], sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     key = hashlib.sha256(bytes(payload) + b"\0" + context).hexdigest()
-    return await asyncio.to_thread(staging_queue(store, config).enqueue, payload, source="public:" + provider,
+    return await to_thread(staging_queue(store, config).enqueue, payload, source="public:" + provider,
                                    adapter="public_source", content_type=content_type, source_url=location,
                                    stream_key=stream_key, metadata=values, observed_at=observed_at,
                                    idempotency_key=key)

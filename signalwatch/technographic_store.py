@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS technographic_sources (
 );
 CREATE INDEX IF NOT EXISTS technographic_source_document ON technographic_sources(document_id,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS technographic_source_endpoint ON technographic_sources(endpoint_url,organization_id);
+CREATE INDEX IF NOT EXISTS technographic_source_entity ON technographic_sources(source_entity_id);
 CREATE TABLE IF NOT EXISTS tech_fingerprints (
  id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, document_id TEXT NOT NULL,
  vendor TEXT NOT NULL, product TEXT NOT NULL, vendor_name TEXT NOT NULL,
@@ -75,18 +76,74 @@ def document_input(entity):
             "published_at": fields.get("published_at"), "content_hash": hashlib.sha256(text.encode()).hexdigest()}
 
 
+def _domain(context):
+    return str(context.get("domain") or "").strip().lower().rstrip(".").removeprefix("www.")
+
+
+def _excluded(conn, company_id, domain):
+    return bool(domain and conn.execute("""SELECT 1 FROM company_asset_decisions
+     WHERE company_id=? AND asset_id IN (?,?) AND (status!='confirmed' OR role!='owned') LIMIT 1""",
+     (company_id, "domain:" + domain, "domain:www." + domain)).fetchone())
+
+
 def organization(conn, context):
+    domain = _domain(context)
     key = context.get("company_id")
     if key:
         row = conn.execute("SELECT id FROM entities WHERE id=? AND kind='company'", (key,)).fetchone()
-        return row[0] if row else None
-    domain = str(context.get("domain") or "").lower().rstrip(".").removeprefix("www.")
+        return row[0] if row and not _excluded(conn, key, domain) else None
     if not domain:
         return None
-    rows = conn.execute("""SELECT DISTINCT c.id FROM entities c JOIN edges e ON e.from_id=c.id
-     WHERE c.kind='company' AND e.relation='official_website' AND e.to_id IN (?,?) LIMIT 2""",
-                        ("domain:" + domain, "domain:www." + domain)).fetchall()
+    rows = conn.execute("""SELECT DISTINCT c.id FROM entities c JOIN (
+      SELECT from_id AS company_id FROM edges WHERE relation='official_website' AND to_id IN (?,?)
+      UNION SELECT company_id FROM company_asset_decisions
+       WHERE asset_id IN (?,?) AND status='confirmed' AND role='owned'
+     ) association ON association.company_id=c.id
+     WHERE c.kind='company' AND NOT EXISTS (SELECT 1 FROM company_asset_decisions rejected
+      WHERE rejected.company_id=c.id AND rejected.asset_id IN (?,?)
+       AND (rejected.status!='confirmed' OR rejected.role!='owned')) LIMIT 2""",
+     ("domain:" + domain, "domain:www." + domain) * 3).fetchall()
     return rows[0][0] if len(rows) == 1 else None
+
+
+def enrichment_targets(conn, limit):
+    rows = conn.execute("""WITH associations AS (
+      SELECT e.from_id AS company_id,e.to_id AS asset_id FROM edges e WHERE e.relation='official_website'
+      UNION SELECT company_id,asset_id FROM company_asset_decisions WHERE status='confirmed' AND role='owned'
+     ), domains AS (
+      SELECT c.id AS company_id,c.name,lower(rtrim(d.value,'.')) AS domain,
+       CASE WHEN lower(d.value) LIKE 'www.%' THEN substr(lower(rtrim(d.value,'.')),5)
+        ELSE lower(rtrim(d.value,'.')) END AS canonical_domain
+      FROM associations a JOIN entities c ON c.id=a.company_id AND c.kind='company'
+      JOIN entities d ON d.id=a.asset_id AND d.kind='domain'
+     ), included AS (
+      SELECT * FROM domains d WHERE NOT EXISTS (SELECT 1 FROM company_asset_decisions rejected
+       WHERE rejected.company_id=d.company_id
+        AND rejected.asset_id IN ('domain:'||d.canonical_domain,'domain:www.'||d.canonical_domain)
+        AND (rejected.status!='confirmed' OR rejected.role!='owned'))
+     ), owners AS (
+      SELECT canonical_domain,CASE WHEN count(DISTINCT company_id)=1 THEN min(company_id) ELSE '' END AS company_id,
+       CASE WHEN count(DISTINCT company_id)=1 THEN min(name) ELSE '' END AS name
+      FROM included GROUP BY canonical_domain
+     ) SELECT DISTINCT i.domain,o.company_id,o.name FROM included i
+      JOIN owners o ON o.canonical_domain=i.canonical_domain ORDER BY i.domain LIMIT ?""", (max(1, int(limit)),))
+    return [dict(row) for row in rows]
+
+
+def reproject_domain(store, conn, asset_id):
+    """Apply a manual decision to retained evidence without changing its source record."""
+    domain = asset_id.removeprefix("domain:").removeprefix("www.")
+    rows = conn.execute("""SELECT * FROM entities WHERE kind IN ('job_posting','company_article','source_record')
+     AND lower(rtrim(coalesce(json_extract(metadata,'$.company_context.domain'),
+      json_extract(metadata,'$.target_domain'),''),'.')) IN (?,?)""", (domain, "www." + domain)).fetchall()
+    affected = set()
+    for row in rows:
+        entity = dict(row)
+        entity["metadata"] = json.loads(entity["metadata"])
+        affected.update(item[0] for item in conn.execute("SELECT organization_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)))
+        project(store, conn, entity, entity["updated_at"])
+        affected.update(item[0] for item in conn.execute("SELECT organization_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)))
+    return affected
 
 
 def document_seen(conn, context, content_hash):
@@ -98,15 +155,23 @@ def document_seen(conn, context, content_hash):
 def project(store, conn, entity, timestamp):
     from .technographics import extract
 
+    # Entity updates merge metadata; attribution must use that retained state,
+    # not interpret an omitted field in a partial refresh as its removal.
+    if entity.get("kind") in {"job_posting", "company_article", "source_record"}:
+        saved = conn.execute("SELECT * FROM entities WHERE id=?", (entity["id"],)).fetchone()
+        if saved is not None:
+            entity = dict(saved)
+            entity["metadata"] = json.loads(entity["metadata"])
     doc = document_input(entity)
     if doc is None:
+        if conn.execute("SELECT 1 FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)).fetchone():
+            _detach_sources(store, conn, entity["id"], None, None, timestamp)
         return {}
     company_id = organization(conn, doc["organization_context"])
+    document_id = ("technographic_document:" + hashlib.sha256((company_id + "\0" + doc["content_hash"]).encode()).hexdigest()) if company_id else None
+    _detach_sources(store, conn, entity["id"], company_id, document_id, timestamp)
     if company_id is None:
         return {"technographic_unattributed": 1}
-    document_id = "technographic_document:" + hashlib.sha256((company_id + "\0" + doc["content_hash"]).encode()).hexdigest()
-    previous = conn.execute("SELECT document_id FROM technographic_sources WHERE organization_id=? AND source_entity_id=?",
-                            (company_id, entity["id"])).fetchone()
     duplicate = conn.execute("SELECT 1 FROM technographic_documents WHERE id=?", (document_id,)).fetchone() is not None
     conn.execute("""INSERT INTO technographic_documents VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id)
      DO UPDATE SET last_seen_at=max(technographic_documents.last_seen_at,excluded.last_seen_at)""",
@@ -116,13 +181,12 @@ def project(store, conn, entity, timestamp):
      source_url=excluded.source_url,url_hash=excluded.url_hash,endpoint_url=excluded.endpoint_url,
      source_type=excluded.source_type,last_seen_at=excluded.last_seen_at""",
                  (company_id, entity["id"], document_id, doc["source_url"], doc["url_hash"], doc["endpoint_url"], doc["source_type"], timestamp, timestamp))
-    if previous and previous[0] != document_id and not conn.execute("SELECT 1 FROM technographic_sources WHERE document_id=?", (previous[0],)).fetchone():
-        _clear_projection(store, conn, company_id, previous[0], timestamp)
+    store._edge(conn, {"from_id": company_id, "to_id": entity["id"], "relation": "has_public_evidence",
+                       "source_url": doc["source_url"], "confidence": 1.0}, timestamp)
     if duplicate:
         conn.execute("UPDATE tech_fingerprints SET last_seen_at=max(last_seen_at,?) WHERE document_id=?", (timestamp, document_id))
         _graph(store, conn, entity["id"], document_id, doc["source_url"], timestamp)
-        if not previous or previous[0] != document_id:
-            _observations(store, conn, company_id, document_id, timestamp)
+        _observations(store, conn, company_id, document_id, timestamp)
         return {"technographic_duplicates": 1}
     if doc["source_type"] == "dns_txt":
         findings = [{"vendor": vendor, "vendor_name": name, "product": "domain verification", "product_name": name + " domain verification",
@@ -146,11 +210,25 @@ def project(store, conn, entity, timestamp):
                      (fingerprint_id, company_id, document_id, finding["vendor"], finding["product"], finding["vendor_name"],
                       finding["product_name"], finding["category"], finding["part"], finding.get("version") or "", finding.get("cpe"),
                       finding["status"], finding["confidence"], finding["evidence_snippet"], finding["method"], timestamp, timestamp))
-    store._edge(conn, {"from_id": company_id, "to_id": entity["id"], "relation": "has_public_evidence",
-                       "source_url": doc["source_url"], "confidence": 1.0}, timestamp)
     _graph(store, conn, entity["id"], document_id, doc["source_url"], timestamp)
     _observations(store, conn, company_id, document_id, timestamp)
     return {"technographic_documents": 1, "tech_fingerprints": len(findings)}
+
+
+def _detach_sources(store, conn, entity_id, company_id, document_id, timestamp):
+    previous = conn.execute("SELECT organization_id,document_id FROM technographic_sources WHERE source_entity_id=?", (entity_id,)).fetchall()
+    for old_company, old_document in previous:
+        if (old_company, old_document) == (company_id, document_id):
+            continue
+        conn.execute("DELETE FROM technographic_sources WHERE organization_id=? AND source_entity_id=?", (old_company, entity_id))
+        if not conn.execute("SELECT 1 FROM technographic_sources WHERE document_id=?", (old_document,)).fetchone():
+            _clear_projection(store, conn, old_company, old_document, timestamp)
+        else:
+            _observations(store, conn, old_company, old_document, timestamp)
+    conn.execute("DELETE FROM edges WHERE to_id=? AND relation='has_public_evidence' AND (? IS NULL OR from_id!=?)",
+                 (entity_id, company_id, company_id))
+    if company_id is None:
+        conn.execute("DELETE FROM edges WHERE from_id=? AND relation LIKE 'technology_%'", (entity_id,))
 
 
 def _graph(store, conn, entity_id, document_id, source_url, timestamp):
@@ -169,14 +247,14 @@ def _clear_projection(store, conn, company_id, document_id, timestamp):
 
 
 def _observations(store, conn, company_id, document_id, timestamp):
-    source = conn.execute("SELECT source_url FROM technographic_sources WHERE document_id=? ORDER BY last_seen_at DESC,source_url LIMIT 1", (document_id,)).fetchone()
+    source = conn.execute("SELECT source_url,last_seen_at FROM technographic_sources WHERE document_id=? ORDER BY last_seen_at DESC,source_url LIMIT 1", (document_id,)).fetchone()
     if source is None:
         return
     observations = []
     for finding in conn.execute("SELECT * FROM tech_fingerprints WHERE document_id=? AND status='asserted_use'", (document_id,)):
         observations.append({"asset_id": company_id, "vendor": finding["vendor"], "product": finding["product"],
                              "part": finding["part"], "version": finding["version"], "cpe": finding["cpe"],
-                             "origin": "technographic:" + document_id, "source_url": source[0], "observed_at": timestamp,
+                             "origin": "technographic:" + document_id, "source_url": source[0], "observed_at": source[1],
                              "confidence": finding["confidence"], "evidence": finding["evidence_snippet"],
                              "evidence_role": "public_text_assertion", "deployment_verified": False, "method": finding["method"]})
     store.ingest({"observation_snapshots": [{"asset_id": company_id, "origin": "technographic:" + document_id}], "observations": observations}, conn=conn)
