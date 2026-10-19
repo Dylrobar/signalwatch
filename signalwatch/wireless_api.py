@@ -58,6 +58,9 @@ def register_wireless_routes(app, config, store, imports):
     from .staging import QueueFull
 
     enrichment = {"task": None}
+    if store.source_state("wireless_enrichment").get("status") == "running":
+        store.update_source("wireless_enrichment", status="interrupted", phase="interrupted",
+                            error="Server restarted during company matching; run enrichment again to resume.")
 
     async def retain(payload, source, location, content_type, metadata, version):
         try:
@@ -259,7 +262,8 @@ def register_wireless_routes(app, config, store, imports):
             raise HTTPException(400, str(error)) from error
 
     async def run_enrichment(request):
-        await asyncio.to_thread(store.update_source, "wireless_enrichment", status="running", error=None)
+        await asyncio.to_thread(store.update_source, "wireless_enrichment", status="running", error=None,
+                                phase="manufacturer_matching" if request.manufacturers else "business_matching")
         try:
             result = {}
             if request.manufacturers:

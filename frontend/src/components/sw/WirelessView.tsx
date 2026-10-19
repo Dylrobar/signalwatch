@@ -160,7 +160,7 @@ export function WirelessView({ gen, onCompany }: { gen: number; onCompany: (id: 
     setUploadResult("");
     if (blob.size > 32 * 1024 * 1024) {
       setUploadError(
-        "The upload exceeds the default 32 MiB limit. Upload a gzip export or use the server import CLI for larger datasets.",
+        "The upload exceeds the default 32 MiB limit. Use a smaller export or compress it as gzip.",
       );
       return;
     }

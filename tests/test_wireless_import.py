@@ -10,10 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from signalwatch.config import DEFAULTS
+from signalwatch.api import create_app
 from signalwatch.ingestion import StagingWorker, staging_queue
 from signalwatch.staging import QueueFull
 from signalwatch.store import Store
 from signalwatch.wireless import iter_wigle_chunks, normalize_wigle, register_dataset, stats
+from signalwatch.wireless_attribution import device_company_links, match_facilities, set_device_company, upsert_facility
 from signalwatch.wireless_import import WirelessImports
 
 
@@ -156,6 +158,37 @@ class WirelessImportTests(unittest.IsolatedAsyncioTestCase):
         with self.store.connection() as conn:
             self.assertEqual(conn.execute("SELECT status FROM wireless_datasets WHERE id=?", (identity,)).fetchone()[0], "failed")
         self.assertEqual(staging_queue(self.store, self.config).stats()["total"], 0)
+
+    async def test_app_restart_marks_interrupted_enrichment_and_preserves_evidence_and_decisions(self):
+        create_app(self.config, auto_collect=False)
+        path = self.archive()
+        for chunk in iter_wigle_chunks(path, rows_per_chunk=2):
+            self.store.ingest(normalize_wigle(chunk))
+        company_id = self.store.save_company_profile(name="Example reviewed operator")["id"]
+        upsert_facility(self.store, "Example known facility", 44, -73, company_id,
+                        source_url="https://example.test/known-facility")
+        match_facilities(self.store)
+        with self.store.connection() as conn:
+            identity = conn.execute("SELECT id FROM wireless_devices WHERE radio_type='WIFI'").fetchone()[0]
+        set_device_company(self.store, identity, company_id, "confirmed", "Example reviewed inventory evidence",
+                           "https://example.test/reviewed-inventory")
+        with self.store.connection() as conn:
+            before_links = device_company_links(conn, identity)
+            before_raw = [tuple(row) for row in conn.execute("SELECT dataset_id,source_row,raw FROM wireless_observations ORDER BY source_row")]
+        self.store.update_source("wireless_enrichment", status="running", phase="manufacturer_matching",
+                                 counts={"manufacturer_links": 2}, started_at="2026-01-01T00:00:00Z")
+        restarted = create_app(self.config, auto_collect=False)
+        recovered = restarted.state.store.source_state("wireless_enrichment")
+        self.assertEqual((recovered["status"], recovered["phase"]), ("interrupted", "interrupted"))
+        self.assertIn("restarted", recovered["error"].lower())
+        self.assertEqual(recovered["counts"], {"manufacturer_links": 2})
+        self.assertEqual(recovered["started_at"], "2026-01-01T00:00:00Z")
+        with restarted.state.store.connection() as conn:
+            self.assertEqual(device_company_links(conn, identity), before_links)
+            self.assertEqual([tuple(row) for row in conn.execute("SELECT dataset_id,source_row,raw FROM wireless_observations ORDER BY source_row")], before_raw)
+        self.assertTrue(before_links["operator_confirmed"])
+        self.assertIn("candidate_business", {row["role"] for row in before_links["items"]})
+        self.assertEqual(stats(restarted.state.store)["observations"], 5)
 
     async def test_empty_and_bad_header_exports_fail_without_partial_observations(self):
         for content in (b"WigleWifi-1.6\nMAC,Type\n", b"not,a,wigle,export\n"):

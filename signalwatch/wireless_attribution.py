@@ -183,16 +183,16 @@ def enrich_manufacturers(store):
     with store.connection(write=True) as conn:
         conn.execute("DELETE FROM wireless_company_links WHERE origin IN ('ieee_registry','bluetooth_registry')")
         for bits in (36, 28, 24):
-            more_specific = "".join(" AND NOT EXISTS (SELECT 1 FROM wireless_manufacturer_prefixes longer WHERE longer.bits="
+            more_specific = "".join(" AND NOT EXISTS (SELECT 1 FROM wireless_manufacturer_prefixes longer INDEXED BY wireless_manufacturer_assignment WHERE longer.bits="
                                     +str(width)+" AND longer.prefix=substr(upper(replace(replace(d.identifier,':',''),'-','')),1,"
                                     +str(width//4)+"))" for width in (28, 36) if width > bits)
             conn.execute("""INSERT OR IGNORE INTO wireless_company_links
              SELECT d.id,r.company_id,'manufacturer','assigned','','ieee_registry',
               json_object('registry',r.registry,'prefix',r.prefix,'prefix_bits',r.bits,'registry_version',r.version,
                'basis','IEEE address block assignee; model and operator unknown'),r.source_url,?,?
-             FROM wireless_devices d JOIN wireless_manufacturer_prefixes r
-              ON r.bits=? AND r.prefix=substr(upper(replace(replace(d.identifier,':',''),'-','')),1,?)
-             WHERE length(replace(replace(d.identifier,':',''),'-',''))=12
+             FROM wireless_devices d NOT INDEXED CROSS JOIN wireless_manufacturer_prefixes r INDEXED BY wireless_manufacturer_assignment
+             WHERE r.bits=? AND r.prefix=substr(upper(replace(replace(d.identifier,':',''),'-','')),1,?)
+              AND length(replace(replace(d.identifier,':',''),'-',''))=12
               AND upper(replace(replace(d.identifier,':',''),'-','')) NOT GLOB '*[^0-9A-F]*'
               AND d.radio_type='WIFI'
               AND substr(upper(replace(replace(d.identifier,':',''),'-','')),2,1) IN ('0','4','8','C')"""
@@ -202,9 +202,9 @@ def enrich_manufacturers(store):
           json_object('registry',r.registry,'company_identifier',r.prefix,'registry_version',r.version,
            'basis','Observed Bluetooth manufacturer-specific data company ID; hardware and operator unverified'),
           r.source_url,max(coalesce(o.observed_at,'')),?
-         FROM wireless_observations o JOIN wireless_manufacturer_prefixes r
-          ON r.registry='Bluetooth SIG' AND r.prefix=printf('%04X',CAST(o.manufacturer_id AS INTEGER))
-         WHERE o.manufacturer_id!='' AND lower(substr(trim(o.manufacturer_id),1,2))!='0x'
+         FROM wireless_observations o NOT INDEXED CROSS JOIN wireless_manufacturer_prefixes r INDEXED BY wireless_manufacturer_assignment
+         WHERE r.bits=16 AND r.registry='Bluetooth SIG' AND r.prefix=printf('%04X',CAST(o.manufacturer_id AS INTEGER))
+          AND o.manufacturer_id!='' AND lower(substr(trim(o.manufacturer_id),1,2))!='0x'
           AND o.radio_type IN ('BLE','BT')
           AND trim(o.manufacturer_id) NOT GLOB '*[^0-9]*'
          GROUP BY o.device_id,r.company_id""", (timestamp,))
@@ -213,9 +213,9 @@ def enrich_manufacturers(store):
           json_object('registry',r.registry,'company_identifier',r.prefix,'registry_version',r.version,
            'basis','Observed Bluetooth manufacturer-specific data company ID; hardware and operator unverified'),
           r.source_url,max(coalesce(o.observed_at,'')),?
-         FROM wireless_observations o JOIN wireless_manufacturer_prefixes r
-          ON r.registry='Bluetooth SIG' AND r.prefix=substr('0000'||upper(substr(trim(o.manufacturer_id),3)),-4)
-         WHERE lower(substr(trim(o.manufacturer_id),1,2))='0x'
+         FROM wireless_observations o NOT INDEXED CROSS JOIN wireless_manufacturer_prefixes r INDEXED BY wireless_manufacturer_assignment
+         WHERE r.bits=16 AND r.registry='Bluetooth SIG' AND r.prefix=substr('0000'||upper(substr(trim(o.manufacturer_id),3)),-4)
+          AND lower(substr(trim(o.manufacturer_id),1,2))='0x'
           AND o.radio_type IN ('BLE','BT')
           AND length(trim(o.manufacturer_id)) BETWEEN 3 AND 6
           AND upper(substr(trim(o.manufacturer_id),3)) NOT GLOB '*[^0-9A-F]*'

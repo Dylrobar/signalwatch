@@ -4,8 +4,10 @@ import io
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from signalwatch.store import Store
 from signalwatch.wireless import device_id, normalize_wigle
@@ -93,6 +95,31 @@ class WirelessAttributionTests(unittest.TestCase):
         self.assertTrue(links["manufacturer_assignment_conflict"])
         self.assertEqual({row["company_name"] for row in links["items"]}, {"First historical assignee", "Second historical assignee"})
         self.assertFalse(links["operator_confirmed"])
+
+    def test_manufacturer_rebuild_scans_input_once_and_indexes_each_prefix_lookup(self):
+        self.observations([["00:11:22:33:44:55", "WiFi", "WIFI", 44, -73, 5, "", "", -50],
+                           ["C2:11:22:33:44:55", "BLE", "BLE", 44, -73, 5, "0x004c", "", -50]])
+        self.registry("001122")
+        import_manufacturer_registry(self.store, '[{"value":76,"name":"Assigned provider"}]', "Bluetooth SIG", "https://bluetooth.example/")
+        statements = []
+        original = self.store.connection
+        @contextmanager
+        def traced_connection(write=False):
+            with original(write=write) as conn:
+                conn.set_trace_callback(statements.append)
+                yield conn
+        with patch.object(self.store, "connection", traced_connection):
+            enrich_manufacturers(self.store)
+        inserts = [statement for statement in statements if "INSERT OR IGNORE INTO wireless_company_links" in statement]
+        self.assertEqual(len(inserts), 5)
+        with original() as conn:
+            for statement in inserts:
+                details = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + statement)]
+                input_alias = "d" if "FROM wireless_devices" in statement else "o"
+                self.assertEqual(details[0], "SCAN " + input_alias)
+                registry = next(detail for detail in details if detail.startswith("SEARCH r "))
+                self.assertIn("wireless_manufacturer_assignment", registry)
+                self.assertIn("bits=? AND prefix=?", registry)
 
     def test_scan_points_match_multiple_candidates_and_all_observed_locations(self):
         identifier = "00:11:22:33:44:55"
