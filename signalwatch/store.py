@@ -855,6 +855,24 @@ class Store:
              (max(1, int(limit)),))
             return [dict(row) for row in rows]
 
+    def company_crawl_candidates(self, configured_domains=(), limit=50):
+        domains = sorted({str(domain).lower().rstrip(".") for domain in configured_domains if domain})
+        configured = "json_extract(s.metadata,'$.target_domain') IN (" + ",".join("?" for _ in domains) + ")" if domains else "0"
+        with self.connection() as conn:
+            rows = conn.execute(f"""WITH candidates AS (SELECT d.value AS domain,s.id AS record_id,
+             s.source_url,s.observed_at,json_extract(s.metadata,'$.target_domain') AS scope,
+             row_number() OVER (PARTITION BY d.value ORDER BY coalesce(julianday(s.observed_at),0) DESC,s.id) AS position
+             FROM entities s JOIN edges report ON report.from_id=s.id AND report.relation='reports_on'
+             JOIN entities d ON d.id=report.to_id AND d.kind='domain'
+             WHERE s.kind='source_record' AND json_extract(s.metadata,'$.provider') IN ('ctlogs','crtsh','certspotter')
+             AND substr(d.value,-length(json_extract(s.metadata,'$.target_domain'))-1)='.'||json_extract(s.metadata,'$.target_domain')
+             AND ({configured} OR EXISTS (SELECT 1 FROM edges official JOIN entities c ON c.id=official.from_id AND c.kind='company'
+              WHERE official.to_id='domain:'||json_extract(s.metadata,'$.target_domain') AND official.relation='official_website'))
+             AND NOT EXISTS (SELECT 1 FROM crawl_urls q WHERE q.url IN ('https://'||d.value||'/','http://'||d.value||'/'))
+             ) SELECT domain,record_id,source_url,observed_at,scope FROM candidates
+             WHERE position=1 ORDER BY domain LIMIT ?""", (*domains, max(1, int(limit))))
+            return [dict(row) for row in rows]
+
     def network_targets(self, limit=100, refresh_hours=24):
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=float(refresh_hours))).isoformat(timespec="seconds")
         with self.connection() as conn:

@@ -572,6 +572,24 @@ class Collector:
             url = canonical_url(url)
             if url:
                 await asyncio.to_thread(self._enqueue, url, source_url=url)
+        candidates = await asyncio.to_thread(self.store.company_crawl_candidates,
+                                            [target.get("domain") for target in self.config.get("source_targets", [])],
+                                            int(self.config["crawl_batch"]))
+        discovered = 0
+        scope_edges = []
+        scope_domains = {}
+        for candidate in candidates:
+            accepted = await asyncio.to_thread(self._enqueue, "https://" + candidate["domain"] + "/", source_url=candidate["source_url"])
+            if accepted:
+                discovered += 1
+                scope_domains[candidate["scope"]] = {"id": "domain:" + candidate["scope"], "kind": "domain",
+                    "name": candidate["scope"], "value": candidate["scope"], "_reference_only": True,
+                    "source_url": candidate["source_url"], "observed_at": candidate["observed_at"]}
+                scope_edges.append({"from_id": candidate["record_id"], "to_id": "domain:" + candidate["scope"],
+                                    "relation": "certificate_lookup_scope", "source_url": candidate["source_url"],
+                                    "observed_at": candidate["observed_at"], "confidence": 1.0})
+        if scope_edges:
+            await self.emit({"entities": list(scope_domains.values()), "edges": scope_edges})
         targets = await asyncio.to_thread(self.store.crawl_targets, int(self.config["crawl_batch"]), float(self.config["crawl_interval_hours"]))
         semaphore = asyncio.Semaphore(int(self.config["concurrency"]))
         async def crawl(target):
@@ -583,5 +601,6 @@ class Collector:
             raise RuntimeError("All crawl targets failed: " + "; ".join(errors)[:2000])
         dns_errors = [message for host in sorted(self.dns_errors) for message in self.dns_errors[host]]
         return {"targets": len(targets), "pages": sum(row["pages"] for row in results), "observations": sum(row["observations"] for row in results),
+                "company_hosts_considered": len(candidates), "company_hosts_queued": discovered,
                 "dns_hosts": len(self.dns_results), "dns_records": sum(record["type"] in {"A", "AAAA"} for result in self.dns_results.values() for record in result.records),
                 "dns_failed": len(self.dns_errors), "dns_fallbacks": sum(result.mode == "doh" and bool(result.system_error) for result in self.dns_results.values()), "errors": [*errors, *dns_errors]}

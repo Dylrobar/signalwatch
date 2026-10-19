@@ -33,6 +33,9 @@ class CaptureStore:
     def enqueue_url(self, url, **fields):
         self.urls.append(url)
 
+    def company_crawl_candidates(self, *args):
+        return []
+
     def finish_url(self, url, error=None):
         self.finished[url] = error
 
