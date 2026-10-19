@@ -4,7 +4,45 @@ import traceback
 import unittest
 from pathlib import Path
 
-from signalwatch.proxies import MAX_PROXY_BYTES, ProxyConfigurationError, ProxyPool, ProxyUnavailableError
+from signalwatch.proxies import (
+    MAX_PROXY_BYTES, ProxyConfigurationError, ProxyPool, ProxyUnavailableError, direct_hosts_from_env,
+)
+
+
+class DirectHostConfigurationTests(unittest.TestCase):
+    def test_default_routes_only_official_cisa_and_nvd_hosts_directly(self):
+        self.assertEqual(direct_hosts_from_env({}), {
+            "www.cisa.gov", "nvd.nist.gov", "services.nvd.nist.gov",
+        })
+
+    def test_explicit_empty_list_routes_every_host_through_configured_proxy(self):
+        for value in ("", "  ", " , , "):
+            with self.subTest(value=value):
+                self.assertEqual(direct_hosts_from_env({"SIGNALWATCH_PROXY_DIRECT_HOSTS": value}), set())
+
+    def test_override_replaces_defaults_and_canonicalizes_exact_hosts(self):
+        hosts = direct_hosts_from_env({"SIGNALWATCH_PROXY_DIRECT_HOSTS":
+            " API.Example.test., api.example.test, bücher.example, 192.0.2.1, [2001:0db8::1], , "})
+        self.assertEqual(hosts, {"api.example.test", "xn--bcher-kva.example", "192.0.2.1", "2001:db8::1"})
+
+    def test_malformed_direct_hosts_fail_closed_without_echoing_values(self):
+        for value in ("https://private-value.example", "private-value.example:443", "*.private-value.example",
+                      ".private-value.example", "user:private-value@host.test", "host.test/private-value",
+                      "host.test?token=private-value", "host.test#private-value", "bad private-value.test",
+                      "bad\nprivate-value.test", "%70rivate-value.test", "bad..private-value.test",
+                      "host.test,[fe80::1%private-value]", None, 1, "x" * 16385):
+            with self.subTest(value_type=type(value).__name__), self.assertRaises(ProxyConfigurationError) as raised:
+                direct_hosts_from_env({"SIGNALWATCH_PROXY_DIRECT_HOSTS": value})
+            self.assertNotIn("private-value", str(raised.exception))
+
+    def test_invalid_direct_host_does_not_leak_value_through_exception_chain(self):
+        env = {"SIGNALWATCH_PROXY_DIRECT_HOSTS": "user:private-value@host.test"}
+        try:
+            direct_hosts_from_env(env)
+        except ProxyConfigurationError as error:
+            self.assertNotIn("private-value", "".join(traceback.format_exception(error)))
+        else:
+            self.fail("Invalid direct host was accepted")
 
 
 class ProxyConfigurationTests(unittest.TestCase):

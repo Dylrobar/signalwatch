@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import json
 import tempfile
@@ -8,10 +9,10 @@ from pathlib import Path
 
 from aiohttp import web
 
-from signalwatch.collectors import Collector, github_timestamp, next_link, parse_github
+from signalwatch.collectors import Collector, KEV_MIRROR_URL, KEV_URL, github_timestamp, next_link, parse_github
 from signalwatch.config import DEFAULTS
 from signalwatch.extract import canonical_url, cpe_parts, fingerprint_page, parse_feed, parse_nvd, read_json
-from signalwatch.http import FetchResult, PublicHTTP, retry_delay
+from signalwatch.http import FetchResult, HTTPError, PublicHTTP, PublicRequestError, retry_delay
 
 
 class CaptureStore:
@@ -190,6 +191,27 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NVDContinuityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bulk_feed_access_errors_use_api_only_without_active_cooldown(self):
+        for status, retry_after in ((403, None), (404, None), (403, 120), (404, 0.5)):
+            with self.subTest(status=status, retry_after=retry_after), tempfile.TemporaryDirectory() as folder:
+                store = CaptureStore()
+                store.sources["nvd"] = {"initialized": True, "watermark": datetime.now(timezone.utc).isoformat()}
+                previous_state = dict(store.sources["nvd"])
+                collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+                error = HTTPError(status, "https://nvd.nist.gov/feed", retry_after=retry_after)
+                collector._nvd_feed = AsyncMock(side_effect=error)
+                collector._nvd_api = AsyncMock(return_value={"advisories": 7, "mode": "api_fallback"})
+                if retry_after is None:
+                    self.assertEqual(await collector.collect_nvd(), {"advisories": 7, "mode": "api_fallback"})
+                    collector._nvd_api.assert_awaited_once_with(previous_state)
+                else:
+                    with self.assertRaises(HTTPError) as raised:
+                        await collector.collect_nvd()
+                    self.assertIs(raised.exception, error)
+                    collector._nvd_api.assert_not_awaited()
+                    self.assertEqual(store.sources["nvd"], previous_state)
+                collector._nvd_feed.assert_awaited_once_with("modified", None)
+
     async def test_stale_watermark_catches_up_before_modified_feed(self):
         store = CaptureStore()
         store.sources["nvd"] = {"initialized": True, "watermark": (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()}
@@ -216,6 +238,65 @@ class NVDContinuityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SourceSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_kev_uses_official_mirror_after_proxy_or_direct_transport_failure(self):
+        for error in (PublicRequestError("Proxy HTTP 403", KEV_URL),
+                      PublicRequestError("Connection timed out", KEV_URL),
+                      PublicRequestError("DNS lookup failed", KEV_URL),
+                      HTTPError(404, KEV_URL)):
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as folder:
+                records = [{"cveID": "CVE-2026-12345"}]
+                path = Path(folder) / "kev.json"
+                path.write_text(json.dumps({"count": 1, "catalogVersion": "2026.10.19", "vulnerabilities": records}))
+                store = CaptureStore()
+                collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+                collector.http.get = AsyncMock(side_effect=[
+                    error, FetchResult(path, 200, {}, KEV_MIRROR_URL, True, "mirror-digest"),
+                ])
+
+                self.assertEqual(await collector.collect_kev(), {"kev": 1})
+
+                self.assertEqual([call.args[0] for call in collector.http.get.await_args_list], [KEV_URL, KEV_MIRROR_URL])
+                self.assertEqual(store.batches, [{"kev_snapshot": records}])
+                self.assertEqual(store.sources["kev"], {"digest": "mirror-digest", "catalog_version": "2026.10.19"})
+
+    async def test_kev_retains_origin_and_gateway_retry_after_without_fetching_mirror(self):
+        for error in (HTTPError(403, KEV_URL, retry_after=120),
+                      HTTPError(429, KEV_URL, retry_after=0.5),
+                      HTTPError(503, KEV_URL, retry_after=120),
+                      PublicRequestError("Proxy HTTP 403", KEV_URL, retry_after=120),
+                      PublicRequestError("Proxy HTTP 429", KEV_URL, retry_after=120)):
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as folder:
+                store = CaptureStore()
+                store.sources["kev"] = {"digest": "previous"}
+                collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+                collector.http.get = AsyncMock(side_effect=error)
+
+                with self.assertRaises(type(error)) as raised:
+                    await collector.collect_kev()
+
+                self.assertIs(raised.exception, error)
+                collector.http.get.assert_awaited_once_with(KEV_URL)
+                self.assertEqual(store.sources["kev"], {"digest": "previous"})
+                self.assertEqual(store.batches, [])
+
+    async def test_kev_does_not_mask_cancellation_or_ingestion_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = CaptureStore()
+            collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+            collector.http.get = AsyncMock(side_effect=asyncio.CancelledError)
+            with self.assertRaises(asyncio.CancelledError):
+                await collector.collect_kev()
+            collector.http.get.assert_awaited_once_with(KEV_URL)
+
+            path = Path(folder) / "kev.json"
+            path.write_text(json.dumps({"count": 1, "vulnerabilities": [{"cveID": "CVE-2026-12345"}]}))
+            collector.http.get = AsyncMock(return_value=FetchResult(path, 200, {}, KEV_URL, True, "valid"))
+            collector.emit = AsyncMock(side_effect=RuntimeError("ingestion failed"))
+            with self.assertRaisesRegex(RuntimeError, "ingestion failed"):
+                await collector.collect_kev()
+            collector.http.get.assert_awaited_once_with(KEV_URL)
+            self.assertEqual(store.sources, {})
+
     async def test_kev_validated_snapshot_and_invalid_response_preserve_checkpoint(self):
         store = CaptureStore()
         with tempfile.TemporaryDirectory() as folder:
@@ -229,6 +310,7 @@ class SourceSnapshotTests(unittest.IsolatedAsyncioTestCase):
             collector.http.get = AsyncMock(return_value=FetchResult(path, 200, {}, "https://www.cisa.gov/", True, "invalid"))
             with self.assertRaises(ValueError):
                 await collector.collect_kev()
+            collector.http.get.assert_awaited_once_with(KEV_URL)
             self.assertEqual(len(store.batches), 1)
             self.assertEqual(store.sources["kev"]["digest"], "valid")
 
