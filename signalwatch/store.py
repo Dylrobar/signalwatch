@@ -511,6 +511,13 @@ class Store:
                 identity_fields = [asset_id, vendor_key, product_key, source_url, origin]
                 if origin.startswith("sbom:"):
                     identity_fields.extend((part, version))
+                else:
+                    # Older inventories keyed different CPE parts to the same
+                    # row. Refresh only the matching legacy part so another
+                    # part's retained evidence survives until its own refresh.
+                    legacy_identity = digest(encode(identity_fields))
+                    conn.execute("DELETE FROM observations WHERE id=? AND part=?", (legacy_identity, part))
+                    identity_fields.append(part)
                 identity = digest(encode(identity_fields))
                 conn.execute("""INSERT INTO observations(id,asset_id,vendor,product,vendor_name,product_name,part,version,source_url,evidence,observed_at,confidence,cpe,raw,origin)
                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
@@ -556,18 +563,25 @@ class Store:
              ((identifier(item["cve"]), float(item.get("epss") or 0), float(item.get("percentile") or 0), item.get("date"), timestamp) for item in batch.get("epss") or []))
         return counts
 
-    def reconcile(self):
+    def reconcile(self, *, asset_ids=None, conn=None):
         timestamp, token = now(), uuid.uuid4().hex
         candidates = {}
         evaluated = 0
+        scoped_ids = tuple(sorted(set(asset_ids))) if asset_ids is not None else None
+        if scoped_ids == ():
+            return {"evaluated": 0, "alerts": 0, "removed": 0, "previous": 0}
+        scope = "asset_id IN (" + ",".join("?" for _ in scoped_ids) + ")" if scoped_ids is not None else "1"
+        values = scoped_ids or ()
         query = """SELECT o.*,a.id AS source_advisory_id,a.canonical_id,a.title,a.summary,a.url,a.severity,
          a.configurations,f.raw AS affected_raw,k.cve AS kev_cve,k.date_added AS kev_date,p.epss,p.percentile,p.date AS epss_date
          FROM observations o JOIN affected f ON f.vendor=o.vendor AND f.product=o.product AND f.part=o.part AND f.vulnerable=1
          JOIN advisories a ON a.id=f.advisory_id AND a.rejected=0
          LEFT JOIN kev k ON k.cve=a.canonical_id LEFT JOIN epss p ON p.cve=a.canonical_id
          WHERE """ + ACTIVE_CVE_STATE
-        with self.connection(write=True) as conn:
-            for row in conn.execute(query):
+        if scoped_ids is not None:
+            query += " AND o." + scope
+        with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
+            for row in conn.execute(query, values):
                 evaluated += 1
                 affected = json.loads(row["affected_raw"])
                 matcher = osv_version_match if affected.get("ecosystem") or affected.get("package") else version_match
@@ -600,20 +614,21 @@ class Store:
                     candidates[key] = record
             conn.execute("CREATE TEMP TABLE alert_current(asset_id TEXT NOT NULL,advisory_id TEXT NOT NULL,PRIMARY KEY(asset_id,advisory_id))")
             conn.executemany("INSERT INTO alert_current(asset_id,advisory_id) VALUES(?,?)", candidates)
-            existing_alerts = {row["id"] for row in conn.execute("SELECT id FROM alerts")}
+            existing_alerts = {row["id"] for row in conn.execute("SELECT id FROM alerts WHERE " + scope, values)}
             for current in candidates.values():
                 if current["id"] not in existing_alerts:
                     self._event(conn, "warning_opened", "Potential exposure warning opened locally: " + current["advisory_id"], current["asset_id"], current["advisory_id"], "correlation", current.get("source_url") or "", timestamp, None, warning_event_state(current))
             for resolved in conn.execute("""SELECT alerts.* FROM alerts LEFT JOIN alert_current current
-             ON current.asset_id=alerts.asset_id AND current.advisory_id=alerts.advisory_id WHERE current.asset_id IS NULL"""):
+             ON current.asset_id=alerts.asset_id AND current.advisory_id=alerts.advisory_id WHERE current.asset_id IS NULL AND """ + ("alerts." + scope if scoped_ids is not None else scope), values):
                 self._event(conn, "warning_resolved", "Potential exposure warning cleared locally: " + resolved["advisory_id"], resolved["asset_id"], resolved["advisory_id"], "correlation", resolved["source_url"] or "", timestamp, warning_event_state(dict(resolved)), None)
-            before = conn.execute("SELECT count(*) FROM alerts").fetchone()[0]
+            before = conn.execute("SELECT count(*) FROM alerts WHERE " + scope, values).fetchone()[0]
             if candidates:
                 columns = list(next(iter(candidates.values())))
                 updates = ",".join(f"{column}=excluded.{column}" for column in columns if column not in {"id", "asset_id", "advisory_id", "first_seen"})
                 sql = "INSERT INTO alerts(" + ",".join(columns) + ") VALUES(" + ",".join("?" for _ in columns) + ") ON CONFLICT(asset_id,advisory_id) DO UPDATE SET " + updates
                 conn.executemany(sql, (tuple(record[column] for column in columns) for record in candidates.values()))
-            removed = conn.execute("DELETE FROM alerts WHERE checked_token!=?", (token,)).rowcount
+            removed = conn.execute("DELETE FROM alerts WHERE checked_token!=? AND " + scope, (token, *values)).rowcount
+            conn.execute("DROP TABLE alert_current")
         return {"evaluated": evaluated, "alerts": len(candidates), "removed": removed, "previous": before}
 
     def stats(self):
@@ -698,6 +713,10 @@ class Store:
                  VALUES(?,?,?,?,?,?,?) ON CONFLICT(company_id,asset_id) DO UPDATE SET status=excluded.status,
                  role=excluded.role,evidence=excluded.evidence,source_url=excluded.source_url,updated_at=excluded.updated_at""",
                              (company_id, asset_id, status, role, evidence.strip(), source_url, timestamp))
+            from .technographic_store import reproject_domain
+            affected = reproject_domain(self, conn, asset_id)
+            if affected:
+                self.reconcile(asset_ids=affected, conn=conn)
         return self.detail(company_id)
 
     def advisories(self, q="", kev=False, limit=50, offset=0, *, sort="rank"):
@@ -864,15 +883,9 @@ class Store:
         return sorted(found.values(), key=lambda item: item.get("published") or "", reverse=True)[:100]
 
     def company_enrichment_targets(self, limit=10000):
+        from .technographic_store import enrichment_targets
         with self.connection() as conn:
-            rows = conn.execute("""SELECT lower(d.value) AS domain,
-             CASE WHEN count(DISTINCT c.id)=1 THEN min(c.id) ELSE '' END AS company_id,
-             CASE WHEN count(DISTINCT c.id)=1 THEN min(c.name) ELSE '' END AS name
-             FROM entities c JOIN edges e ON e.from_id=c.id AND e.relation='official_website'
-             JOIN entities d ON d.id=e.to_id AND d.kind='domain'
-             WHERE c.kind='company' GROUP BY lower(d.value) ORDER BY lower(d.value) LIMIT ?""",
-             (max(1, int(limit)),))
-            return [dict(row) for row in rows]
+            return enrichment_targets(conn, limit)
 
     def technographic_document_seen(self, context, content_hash):
         from .technographic_store import document_seen

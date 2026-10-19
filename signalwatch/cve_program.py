@@ -6,6 +6,7 @@ import re
 import zipfile
 from datetime import datetime, timezone
 
+from .async_utils import gather, to_thread
 from .extract import product_entities
 from .matching import cpe_fields
 
@@ -112,7 +113,7 @@ def read_archive(path, seen, excluded, limit):
 
 
 async def collect_cve_program(config, store, http):
-    state = await asyncio.to_thread(store.source_state, "cve_program")
+    state = await to_thread(store.source_state, "cve_program")
     limit = int(config.get("cve_max_records", 250))
     zip_limit = int(config.get("cve_max_zip_mb", 16)) * 1024 * 1024
     if limit < 1 or zip_limit < 1:
@@ -120,7 +121,7 @@ async def collect_cve_program(config, store, http):
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if config.get("github_token"):
         headers["Authorization"] = "Bearer " + config["github_token"]
-    fetched = await asyncio.gather(http.get(DELTA_URL, max_bytes=2 * 1024 * 1024), http.get(RELEASE_URL, headers=headers, max_bytes=2 * 1024 * 1024), return_exceptions=True)
+    fetched = await gather(http.get(DELTA_URL, max_bytes=2 * 1024 * 1024), http.get(RELEASE_URL, headers=headers, max_bytes=2 * 1024 * 1024), return_exceptions=True)
     if all(isinstance(item, BaseException) for item in fetched):
         raise fetched[0]
     gaps = [reason for reason in state.get("gap_reasons", []) if reason.startswith("Unverified rollover interval")]
@@ -160,7 +161,7 @@ async def collect_cve_program(config, store, http):
                 raise ValueError("CVE record id differs from its delta manifest")
             return record, response.digest
 
-    records = await asyncio.gather(*(fetch_record(native_id) for native_id in raw_ids[:limit]))
+    records = await gather(*(fetch_record(native_id) for native_id in raw_ids[:limit]))
     delta_done.update(raw_ids[:limit])
     excluded = {record["cveMetadata"]["cveId"].upper() for record, _ in records}
     archive_complete = False
@@ -184,7 +185,7 @@ async def collect_cve_program(config, store, http):
             gaps.append(f"Cumulative hourly delta unavailable: {str(exc)[:200]}")
     advisories = [parse_cve5(record) for record, _ in records]
     entities = [entity for advisory in advisories for entity in product_entities([item for item in advisory["affected"] if item.get("criteria")], advisory["url"], advisory["modified"])]
-    counts = await asyncio.to_thread(store.ingest, {"advisories": advisories, "entities": entities}) if advisories else {}
+    counts = await to_thread(store.ingest, {"advisories": advisories, "entities": entities}) if advisories else {}
     for (record, digest), advisory in zip(records, advisories):
         seen[record["cveMetadata"]["cveId"].upper()] = {"digest": digest, "modified": advisory["modified"]}
     if delta.get("error"):
@@ -205,5 +206,5 @@ async def collect_cve_program(config, store, http):
         fields["delta_digest"] = delta_result.digest
     if archive_complete:
         fields["archive_complete_digest"] = archive_digest
-    await asyncio.to_thread(store.update_source, "cve_program", **fields)
+    await to_thread(store.update_source, "cve_program", **fields)
     return {**(counts or {}), "records": len(advisories), "pending": pending, "coverage_scope": "recent_delta", "coverage_floor": floor, "coverage_through": through, "raw_delta_fetch_time": fields["raw_delta_fetch_time"], "gap": fields["gap"], "history_complete": False}

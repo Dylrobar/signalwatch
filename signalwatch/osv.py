@@ -6,6 +6,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
+from .async_utils import gather, to_thread
+
 
 INDEX_URL = "https://storage.googleapis.com/osv-vulnerabilities/modified_id.csv"
 DATA_URL = "https://storage.googleapis.com/osv-vulnerabilities/"
@@ -229,7 +231,7 @@ async def collect_osv(config, store, http):
     limit = int(config.get("osv_max_records", 500))
     if limit < 1:
         raise ValueError("osv_max_records must be positive")
-    state = await asyncio.to_thread(store.source_state, "osv")
+    state = await to_thread(store.source_state, "osv")
     cursor = state.get("cursor")
     observed = datetime.now(timezone.utc)
     if not isinstance(cursor, dict):
@@ -282,15 +284,15 @@ async def collect_osv(config, store, http):
                 raise ValueError("OSV record id differs from its index path")
             return parse_osv(record)
 
-    batches = await asyncio.gather(*(fetch(change) for change in changes))
+    batches = await gather(*(fetch(change) for change in changes))
     batch = {key: [item for part in batches for item in part[key]] for key in ("advisories", "entities", "edges")}
-    counts = await asyncio.to_thread(store.ingest, batch) if changes else {}
+    counts = await to_thread(store.ingest, batch) if changes else {}
     no_progress_runs = int(state.get("no_progress_runs", 0)) + 1 if not changes and not complete else 0
     errors = []
     if no_progress_runs >= 3 and revision_changed:
         errors.append(f"OSV backlog produced no records for {no_progress_runs} runs across index revisions. An equal-timestamp group may exceed the scan budget ({chunk_limit}/{chunk_cap} chunks). Retries grow to the cap; if this persists, increase osv_index_max_chunks or osv_index_chunk_mb. The watermark has not advanced.")
     if complete:
-        await asyncio.to_thread(store.update_source, "osv", watermark=cursor["upper"], cursor=None, no_progress_runs=0)
+        await to_thread(store.update_source, "osv", watermark=cursor["upper"], cursor=None, no_progress_runs=0)
     else:
-        await asyncio.to_thread(store.update_source, "osv", cursor=next_cursor, no_progress_runs=no_progress_runs)
+        await to_thread(store.update_source, "osv", cursor=next_cursor, no_progress_runs=no_progress_runs)
     return {**(counts or {}), "records": len(changes), "pending": not complete, "no_progress_runs": no_progress_runs, "index_chunks": chunk_limit, "index_revision_changed": revision_changed, "errors": errors, "withdrawn": sum(bool(item["withdrawn"]) for item in batch["advisories"])}

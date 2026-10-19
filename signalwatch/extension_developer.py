@@ -11,6 +11,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 from bs4 import BeautifulSoup
 from packaging.requirements import InvalidRequirement, Requirement
 
+from .async_utils import gather, to_thread
 from .http import display_url, public_error
 from .matching import ecosystem_identity, package_identity
 from .staging import MAX_METADATA_BYTES, bounded_json
@@ -113,7 +114,7 @@ async def collect_developer_sources(config, store, http):
     batch = min(20, max(1, int(config.get("public_source_batch", 3))))
     maximum = min(1000, max(1, int(config.get("public_source_records", 100))))
     targets = [target for target in config.get("source_targets", []) if isinstance(target, dict)]
-    state = await asyncio.to_thread(store.source_state, "developer_sources") if store is not None else {}
+    state = await to_thread(store.source_state, "developer_sources") if store is not None else {}
     cursors = dict(state.get("cursors") or {})
     lookup_cache = dict(state.get("osv_lookup_cache") or {})
 
@@ -194,7 +195,7 @@ async def collect_developer_sources(config, store, http):
             for url in _strings(urls):
                 configured.append((url, _context(target)))
         if configured:
-            await asyncio.gather(*(attempt(url, context, kind="javascript" if provider == "javascript_artifacts" else "generic") for url, context in rotate(configured, "urls:" + provider)))
+            await gather(*(attempt(url, context, kind="javascript" if provider == "javascript_artifacts" else "generic") for url, context in rotate(configured, "urls:" + provider)))
 
         if provider == "github_public":
             eligible = [target for target in targets if target.get("github_org")]
@@ -369,9 +370,9 @@ async def collect_developer_sources(config, store, http):
         if health["status"] == "unconfigured":
             health["requirements"] = next(definition["required"] for definition in SOURCE_DEFINITIONS if definition["id"] == provider)
 
-    await asyncio.gather(*(provider_run(definition["id"]) for definition in SOURCE_DEFINITIONS))
+    await gather(*(provider_run(definition["id"]) for definition in SOURCE_DEFINITIONS))
     if store is not None:
-        await asyncio.to_thread(store.update_source, "developer_sources", cursors=cursors, osv_lookup_cache=dict(sorted(lookup_cache.items(), key=lambda value: value[1])[-30:]))
+        await to_thread(store.update_source, "developer_sources", cursors=cursors, osv_lookup_cache=dict(sorted(lookup_cache.items(), key=lambda value: value[1])[-30:]))
     return result
 
 

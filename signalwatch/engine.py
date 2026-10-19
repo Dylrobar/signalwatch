@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .async_utils import gather, to_thread
 from .collectors import Collector
 from .cve_program import collect_cve_program
 from .csaf import collect_csaf
@@ -96,7 +97,7 @@ class Engine:
     async def __aenter__(self):
         self.collector = await Collector(self.config, self.store).__aenter__()
         for url in self.config["seed_urls"]:
-            await asyncio.to_thread(self.store.enqueue_url, url, "configured-seed")
+            await to_thread(self.store.enqueue_url, url, "configured-seed")
         return self
 
     async def __aexit__(self, *args):
@@ -130,7 +131,7 @@ class Engine:
         return max(due, retry) if retry else due
 
     async def _due(self, names, *, persist=False):
-        states = {row["name"]: row for row in await asyncio.to_thread(self.store.sources)}
+        states = {row["name"]: row for row in await to_thread(self.store.sources)}
         clock = datetime.now(timezone.utc)
         due, next_times = [], []
         for name in names:
@@ -138,7 +139,7 @@ class Engine:
             next_time = self.next_run(name, state, clock)
             stamp = next_time.isoformat(timespec="seconds")
             if persist and stamp != state.get("next_run"):
-                await asyncio.to_thread(self.store.update_source, name, next_run=stamp)
+                await to_thread(self.store.update_source, name, next_run=stamp)
             next_times.append(next_time)
             if next_time <= clock:
                 due.append(name)
@@ -147,9 +148,9 @@ class Engine:
 
     async def _schedule_fields(self, name, **fields):
         stamp = now()
-        state = await asyncio.to_thread(self.store.source_state, name)
+        state = await to_thread(self.store.source_state, name)
         next_time = self.next_run(name, {**state, **fields, "last_run": stamp})
-        await asyncio.to_thread(self.store.update_source, name, last_run=stamp,
+        await to_thread(self.store.update_source, name, last_run=stamp,
                                 next_run=next_time.isoformat(timespec="seconds"), **fields)
 
     async def _collect_source(self, name):
@@ -161,7 +162,7 @@ class Engine:
             config = self.config
             discovered = []
             if name in {"exposure", "corporate", "developer"}:
-                discovered = await asyncio.to_thread(self.store.company_enrichment_targets, self.config.get("max_discovered_domains", 10000))
+                discovered = await to_thread(self.store.company_enrichment_targets, self.config.get("max_discovered_domains", 10000))
                 if discovered:
                     targets = list(self.config.get("source_targets", []))
                     domains = {str(target.get("domain", "")).lower().rstrip(".") for target in targets}
@@ -182,7 +183,7 @@ class Engine:
         counts = {"claimed": 0, "processed": 0, "retried": 0, "dead": 0, "lease_lost": 0}
         while remaining:
             limit = min(500, remaining)
-            result = await asyncio.to_thread(worker.drain, limit, reconcile=False)
+            result = await to_thread(worker.drain, limit, reconcile=False)
             for key in counts:
                 counts[key] += int(result.get(key, 0))
             claimed = int(result.get("claimed", 0))
@@ -206,7 +207,7 @@ class Engine:
         return False
 
     async def _source(self, name):
-        state = await asyncio.to_thread(self.store.source_state, name)
+        state = await to_thread(self.store.source_state, name)
         retry_at = state.get("retry_at")
         retry_time = parsed_time(retry_at)
         if retry_time and retry_time > datetime.now(timezone.utc):
@@ -220,7 +221,7 @@ class Engine:
             status, errors, succeeded = source_outcome(result)
             fields = {"last_success": None} if status == "unconfigured" else {"last_success": now()} if succeeded else {}
             if succeeded:
-                current = await asyncio.to_thread(self.store.source_state, name)
+                current = await to_thread(self.store.source_state, name)
                 retry_time = parsed_time(current.get("retry_at"))
                 if current.get("retry_at") and (retry_time is None or retry_time <= datetime.now(timezone.utc)):
                     fields.update(retry_at=None, retry_status=None)
@@ -248,7 +249,7 @@ class Engine:
                     deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 except OverflowError:
                     deadline = datetime.max.replace(tzinfo=timezone.utc)
-                current = await asyncio.to_thread(self.store.source_state, name)
+                current = await to_thread(self.store.source_state, name)
                 existing = parsed_time(current.get("retry_at"))
                 if existing is not None:
                     deadline = max(deadline, existing)
@@ -288,25 +289,25 @@ class Engine:
                             name = f"nvd-{year}"
                             self.current_sources.add(name)
                             try:
-                                await asyncio.to_thread(self.store.update_source, name, status="running", started_at=now())
+                                await to_thread(self.store.update_source, name, status="running", started_at=now())
                                 result = await self.collector.bootstrap_year(year)
                                 results.append({"source": name, "ok": True, "counts": result})
-                                await asyncio.to_thread(self.store.update_source, name, status="ok", last_success=now(), counts=result, error=None)
+                                await to_thread(self.store.update_source, name, status="ok", last_success=now(), counts=result, error=None)
                             except Exception as exc:
-                                await asyncio.to_thread(self.store.update_source, name, status="error", error=str(exc), finished_at=now())
+                                await to_thread(self.store.update_source, name, status="error", error=str(exc), finished_at=now())
                                 raise
                             finally:
                                 self.current_sources.discard(name)
                     else:
                         # A failed status write must not release the process/file
                         # guards while sibling collectors still use the database.
-                        results = await asyncio.gather(*(self._source(name) for name in names), return_exceptions=True)
+                        results = await gather(*(self._source(name) for name in names), return_exceptions=True)
                         for result in results:
                             if isinstance(result, BaseException):
                                 raise result
                     staging = await self._drain_staging()
-                    matched = await asyncio.to_thread(self.store.reconcile)
-                    await asyncio.to_thread(self.store.prune_events, int(self.config.get("events_max_rows", 50000)), float(self.config.get("events_retention_days", 90)))
+                    matched = await to_thread(self.store.reconcile)
+                    await to_thread(self.store.prune_events, int(self.config.get("events_max_rows", 50000)), float(self.config.get("events_retention_days", 90)))
                     self.last_result = {"started_at": started, "finished_at": now(), "sources": results, "matching": matched, "staging": staging}
                     return self.last_result
                 except Exception as exc:

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+from .async_utils import to_thread
 from .normalization import NormalizationError, normalize
 from .staging import LeaseLost, StagingQueue
 
@@ -74,7 +75,7 @@ class StagingWorker:
     async def run(self):
         while True:
             try:
-                result = await asyncio.to_thread(self.drain)
+                result = await to_thread(self.drain)
             except asyncio.CancelledError:
                 raise
             except Exception as error:

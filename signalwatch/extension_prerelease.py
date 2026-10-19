@@ -11,6 +11,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from fastapi import Query
 
+from .async_utils import gather, to_thread
 from .extract import CVE_RE, canonical_url, utcnow
 from .normalization import NormalizationError, _annotate
 
@@ -345,7 +346,7 @@ async def collect_prerelease_sources(config, store, http):
     async def collect(provider):
         async with semaphore:
             stamp = utcnow()
-            previous = await asyncio.to_thread(store.source_state, "provider:" + provider)
+            previous = await to_thread(store.source_state, "provider:" + provider)
             if settings.get(provider, {}).get("enabled") is False:
                 return provider, {"status": "disabled", "requirements": []}
             retry_at = previous.get("retry_at")
@@ -449,10 +450,10 @@ async def collect_prerelease_sources(config, store, http):
             except Exception as error:
                 outcome = {"status": "error", "checked_at": stamp, "staged": staged, "records": count, "error": public_error(error),
                            "retry_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()}
-            await asyncio.to_thread(store.update_source, "provider:" + provider, **outcome)
+            await to_thread(store.update_source, "provider:" + provider, **outcome)
             return provider, outcome
 
-    results = await asyncio.gather(*(collect(provider) for provider in DEFINITIONS))
+    results = await gather(*(collect(provider) for provider in DEFINITIONS))
     health.update(results)
     return {"targets": len(results), "staged": sum(row.get("staged", 0) for _, row in results),
             "records": sum(row.get("records", 0) for _, row in results), "errors": [key + ": " + row["error"] for key, row in results if row.get("error")], "provider_health": health}

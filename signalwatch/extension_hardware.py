@@ -9,6 +9,7 @@ from urllib.parse import urlencode, urlsplit
 
 from bs4 import BeautifulSoup
 
+from .async_utils import gather, to_thread
 from .extension_network import ENDPOINTS, normalize_network
 from .normalization import NormalizationError, _mac, wireless
 
@@ -221,7 +222,7 @@ async def collect_hardware_sources(config, store, http):
             else:
                 base = "shodan" if provider == "shodan_ics" else "censys"
                 requests = [(ENDPOINTS[base], {"query": str(options["query"])})]
-            state = await asyncio.to_thread(store.source_state, "hardware_cursors") if store is not None else {}
+            state = await to_thread(store.source_state, "hardware_cursors") if store is not None else {}
             cursor = int(state.get(provider, 0)) % max(1, len(requests))
             selected = (requests[cursor:] + requests[:cursor])[:request_limit]
             status["pending_targets"] = max(0, len(requests) - len(selected))
@@ -264,7 +265,7 @@ async def collect_hardware_sources(config, store, http):
                 except Exception as exc:
                     failures.append(str(exc))
             if store is not None:
-                await asyncio.to_thread(store.update_source, "hardware_cursors", **{provider: (cursor + len(selected)) % max(1, len(requests))})
+                await to_thread(store.update_source, "hardware_cursors", **{provider: (cursor + len(selected)) % max(1, len(requests))})
         except Exception as exc:
             failures.append(str(exc))
         failures = [" ".join(message.split())[:300] for message in failures]
@@ -277,5 +278,5 @@ async def collect_hardware_sources(config, store, http):
         status["error"] = "; ".join(failures)[:1000]
         errors.extend(provider + ": " + message for message in failures)
 
-    await asyncio.gather(*(collect_provider(definition) for definition in SOURCE_DEFINITIONS))
+    await gather(*(collect_provider(definition) for definition in SOURCE_DEFINITIONS))
     return {key: sum(row[key] for row in health.values()) for key in ("staged", "unchanged", "records", "requests", "pending_targets")} | {"provider_health": health, "errors": errors}

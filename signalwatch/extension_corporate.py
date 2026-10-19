@@ -16,6 +16,8 @@ from xml.etree import ElementTree
 from bs4 import BeautifulSoup
 import feedparser
 
+from .async_utils import gather, to_thread
+
 
 SOURCE_DEFINITIONS = [
     {"id": provider, "name": name, "category": "corporate", "family": "corporate", "access": access,
@@ -463,7 +465,7 @@ async def _discover(config, store, http, state):
         async with semaphore:
             await discover_target(target, domain)
 
-    await asyncio.gather(*(discover_bounded(target, domain) for target, domain in selected))
+    await gather(*(discover_bounded(target, domain) for target, domain in selected))
     for target in targets:
         cached = cache.get(str(target.get("domain", "")).lower()) or {}
         merged = dict(target)
@@ -720,7 +722,7 @@ def _requests(config):
 
 async def collect_corporate_sources(config, store, http):
     from .sourcehub import stage_payload
-    state = await asyncio.to_thread(store.source_state, "corporate_sources")
+    state = await to_thread(store.source_state, "corporate_sources")
     targets, state, discovery = await _discover(config, store, http, state)
     requests, health = _requests({**config, "source_targets": targets})
     if discovery is not None:
@@ -799,7 +801,7 @@ async def collect_corporate_sources(config, store, http):
                 unchanged = same_jobs and page.get("complete") if job_provider else getattr(response, "changed", True) is False and digests.get(identity) == response.digest
                 if unchanged and (provider not in {"gleif", "importyeti_public"} or target.get("_gleif_child_lei")):
                     if provider in {"greenhouse", "lever", "ashby", "company_feeds"} and hasattr(store, "touch_technographic_source"):
-                        await asyncio.to_thread(store.touch_technographic_source, source_url, metadata["target"], datetime.now(timezone.utc).isoformat())
+                        await to_thread(store.touch_technographic_source, source_url, metadata["target"], datetime.now(timezone.utc).isoformat())
                     return provider, {"unchanged": 1, "successful": 1}
                 payload = await asyncio.to_thread(response.path.read_bytes)
                 content_type = next((value for key, value in response.headers.items() if key.lower() == "content-type"), "application/octet-stream")
@@ -832,7 +834,7 @@ async def collect_corporate_sources(config, store, http):
                                                "payload_hash": hashlib.sha256(payload).hexdigest(), "metadata": metadata,
                                                "observed_at": queued.get("observed_at") or datetime.now(timezone.utc).isoformat()}, max_records=record_limit)
                 if queued.get("duplicate") and provider in {"greenhouse", "lever", "ashby", "company_feeds"} and hasattr(store, "touch_technographic_source"):
-                    await asyncio.to_thread(store.touch_technographic_source, source_url, metadata["target"], datetime.now(timezone.utc).isoformat())
+                    await to_thread(store.touch_technographic_source, source_url, metadata["target"], datetime.now(timezone.utc).isoformat())
                 if job_provider:
                     next_offset = offset + len(preview["entities"])
                     complete = next_offset >= len(jobs)
@@ -865,9 +867,9 @@ async def collect_corporate_sources(config, store, http):
             message = "HTTP " + str(status) if isinstance(status, int) else phase.capitalize() + " failed (" + type(error).__name__ + ")"
             return provider, {"error": message, "staged": staged}
 
-    results = await asyncio.gather(*(fetch(request) for request in selected))
+    results = await gather(*(fetch(request) for request in selected))
     followups = [request for _, result in results for request in result.get("followups", [])]
-    results.extend(await asyncio.gather(*(fetch(request) for request in followups)))
+    results.extend(await gather(*(fetch(request) for request in followups)))
     totals = {"requests": len(selected) + len(followups) + (discovery or {}).get("attempted", 0),
               "staged": (discovery or {}).get("staged", 0), "records": (discovery or {}).get("records", 0),
               "unchanged": 0, "pending_targets": max(0, len(requests) - len(selected))}
@@ -882,7 +884,7 @@ async def collect_corporate_sources(config, store, http):
         else:
             row["coverage_truncated"] = row.get("coverage_truncated", False) or result.get("truncated", False)
         row["status"] = "partial" if row["errors"] and row["successful"] else "error" if row["errors"] else "ok"
-    await asyncio.to_thread(store.update_source, "corporate_sources", cursors=cursors, digests=digests,
+    await to_thread(store.update_source, "corporate_sources", cursors=cursors, digests=digests,
                             gleif_pages=gleif_pages, job_pages=job_pages, discovery=state.get("discovery", {}), discovery_cursor=state.get("discovery_cursor", 0))
     errors = [provider + ": " + message for provider, row in health.items() for message in row["errors"]]
     return {**totals, "errors": errors, "provider_health": health}

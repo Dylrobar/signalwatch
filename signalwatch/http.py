@@ -348,7 +348,12 @@ class PublicHTTP:
                                              request_body=request_body, allow_redirects=allow_redirects,
                                              proxy=proxy, state=request_state) as response:
                         response_headers = CIMultiDict(response.headers)
-                        if response.status == 304 and body.exists():
+                        if response.status == 304:
+                            if (not cache or force or not meta or not body.exists()
+                                    or not (meta.get("etag") or meta.get("last_modified"))):
+                                raise PublicRequestError("HTTP 304 without a usable cached response", str(response.url))
+                            if body.stat().st_size > limit:
+                                raise ValueError(f"Response exceeds {limit} bytes: {display_url(url)}")
                             cached_headers = CIMultiDict(meta.get("headers", {}))
                             cached_headers.update(response_headers)
                             return FetchResult(body, 304, cached_headers, str(response.url), False, meta.get("digest", ""))
@@ -387,6 +392,11 @@ class PublicHTTP:
                                 digest.update(chunk)
                         value = digest.hexdigest()
                         changed = value != meta.get("digest")
+                        # A successful uncached fetch still replaces this body.
+                        # Remove its old validators first so later revalidation
+                        # cannot pair the new bytes with the previous digest.
+                        if not cache:
+                            meta_path.unlink(missing_ok=True)
                         temp.replace(body)
                         metadata = {
                             "url": str(response.url), "etag": response_headers.get("ETag"),
