@@ -7,12 +7,16 @@ import os
 import random
 import socket
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
+from multidict import CIMultiDict
+
+from .proxies import ProxyPool, ProxyUnavailableError
 
 
 def display_url(url):
@@ -31,9 +35,13 @@ def display_url(url):
 
 
 class PublicRequestError(RuntimeError):
-    def __init__(self, reason, url):
+    def __init__(self, reason, url, *, retry_after=None):
         self.reason = reason
-        super().__init__(f"{reason}: {display_url(url)}")
+        self.retry_after = retry_after
+        message = f"{reason}: {display_url(url)}"
+        if retry_after is not None:
+            message += f". Retry after {math.ceil(retry_after)} seconds"
+        super().__init__(message)
 
 
 def public_error(error):
@@ -93,20 +101,178 @@ class PublicHTTP:
         self.locks = {}
         self.host_wait = {}
         self.host_status = {}
+        self.host_slots = {}
+        self.restored_hosts = set()
+        self.proxy_pool = ProxyPool.from_env()
+
+    def _cooldown_path(self, host):
+        return self.cache / ("cooldown-" + hashlib.sha256(str(host).encode()).hexdigest() + ".json")
+
+    def _restore_cooldown(self, host):
+        if host in self.restored_hosts:
+            return
+        self.restored_hosts.add(host)
+        path = self._cooldown_path(host)
+        try:
+            value = json.loads(path.read_text())
+            remaining = float(value["until"]) - time.time()
+            status = int(value["status"])
+            if math.isfinite(remaining) and remaining > 0 and status in {403, 429, 502, 503, 504}:
+                self.host_wait[host] = max(self.host_wait.get(host, 0), time.monotonic() + remaining)
+                self.host_status[host] = status
+            else:
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            pass
+
+    def _cooldown(self, host, status, delay):
+        self._restore_cooldown(host)
+        self.host_wait[host] = max(self.host_wait.get(host, 0), time.monotonic() + delay)
+        self.host_status[host] = status
+        # Persist only the origin's deadline/status, never proxy or request secrets.
+        path = self._cooldown_path(host)
+        remaining = max(0, self.host_wait[host] - time.monotonic())
+        self._persist_cooldown(path, time.time() + remaining, status)
+
+    def _persist_cooldown(self, path, until, status):
+        temporary = path.with_suffix(f".{os.getpid()}.{random.getrandbits(64):016x}.tmp")
+        try:
+            temporary.write_text(json.dumps({"until": until, "status": status}))
+            temporary.replace(path)
+        except OSError:
+            # A cache write failure must not replace the server's HTTP diagnosis
+            # or drop the in-memory backoff.
+            pass
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _proxy_cooldown(self):
+        if self.proxy_pool is None:
+            return None, 0
+        path = self.cache / f"proxy-cooldown-{self.proxy_pool.cache_key}.json"
+        try:
+            value = json.loads(path.read_text())
+            until = float(value["until"])
+            if math.isfinite(until) and int(value["status"]) in {429, 502, 503, 504}:
+                return path, until
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            pass
+        return path, 0
+
+    def _restore_proxy_cooldown(self):
+        # Other PublicHTTP instances can share this configured gateway. Re-read
+        # before every hop so a fresh client cannot skip its Retry-After period.
+        path, until = self._proxy_cooldown()
+        remaining = until - time.time()
+        if path is not None and remaining > 0:
+            self.proxy_pool.defer(remaining)
+
+    def _defer_proxy(self, status, delay):
+        path, previous = self._proxy_cooldown()
+        if path is not None:
+            until = max(previous, time.time() + delay)
+            self.proxy_pool.defer(max(0, until - time.time()))
+            self._persist_cooldown(path, until, status)
 
     async def __aenter__(self):
-        headers = {"User-Agent": self.config["user_agent"], **self.config.get("headers", {})}
+        # Apply configured headers per logical request so a cross-origin redirect
+        # can remove credentials without ClientSession restoring its defaults.
+        headers = {"User-Agent": self.config["user_agent"]}
         connector = aiohttp.TCPConnector(
             limit=int(self.config["concurrency"]),
             limit_per_host=int(self.config["per_host"]),
             ttl_dns_cache=600,
         )
         timeout = aiohttp.ClientTimeout(total=float(self.config["timeout"]), connect=10)
-        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers, trust_env=True)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers,
+                                             trust_env=self.proxy_pool is None)
         return self
 
     async def __aexit__(self, *exc):
         await self.session.close()
+
+    @asynccontextmanager
+    async def _request(self, url, *, method, headers, request_body, allow_redirects, proxy, state):
+        """Follow bounded redirects while checking each actual destination."""
+        current = aiohttp.client_reqrep.URL(url)
+        request_headers = CIMultiDict(headers)
+        request_body = dict(request_body or {})
+        redirects = 0
+        auth = None
+        remaining_timeout = float(self.config["timeout"])
+        while True:
+            if current.user is not None:
+                auth = aiohttp.BasicAuth.from_url(current)
+                current = current.with_user(None)
+            host = current.host
+            self._restore_cooldown(host)
+            delay = self.host_wait.get(host, 0) - time.monotonic()
+            if delay > 0:
+                if delay > 60:
+                    raise HTTPError(self.host_status.get(host, 429), str(current), retry_after=delay)
+                await asyncio.sleep(delay)
+                continue
+            # Release the previous host's slot before waiting for the next host.
+            slot = self.host_slots.setdefault(host, asyncio.Semaphore(int(self.config["per_host"])))
+            async with slot:
+                if self.host_wait.get(host, 0) > time.monotonic():
+                    continue
+                if self.proxy_pool:
+                    self._restore_proxy_cooldown()
+                    try:
+                        self.proxy_pool.ensure_available(proxy)
+                    except ProxyUnavailableError as exc:
+                        raise PublicRequestError(str(exc), str(current), retry_after=exc.retry_after) from None
+                options = dict(request_body)
+                if proxy is not None:
+                    options.update(proxy=proxy.url, proxy_auth=proxy.auth)
+                if auth is not None:
+                    options["auth"] = auth
+                if remaining_timeout <= 0:
+                    raise asyncio.TimeoutError
+                options["timeout"] = aiohttp.ClientTimeout(total=remaining_timeout, connect=min(10, remaining_timeout))
+                request = self.session.get if method == "GET" else self.session.post
+                state["url"] = str(current)
+                started = time.monotonic()
+                async with request(str(current), headers=CIMultiDict(request_headers), allow_redirects=False, **options) as response:
+                    if allow_redirects and response.status in {301, 302, 303, 307, 308}:
+                        redirects += 1
+                        if redirects >= 10:
+                            raise PublicRequestError("Too many HTTP redirects", str(current))
+                        response_headers = CIMultiDict(response.headers)
+                        location = response_headers.get("Location") or response_headers.get("URI")
+                        if location is not None:
+                            try:
+                                target = aiohttp.client_reqrep.URL(location)
+                                if target.scheme not in {"", "http", "https"}:
+                                    raise ValueError
+                                if not target.scheme or (target.scheme == current.scheme and not target.raw_authority):
+                                    target = current.join(target)
+                                cross_origin = current.origin() != target.origin()
+                            except (ValueError, TypeError):
+                                raise PublicRequestError("Invalid HTTP redirect", str(current)) from None
+                            if cross_origin:
+                                auth = None
+                                for name in ("Authorization", "Cookie", "Proxy-Authorization"):
+                                    request_headers.popall(name, None)
+                            if response.status == 303 or (response.status in {301, 302} and method == "POST"):
+                                method = "GET"
+                                request_body = {}
+                                request_headers.popall("Content-Length", None)
+                            else:
+                                data = request_body.get("data")
+                                if hasattr(data, "read") or hasattr(data, "__aiter__"):
+                                    # A separate aiohttp request may already have consumed
+                                    # or closed a streaming body. Never replay it as empty.
+                                    raise PublicRequestError("Cannot replay a streaming request body after redirect", str(current))
+                            current = target
+                            remaining_timeout -= time.monotonic() - started
+                            continue
+                    yield response
+                    return
 
     async def get(self, url, *, params=None, headers=None, max_bytes=None, cache=True, force=False, allow_redirects=True, max_attempts=4):
         if not 1 <= max_attempts <= 4:
@@ -134,6 +300,8 @@ class PublicHTTP:
         limit = max_bytes if max_bytes is not None else int(self.config["max_response_mb"]) * 1024 * 1024
         host = aiohttp.client_reqrep.URL(url).host
         attempt = 0
+        proxy = None
+        self._restore_cooldown(host)
         while attempt < max_attempts:
             delay = self.host_wait.get(host, 0) - time.monotonic()
             while delay > 0:
@@ -144,6 +312,7 @@ class PublicHTTP:
                 await asyncio.sleep(delay)
                 delay = self.host_wait.get(host, 0) - time.monotonic()
             temp = self.cache / f"{key}.{os.getpid()}.{random.getrandbits(64):016x}.part"
+            request_state = {"url": url}
             try:
                 lock = self.locks.setdefault(key, asyncio.Lock())
                 async with lock:
@@ -159,25 +328,52 @@ class PublicHTTP:
                             meta = json.loads(meta_path.read_text())
                         except (OSError, ValueError):
                             meta = {}
-                    request_headers = dict(headers)
+                    request_headers = CIMultiDict(self.config.get("headers", {}))
+                    request_headers.update(headers)
                     if not force and meta:
                         if meta.get("etag"):
                             request_headers["If-None-Match"] = meta["etag"]
                         if meta.get("last_modified"):
                             request_headers["If-Modified-Since"] = meta["last_modified"]
-                    request = self.session.get if method == "GET" else self.session.post
+                    if self.proxy_pool:
+                        self._restore_proxy_cooldown()
+                        try:
+                            if proxy is None:
+                                proxy = self.proxy_pool.choose()
+                            self.proxy_pool.ensure_available(proxy)
+                        except ProxyUnavailableError as exc:
+                            raise PublicRequestError(str(exc), url, retry_after=exc.retry_after) from None
                     attempt += 1
-                    async with request(url, headers=request_headers, allow_redirects=allow_redirects, **(request_body or {})) as response:
-                        response_headers = dict(response.headers)
+                    async with self._request(url, method=method, headers=request_headers,
+                                             request_body=request_body, allow_redirects=allow_redirects,
+                                             proxy=proxy, state=request_state) as response:
+                        response_headers = CIMultiDict(response.headers)
                         if response.status == 304 and body.exists():
-                            return FetchResult(body, 304, {**meta.get("headers", {}), **response_headers}, str(response.url), False, meta.get("digest", ""))
-                        if response.status in (429, 502, 503, 504):
-                            wait = max(1.0, retry_delay(response.headers.get("Retry-After"), attempt - 1))
-                            self.host_wait[host] = max(self.host_wait.get(host, 0), time.monotonic() + wait)
-                            self.host_status[host] = response.status
-                            if attempt < max_attempts and wait <= 60:
+                            cached_headers = CIMultiDict(meta.get("headers", {}))
+                            cached_headers.update(response_headers)
+                            return FetchResult(body, 304, cached_headers, str(response.url), False, meta.get("digest", ""))
+                        limited_403 = response.status == 403 and (
+                            response_headers.get("Retry-After") is not None
+                            or response_headers.get("X-RateLimit-Remaining") == "0")
+                        if response.status in (429, 502, 503, 504) or limited_403:
+                            wait = max(1.0, retry_delay(response_headers.get("Retry-After"), attempt - 1))
+                            if limited_403:
+                                wait = max(wait, 60.0)
+                                try:
+                                    reset = float(response_headers.get("X-RateLimit-Reset", "")) - time.time()
+                                    if math.isfinite(reset):
+                                        wait = max(wait, reset)
+                                except ValueError:
+                                    pass
+                            for cooldown_host in {host, aiohttp.client_reqrep.URL(str(response.url)).host}:
+                                self._cooldown(cooldown_host, response.status, wait)
+                            # Retain the same proxy on origin HTTP responses. A different
+                            # address must not skip an authentication/access/rate limit.
+                            if not limited_403 and attempt < max_attempts and wait <= 60:
                                 continue
                             raise HTTPError(response.status, str(response.url), retry_after=wait)
+                        if response.status == 407 and self.proxy_pool:
+                            self.proxy_pool.reject_auth()
                         if response.status >= 400:
                             raise HTTPError(response.status, str(response.url))
                         size = 0
@@ -193,8 +389,8 @@ class PublicHTTP:
                         changed = value != meta.get("digest")
                         temp.replace(body)
                         metadata = {
-                            "url": str(response.url), "etag": response.headers.get("ETag"),
-                            "last_modified": response.headers.get("Last-Modified"),
+                            "url": str(response.url), "etag": response_headers.get("ETag"),
+                            "last_modified": response_headers.get("Last-Modified"),
                             "digest": value, "size": size, "fetched_at": time.time(),
                             "headers": {key: value for key, value in response_headers.items() if key.lower() != "set-cookie"},
                         }
@@ -204,13 +400,32 @@ class PublicHTTP:
                             meta_temp.replace(meta_path)
                         return FetchResult(body, response.status, response_headers, str(response.url), changed, value)
             except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                permanent = isinstance(error, (aiohttp.ClientSSLError, aiohttp.TooManyRedirects)) or (
-                    isinstance(error, aiohttp.ClientConnectorError) and isinstance(error.os_error, socket.gaierror)
+                failed_url = request_state["url"]
+                failed_host = aiohttp.client_reqrep.URL(failed_url).host
+                proxy_error = isinstance(error, aiohttp.ClientHttpProxyError)
+                proxy_denied = proxy_error and 400 <= error.status < 500
+                if proxy_error and error.status == 407 and self.proxy_pool:
+                    self.proxy_pool.reject_auth()
+                proxy_retry_after = CIMultiDict(error.headers or {}).get("Retry-After") if proxy_error else None
+                if proxy_error and (error.status == 429 or (error.status in {502, 503, 504} and proxy_retry_after is not None)):
+                    wait = max(1.0, retry_delay(proxy_retry_after, attempt - 1))
+                    self._cooldown(failed_host, error.status, wait)
+                    if self.proxy_pool:
+                        self._defer_proxy(error.status, wait)
+                    raise PublicRequestError(f"Proxy HTTP {error.status}", failed_url, retry_after=wait) from None
+                permanent = proxy_denied or isinstance(error, (aiohttp.ClientSSLError, aiohttp.TooManyRedirects)) or (
+                    proxy is None and isinstance(error, aiohttp.ClientConnectorError)
+                    and isinstance(error.os_error, socket.gaierror)
                     and error.os_error.errno in {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
                 )
+                if proxy is not None and not permanent:
+                    self.proxy_pool.fail(proxy)
+                    proxy = None
                 if attempt == max_attempts or permanent:
                     if isinstance(error, asyncio.TimeoutError):
                         reason = "Connection timed out"
+                    elif proxy_error:
+                        reason = f"Proxy HTTP {error.status}"
                     elif isinstance(error, aiohttp.ClientConnectorCertificateError):
                         reason = "TLS certificate verification failed"
                     elif isinstance(error, aiohttp.ClientSSLError):
@@ -221,7 +436,9 @@ class PublicHTTP:
                         reason = "DNS lookup failed"
                     else:
                         reason = "Connection failed"
-                    raise PublicRequestError(reason, url) from error
+                    # aiohttp exception chains can contain proxy authentication,
+                    # headers and query strings. Keep only the typed diagnosis.
+                    raise PublicRequestError(reason, failed_url) from None
                 await asyncio.sleep(retry_delay(None, attempt - 1))
             finally:
                 temp.unlink(missing_ok=True)

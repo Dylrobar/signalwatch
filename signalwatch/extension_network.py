@@ -5,8 +5,10 @@ import hashlib
 import io
 import ipaddress
 import json
+import math
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .normalization import NormalizationError
@@ -40,6 +42,32 @@ for _definition in SOURCE_DEFINITIONS:
 ENDPOINTS = {"certspotter": "https://api.certspotter.com/v1/issuances", "ctlogs": "https://api.ctlogs.dev/v1/hosts/", "crtsh": "https://crt.sh/", "passive_dns": "https://api.hackertarget.com/hostsearch/", "dns_txt": "https://dns.google/resolve", "shodan": "https://api.shodan.io/shodan/host/search", "censys": "https://api.platform.censys.io/v3/global/search/query", "fofa": "https://fofa.info/api/v1/search/all", "zoomeye": "https://api.zoomeye.ai/v2/search", "netlas": "https://app.netlas.io/api/responses/"}
 FOFA_FIELDS = ("ip", "port", "host", "protocol", "title", "domain", "server", "os")
 CT_PROVIDERS = ("certspotter", "ctlogs", "crtsh")
+
+
+def _passive_dns_budget(store, clock, *, reserve=False, retry_at=0):
+    """Reserve before sending so retries, restarts and concurrent runs share one quota."""
+    key = "exposure_passive_dns_budget"
+    with store.connection(write=True) as conn:
+        row = conn.execute("SELECT state FROM sources WHERE name=?", (key,)).fetchone()
+        state = json.loads(row[0]) if row else {}
+        stamps = sorted(stamp for stamp in state.get("request_times", [])
+                        if isinstance(stamp, (int, float)) and math.isfinite(stamp) and stamp > clock - 86400)
+        deadline = max(float(state.get("retry_at") or 0), retry_at)
+        if len(stamps) >= 20:
+            deadline = max(deadline, stamps[-20] + 86400)
+        allowed = deadline <= clock and len(stamps) < 20
+        if reserve and allowed:
+            stamps.append(clock)
+        state.update(request_times=stamps, retry_at=deadline if deadline > clock else 0)
+        conn.execute("INSERT INTO sources(name,state) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET state=excluded.state",
+                     (key, json.dumps(state, separators=(",", ":"))))
+    return {"allowed": allowed, "retry_at": deadline if deadline > clock else 0,
+            "remaining": max(0, 20 - len(stamps))}
+
+
+def _passive_dns_quota(payload):
+    text = " ".join(payload[:512].decode("utf-8-sig", errors="replace").lower().split())
+    return bool(re.match(r"^(?:error\s*:\s*)?(?:api (?:count|limit) exceeded|daily (?:api |query )?limit exceeded|rate limit exceeded)", text))
 
 
 def _domain(value):
@@ -287,6 +315,9 @@ async def collect_network_sources(config, store, http):
         if not targets:
             status["requirements"] = ["source_targets"]
             return
+        if provider == "passive_dns" and store is None:
+            status["requirements"] = ["persistent_store"]
+            return
         status["requirements"] = []
         failures, successful = [], 0
         incremental = provider in {"certspotter", "ctlogs"}
@@ -306,6 +337,7 @@ async def collect_network_sources(config, store, http):
             status["deferred_targets"] = max(0, len(selected) - available)
             selected = selected[:available]
         status["pending_targets"] = max(0, len(provider_targets) - len(selected))
+        traversed, budget_deferred = 0, False
         for target in selected:
             try:
                 domain = _domain(target["domain"])
@@ -367,14 +399,27 @@ async def collect_network_sources(config, store, http):
                     public_params = {key: value for key, value in params.items() if key != "key"}
                     provenance_url = safe_url + ("?" + urlencode(public_params) if public_params else "")
                     async with semaphore:
+                        if provider == "passive_dns":
+                            budget = await asyncio.to_thread(_passive_dns_budget, store, time.time(), reserve=True)
+                            status["daily_requests_remaining"] = budget["remaining"]
+                            if not budget["allowed"]:
+                                budget_deferred = True
+                                status["deferred_targets"] += len(selected) - traversed
+                                status["reason"] = "HackerTarget daily query budget or provider cooldown is active"
+                                status["retry_at"] = datetime.fromtimestamp(min(budget["retry_at"], 253402300799), timezone.utc).isoformat()
+                                break
                         status["requests"] += 1
                         if incremental:
                             request_times.append(time.time())
                         if body is not None:
                             fetched = await http.post(url, json=body, headers=headers, max_bytes=payload_limit, max_attempts=1, allow_redirects=False)
                         else:
-                            fetched = await http.get(url, params=params, headers=headers, max_bytes=payload_limit, cache=provider not in {"shodan", "fofa", "censys", "netlas"}, max_attempts=2 if provider == "crtsh" else 1, allow_redirects=not bool(credentials))
+                            fetched = await http.get(url, params=params, headers=headers, max_bytes=payload_limit, cache=provider not in {"shodan", "fofa", "censys", "netlas", "passive_dns"}, max_attempts=2 if provider == "crtsh" else 1, allow_redirects=not bool(credentials) and provider != "passive_dns")
                         payload = await asyncio.to_thread(fetched.path.read_bytes)
+                        if provider == "passive_dns" and _passive_dns_quota(payload):
+                            header = next((value for key, value in fetched.headers.items() if key.lower() == "retry-after"), None)
+                            delay = max(86400, retry_delay(header, 0) if header else 0)
+                            raise HTTPError(429, safe_url, "HackerTarget daily query quota reached", retry_after=delay)
                         rows = _records({"payload": payload, "metadata": metadata}, provider)
                         if incremental:
                             if len(rows) > 1000:
@@ -409,6 +454,14 @@ async def collect_network_sources(config, store, http):
                         ct_covered.add(domain)
                     successful += 1
             except Exception as exc:
+                if provider == "passive_dns" and isinstance(exc, HTTPError) and exc.status == 429:
+                    delay = exc.retry_after if exc.retry_after is not None else 86400
+                    budget = await asyncio.to_thread(_passive_dns_budget, store, time.time(),
+                                                     retry_at=time.time() + max(1, delay))
+                    status.update(reason="HackerTarget query quota reached; collection is deferred",
+                                  retry_at=datetime.fromtimestamp(min(budget["retry_at"], 253402300799), timezone.utc).isoformat())
+                    status["deferred_targets"] += 1
+                    continue
                 if incremental:
                     delay = max(3600, exc.retry_after or 0) if isinstance(exc, HTTPError) and exc.status in {429, 503} else 900
                     progress["retry_at"] = time.time() + delay
@@ -417,12 +470,21 @@ async def collect_network_sources(config, store, http):
                     if isinstance(value, str) and value:
                         reason = reason.replace(value, "[redacted]")
                 failures.append(provider + ": " + reason)
+            finally:
+                if not budget_deferred:
+                    traversed += 1
+            if budget_deferred:
+                break
         if store is not None:
-            await asyncio.to_thread(store.update_source, "exposure_cursors", **{provider: (cursor + len(selected)) % len(provider_targets)})
+            advanced = traversed if provider == "passive_dns" else len(selected)
+            if provider != "passive_dns" or advanced:
+                await asyncio.to_thread(store.update_source, "exposure_cursors", **{provider: (cursor + advanced) % len(provider_targets)})
             if incremental:
                 await asyncio.to_thread(store.update_source, "exposure_ct", **{provider: {**progress, "targets": domain_states, "request_times": request_times}})
         if provider == "ctlogs":
             status["pending_pages"] = sum(bool(value.get("after")) for value in domain_states.values())
+        if provider == "passive_dns":
+            status["pending_targets"] = max(0, len(provider_targets) - traversed)
         status["status"] = "partial" if failures and successful else "error" if failures else "deferred" if status["deferred_targets"] and not successful else "healthy"
         status["error"] = "; ".join(failures)[:1000]
         errors.extend(failures)

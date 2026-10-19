@@ -75,6 +75,21 @@ def next_link(header):
     return None
 
 
+def crawl_link_url(base_url, href):
+    try:
+        url = canonical_url(urljoin(base_url, href.strip()))
+    except (ValueError, UnicodeError):
+        return ""
+    if not url:
+        return ""
+    # Cloudflare email-obfuscation anchors are decoded by browser JavaScript;
+    # they are not pages and commonly return 404 when fetched by a crawler.
+    path = urlsplit(url).path
+    if path == "/cdn-cgi/l/email-protection" or path.startswith("/cdn-cgi/l/email-protection/"):
+        return ""
+    return url
+
+
 class Collector:
     def __init__(self, config, store):
         self.config = config
@@ -551,7 +566,7 @@ class Collector:
                     soup = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
                     links = []
                     for link in soup.find_all("a", href=True, limit=1000):
-                        href = canonical_url(urljoin(final_url, str(link["href"])))
+                        href = crawl_link_url(final_url, str(link["href"]))
                         if not href or urlsplit(href).hostname != final_host or href in seen:
                             continue
                         if re.search(r"\.(?:pdf|zip|gz|tar|png|jpg|jpeg|gif|svg|mp4|webm|woff2?|css|js)(?:$|\?)", href, re.I):

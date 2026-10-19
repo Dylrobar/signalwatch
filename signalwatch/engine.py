@@ -10,6 +10,7 @@ from pathlib import Path
 from .collectors import Collector
 from .cve_program import collect_cve_program
 from .csaf import collect_csaf
+from .http import HTTPError, PublicRequestError
 from .network import collect_network
 from .nmap import collect_nmap
 from .osv import collect_osv
@@ -147,7 +148,7 @@ class Engine:
     async def _schedule_fields(self, name, **fields):
         stamp = now()
         state = await asyncio.to_thread(self.store.source_state, name)
-        next_time = self.next_run(name, {**state, "last_run": stamp})
+        next_time = self.next_run(name, {**state, **fields, "last_run": stamp})
         await asyncio.to_thread(self.store.update_source, name, last_run=stamp,
                                 next_run=next_time.isoformat(timespec="seconds"), **fields)
 
@@ -218,6 +219,11 @@ class Engine:
             result = await self._collect_source(name)
             status, errors, succeeded = source_outcome(result)
             fields = {"last_success": None} if status == "unconfigured" else {"last_success": now()} if succeeded else {}
+            if succeeded:
+                current = await asyncio.to_thread(self.store.source_state, name)
+                retry_time = parsed_time(current.get("retry_at"))
+                if current.get("retry_at") and (retry_time is None or retry_time <= datetime.now(timezone.utc)):
+                    fields.update(retry_at=None, retry_status=None)
             await self._schedule_fields(
                 name, status=status,
                 finished_at=now(), duration=round(time.monotonic() - start, 2), counts=result,
@@ -232,8 +238,20 @@ class Engine:
         except Exception as exc:
             message = str(exc) or type(exc).__name__
             log.exception("%s collection failed", name)
-            await self._schedule_fields(name, status="error", error=message[:1000], finished_at=now())
-            return {"source": name, "ok": False, "error": message}
+            retry = {}
+            delay = getattr(exc, "retry_after", None)
+            if isinstance(exc, (HTTPError, PublicRequestError)) and delay is not None and math.isfinite(delay) and delay > 0:
+                try:
+                    deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                except OverflowError:
+                    deadline = datetime.max.replace(tzinfo=timezone.utc)
+                current = await asyncio.to_thread(self.store.source_state, name)
+                existing = parsed_time(current.get("retry_at"))
+                if existing is not None:
+                    deadline = max(deadline, existing)
+                retry = {"retry_at": deadline.isoformat(), "retry_status": getattr(exc, "status", None)}
+            await self._schedule_fields(name, status="error", error=message[:1000], finished_at=now(), **retry)
+            return {"source": name, "ok": False, "error": message, **retry}
         finally:
             self.current_sources.discard(name)
 
