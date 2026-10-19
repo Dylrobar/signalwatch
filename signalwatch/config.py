@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 DEFAULTS = {
@@ -46,6 +46,13 @@ DEFAULTS = {
     "sbom_max_mb": 20,
     "events_max_rows": 50000,
     "events_retention_days": 90,
+    "staging_max_payload_mb": 8,
+    "staging_max_mb": 512,
+    "staging_max_records": 10000,
+    "staging_batch": 25,
+    "staging_poll_seconds": 2,
+    "staging_retention_days": 7,
+    "staging_max_completed": 10000,
     "sources": {
         "nvd": True,
         "kev": True,
@@ -122,13 +129,17 @@ def load_config(path="config.json"):
         config[name] = str(target if target.is_absolute() else path.parent / target)
     for name in ("concurrency", "per_host", "timeout", "crawl_pages", "crawl_batch", "interval_minutes",
                  "osv_max_records", "osv_index_chunk_mb", "osv_index_chunks", "osv_index_max_chunks", "cve_max_records",
+                 "staging_max_records", "staging_batch", "staging_max_completed",
                  "cve_max_zip_mb", "csaf_max_records", "network_batch", "network_interval_hours", "news_concurrency"):
         if int(config[name]) < 1:
             raise ValueError(f"{name} must be positive")
-    for name in ("dns_timeout", "dns_concurrency", "sbom_max_mb", "events_max_rows", "events_retention_days"):
+    for name in ("dns_timeout", "dns_concurrency", "sbom_max_mb", "events_max_rows", "events_retention_days",
+                 "staging_max_payload_mb", "staging_max_mb", "staging_poll_seconds", "staging_retention_days"):
         if float(config[name]) <= 0:
             raise ValueError(f"{name} must be positive")
     if config["dns_mode"] not in {"system", "fallback", "doh"}:
         raise ValueError("dns_mode must be system, fallback, or doh")
+    if int(config["staging_batch"]) > 500:
+        raise ValueError("staging_batch must be at most 500")
     config["config_path"] = str(path)
     return config

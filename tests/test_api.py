@@ -1,3 +1,4 @@
+import base64
 import json
 import socket
 import subprocess
@@ -18,7 +19,7 @@ class ApiContractTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp.name)
         cls.config = cls.root / "config.json"
-        cls.config.write_text(json.dumps({"db": "monitor.db", "cache_dir": "cache", "seed_urls": [], "sbom_max_mb": 0.5, "nvd_api_key": "private-nvd-value", "github_token": "private-github-value"}))
+        cls.config.write_text(json.dumps({"db": "monitor.db", "cache_dir": "cache", "seed_urls": [], "sbom_max_mb": 0.5, "staging_max_payload_mb": 0.01, "nvd_api_key": "private-nvd-value", "github_token": "private-github-value"}))
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             cls.port = sock.getsockname()[1]
@@ -54,6 +55,65 @@ class ApiContractTests(unittest.TestCase):
         result = json.dumps(self.request("/api/status"))
         self.assertNotIn("private-nvd-value", result)
         self.assertNotIn("private-github-value", result)
+
+    def test_unified_staging_preserves_bytes_and_processes_in_background(self):
+        raw = b"\x00\xff wireless export\r\n"
+        request = {"source": "api-staging-bytes", "adapter": "opaque", "payload_encoding": "base64",
+                   "payload": base64.b64encode(raw).decode(), "metadata": {"sensor": "local-import"}, "idempotency_key": "capture-1"}
+        staged = self.request("/api/staging", request)
+        duplicate = self.request("/api/staging", request)
+        self.assertEqual(staged["id"], duplicate["id"])
+        self.assertTrue(duplicate["duplicate"])
+        with urllib.request.urlopen(self.base + f'/api/staging/{staged["id"]}/payload') as response:
+            self.assertEqual(response.read(), raw)
+            self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+        for _ in range(100):
+            detail = self.request(f'/api/staging/{staged["id"]}')
+            if detail["status"] == "processed":
+                break
+            time.sleep(.05)
+        self.assertEqual(detail["status"], "processed")
+        self.assertNotIn("payload", detail)
+        self.assertNotIn("lease_token", detail)
+        listed = self.request("/api/staging?status=processed")["items"]
+        self.assertIn(staged["id"], [item["id"] for item in listed])
+        self.assertNotIn("payload", next(item for item in listed if item["id"] == staged["id"]))
+        self.assertIn("counts", self.request("/api/staging/stats"))
+
+    def test_staging_failed_adapter_can_be_retried_without_losing_raw_input(self):
+        raw = "  imported text\r\n"
+        staged = self.request("/api/staging", {"source": "api-staging-retry", "adapter": "not-installed", "payload": raw})
+        for _ in range(100):
+            detail = self.request(f'/api/staging/{staged["id"]}')
+            if detail["status"] == "dead":
+                break
+            time.sleep(.05)
+        self.assertEqual(detail["status"], "dead")
+        self.request(f'/api/staging/{staged["id"]}/retry', {"adapter": "opaque"})
+        for _ in range(100):
+            detail = self.request(f'/api/staging/{staged["id"]}')
+            if detail["status"] == "processed":
+                break
+            time.sleep(.05)
+        self.assertEqual(detail["status"], "processed")
+        with urllib.request.urlopen(self.base + f'/api/staging/{staged["id"]}/payload') as response:
+            self.assertEqual(response.read(), raw.encode())
+
+    def test_invalid_staging_requests_leave_queue_unchanged(self):
+        before = self.request("/api/staging/stats")["total"]
+        for payload, expected in [
+            ({"source": "api-invalid", "payload": "x" * 12000}, 413),
+            ({"source": "api-invalid", "payload_encoding": "base64", "payload": "***"}, 400),
+            ({"source": "api-invalid", "payload": {"unexpected": "object"}}, 400),
+            ({"source": " ", "payload": "data"}, 422),
+            ({"source": "api-invalid", "payload": "data", "observed_at": "2026-10-19T00:00:00"}, 422),
+        ]:
+            with self.subTest(payload=payload):
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    self.request("/api/staging", payload)
+                self.assertEqual(raised.exception.code, expected)
+        self.assertEqual(self.request("/api/staging/stats")["total"], before)
 
     def test_company_profile_creation_edit_search_and_collector_refresh(self):
         profile = {"name": "Profile API Research", "legal_name": "Profile API Research Limited",

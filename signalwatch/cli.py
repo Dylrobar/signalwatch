@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import mimetypes
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,32 @@ def parser():
     sbom.add_argument("path", type=Path)
     sbom.add_argument("--asset", required=True)
     sbom.add_argument("--source", default="default")
+    stage = commands.add_parser("stage")
+    stage.add_argument("path", type=Path)
+    stage.add_argument("--source", required=True)
+    stage.add_argument("--adapter", default="auto")
+    stage.add_argument("--content-type")
+    stage.add_argument("--source-url", default="")
+    stage.add_argument("--stream-key", default="")
+    stage.add_argument("--idempotency-key", default="")
+    stage.add_argument("--observed-at")
+    stage.add_argument("--metadata", default="{}")
+    queue = commands.add_parser("staging")
+    operations = queue.add_subparsers(dest="operation", required=True)
+    listing = operations.add_parser("list")
+    listing.add_argument("--status", choices=["pending", "processing", "processed", "dead"], default="")
+    listing.add_argument("--limit", type=int, default=50)
+    listing.add_argument("--offset", type=int, default=0)
+    show = operations.add_parser("show")
+    show.add_argument("id", type=int)
+    show.add_argument("--payload", action="store_true")
+    work = operations.add_parser("work")
+    work.add_argument("--limit", type=int)
+    retry = operations.add_parser("retry")
+    retry.add_argument("id", type=int)
+    retry.add_argument("--adapter")
+    operations.add_parser("stats")
+    operations.add_parser("prune")
     export = commands.add_parser("export")
     export.add_argument("--kind", choices=["entities", "advisories", "alerts", "articles", "events"], default="advisories")
     export.add_argument("--query", default="")
@@ -78,7 +105,47 @@ def main():
         if result.get("busy") or any(not item["ok"] for item in result.get("sources", [])):
             raise SystemExit(1)
     elif args.command == "status":
-        print(json.dumps({"stats": store.stats(), "sources": store.sources()}, indent=2))
+        from .ingestion import staging_queue
+        print(json.dumps({"stats": store.stats(), "sources": store.sources(), "staging": staging_queue(store, config).stats()}, indent=2))
+    elif args.command == "stage":
+        from .ingestion import staging_queue
+        maximum = int(float(config.get("staging_max_payload_mb", 8)) * 1024 * 1024)
+        if str(args.path) == "-":
+            payload = sys.stdin.buffer.read(maximum + 1)
+        else:
+            with args.path.open("rb") as source:
+                payload = source.read(maximum + 1)
+        metadata = json.loads(args.metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("Staging metadata must be a JSON object")
+        result = staging_queue(store, config).enqueue(
+            payload, source=args.source, adapter=args.adapter,
+            content_type=args.content_type or mimetypes.guess_type(str(args.path))[0] or "application/octet-stream",
+            source_url=args.source_url, metadata=metadata, observed_at=args.observed_at,
+            stream_key=args.stream_key, idempotency_key=args.idempotency_key)
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == "staging":
+        from .ingestion import StagingWorker, staging_queue
+        queue = staging_queue(store, config)
+        if args.operation == "list":
+            result = queue.list(status=args.status, limit=args.limit, offset=args.offset)
+        elif args.operation == "show":
+            result = queue.get(args.id, include_payload=args.payload)
+            if result is None:
+                raise ValueError("Staged record not found")
+            if args.payload:
+                sys.stdout.buffer.write(result["payload"])
+                return
+        elif args.operation == "work":
+            result = StagingWorker(store, config, queue).drain(args.limit)
+        elif args.operation == "retry":
+            result = queue.retry(args.id, adapter=args.adapter)
+        elif args.operation == "prune":
+            result = queue.prune(retention_days=float(config.get("staging_retention_days", 7)),
+                                 max_completed=int(config.get("staging_max_completed", 10000)))
+        else:
+            result = queue.stats()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "seed":
         from .api import public_url
         urls = list(dict.fromkeys(public_url(value) for value in args.urls))

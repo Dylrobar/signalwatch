@@ -4,12 +4,13 @@ import json
 import re
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .companies import COMPANY_SCHEMA, asset_identity, company, company_assets, company_profile, labels, validate_parent
 from .matching import cpe_fields, ecosystem_identity, identifier, normalize, osv_version_match, package_identity, rank, version_match
+from .staging import STAGING_SCHEMA
 
 
 SCHEMA = """
@@ -260,6 +261,9 @@ class Store:
             had_advisory_seen = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='advisory_seen'").fetchone() is not None
             conn.executescript(SCHEMA)
             conn.executescript(COMPANY_SCHEMA)
+            conn.executescript(STAGING_SCHEMA)
+            if "superseded_by" not in {row[1] for row in conn.execute("PRAGMA table_info(raw_ingress)")}:
+                conn.execute("ALTER TABLE raw_ingress ADD COLUMN superseded_by INTEGER")
             if not had_advisory_seen:
                 conn.execute("INSERT OR IGNORE INTO advisory_seen(canonical_id,first_seen) SELECT canonical_id,min(updated_at) FROM advisories GROUP BY canonical_id")
             if "part" not in {row[1] for row in conn.execute("PRAGMA table_info(observations)")}:
@@ -373,7 +377,7 @@ class Store:
         self._entity(conn, {"id": key, "kind": kind, "name": product, "metadata": metadata, "source_url": source_url, "observed_at": observed_at}, timestamp)
         return key, vendor_key, product_key, part
 
-    def ingest(self, batch):
+    def ingest(self, batch, *, conn=None):
         timestamp = now()
         snapshot = batch.get("kev_snapshot") if "kev_snapshot" in batch else None
         if snapshot is not None:
@@ -386,7 +390,7 @@ class Store:
              "affected": [], "references": [], "raw": item} for item in batch["kev"]]
             batch = {**batch, "advisories": list(batch.get("advisories") or []) + stubs}
         counts = {key: len(batch.get(key) or []) for key in ("advisories", "articles", "entities", "edges", "observations", "kev", "epss")}
-        with self.connection(write=True) as conn:
+        with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
             if snapshot is not None:
                 conn.execute("CREATE TEMP TABLE kev_current(cve TEXT PRIMARY KEY)")
                 conn.executemany("INSERT OR IGNORE INTO kev_current(cve) VALUES(?)", ((identifier(item["cveID"]),) for item in snapshot))

@@ -169,6 +169,67 @@ signalwatch export --kind events --event-kind warning_opened > warning-openings.
 
 `POST /api/import/sbom` accepts `asset_url`, `source_key`, and a JSON `document` object. The import report includes imported/skipped/duplicate components, observations, skip reasons, and current matching totals. Its request limit defaults to 20 MiB. Imports remain local to the application.
 
+## Unified staging queue
+
+Version 0.7.0 adds one durable `raw_ingress` table for heterogeneous inputs. Every source uses the same envelope: original payload bytes, SHA-256, source, MIME type, adapter, source URL, JSON metadata, observation/receipt times, optional stream/idempotency keys, and processing state. New formats need an adapter rather than a database migration. Payloads and metadata are data; source URLs are provenance and are not fetched by the staging worker.
+
+| Adapter | Accepted input | Normalized output |
+| --- | --- | --- |
+| `vulnerability_json` | NVD, GHSA, OSV, or canonical advisory JSON | Existing advisory/product records |
+| `news` | RSS/Atom or plain article text with `metadata.article_url` | Articles and CVE references; text without an article URL remains evidence |
+| `dns` | DNS text records or structured DNS JSON | Domain anchors, DNS record evidence, and relationships |
+| `pdf_metadata` | Already extracted PDF metadata as JSON/text | Document evidence; binary PDF extraction is a separate producer step |
+| `wireless` | MAC/BSSID CSV, text, or JSON logs | Wireless evidence with normalized MAC addresses and explicit log fields |
+| `normalized_batch` | Existing `Store.ingest` batch JSON | Existing models, including explicit snapshot markers |
+| `opaque` | Any bytes | Generic evidence with a bounded preview and raw-record reference |
+| `auto` | Recognized MIME type, JSON shape, or `metadata.record_type` | A supported adapter above; unknown input becomes opaque evidence |
+
+Adapters do not infer company ownership, hidden technologies, device vendors, or vulnerable deployments from DNS, documents, or MAC addresses. Those records remain evidence until explicit attribution/inventory connects them. Up to 5,000 normalized records may be produced by one item. Existing native collectors and SBOM imports retain their current ingestion/checkpoint paths; this queue accepts new raw inputs and explicit normalized batches.
+
+`POST /api/staging` returns HTTP 202 after durable enqueue. For example:
+
+```json
+{
+  "source": "dns-import",
+  "adapter": "dns",
+  "content_type": "text/plain",
+  "stream_key": "example.net",
+  "idempotency_key": "export-0001",
+  "observed_at": "2026-10-19T12:00:00Z",
+  "metadata": {"resolver": "imported-log"},
+  "payload_encoding": "utf-8",
+  "payload": "example.net. 300 IN TXT \"v=spf1 -all\"\n"
+}
+```
+
+`utf-8` strings and `base64` transport preserve their decoded bytes, including whitespace. `json` accepts a JSON value and stores a canonical serialization; use a UTF-8 string, base64, or the CLI when original JSON formatting matters. `observed_at` requires a timezone in API requests and defaults to receipt time; publisher disclosure dates remain separate. Metadata is capped at 16 KiB. All staging routes use the existing API authentication.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/staging?status=dead&limit=50&offset=0` | Paginated envelope/state listing without raw payloads |
+| `GET /api/staging/stats` | Counts, bytes, limits, and worker health |
+| `GET /api/staging/{id}` | One envelope and processing result/error |
+| `GET /api/staging/{id}/payload` | Exact retained bytes as an attachment |
+| `POST /api/staging/{id}/retry` | Retry a failed record; optional `{"adapter":"opaque"}` changes its adapter |
+
+```bash
+signalwatch stage records.txt --source dns-import --adapter dns --stream-key example.net
+signalwatch stage report-metadata.json --source reports --adapter pdf_metadata
+signalwatch stage wireless.csv --source imported-logs --adapter wireless
+signalwatch staging list --status dead
+signalwatch staging show 1 --payload > original-input.bin
+signalwatch staging retry 1 --adapter opaque
+signalwatch staging work --limit 25
+signalwatch staging stats
+signalwatch staging prune
+```
+
+The server starts a background worker, including with `serve --no-collect`. `staging work` runs one bounded drain without a server. Workers claim fenced leases; normalized writes and the processed acknowledgment commit in one SQLite transaction. Invalid formats become `dead`; transient errors retry after 30 and 60 seconds, with three attempts total. Expired leases can be reclaimed. Failed records retain their original bytes for inspection and retry.
+
+Arrival order is preserved per `(source, stream_key)`, across adapters. A delayed record blocks later records in that stream while other streams progress. Use distinct stream keys for independent datasets. Once a newer record has processed, retained older records cannot be retried over it, even if the newer raw record is later pruned. Explicit idempotency keys deduplicate within `(source, stream_key, adapter)` only while the raw row is retained; a conflicting payload or envelope is rejected. Repeated observations without a key remain separate records.
+
+Defaults allow 8 MiB per payload and 512 MiB/10,000 raw records total. Processed raw records expire after seven days and may be evicted sooner to admit new data; normalized records remain. Pending, processing, and dead records are never evicted automatically. When they fill capacity, admission returns HTTP 503 with `Retry-After: 30`. Raw references can outlive raw retention, so payload retrieval may later return 404. These bounds cover raw payload bytes, not total SQLite/index/WAL disk usage.
+
 ## Configuration and performance
 
 Edit the generated `config.json`. Restart after editing it externally. RSS additions made through the UI persist immediately.
@@ -194,6 +255,10 @@ Existing configurations gain the new collector switches from defaults. An existi
 | `dns_timeout` / `dns_concurrency` | 5 / 4 | System/DoH timeout and resolver worker limits |
 | `sbom_max_mb` | 20 | Maximum SBOM file/request size in MiB; fractional limits supported |
 | `events_retention_days` / `events_max_rows` | 90 / 50000 | Local event retention and row cap |
+| `staging_max_payload_mb` / `staging_max_mb` | 8 / 512 | Per-item and total retained raw payload MiB |
+| `staging_max_records` / `staging_max_completed` | 10000 / 10000 | Raw admission cap and processed-record retention cap |
+| `staging_batch` / `staging_poll_seconds` | 25 / 2 | Items per worker drain and idle polling interval |
+| `staging_retention_days` | 7 | Processed raw-record retention; pending/dead records remain |
 | `timeout` | 30 | HTTP request timeout in seconds |
 | `headers` / `user_agent` | Application user agent | Request header configuration |
 | `sources` | All enabled | Individual collector switches |
@@ -235,6 +300,8 @@ Version 0.4.0 validation includes API inventory replacement, multiple package ve
 Validation on 2026-10-18: 165 automated tests and nine Chromium browser check groups passed at desktop and mobile sizes. An isolated QA database exercised imports and warning transitions; live public collection verified DNS/routing context and local advisory history separately.
 
 Version 0.5.0 validation: 175 Python tests and 12 frontend tests passed, as did strict TypeScript checking and the frontend production build. Remote API tests use real HTTP requests to verify optional authentication, protected exports and mutations, exact-origin preflights, reverse-proxy paths, credential omission, and readable error responses. Fourteen local Chromium interaction groups covered authentication, filtered exports, navigation, forms, and mobile layouts. A separate flow imported explicit test inventory against an actual stored public advisory, displayed a potential warning, then cleared the inventory and verified the local warning-clearance event. Browser validation used a copied database and local frontend source; it did not publish or synchronize a Lovable project. The wheel builds successfully with all package files included.
+
+Version 0.7.0 validation: all 256 backend tests passed, including all five heterogeneous input families, exact raw bytes, authenticated HTTP ingestion, background processing, CLI round trips, malformed inputs, explicit idempotency expiry, concurrent capacity/claims, lease fencing, atomic rollback, stream ordering, failed-record replay guards, and retention. Independent queue/adapter review cleared. No frontend files or dependencies changed in this release.
 
 ## Primary source documentation
 

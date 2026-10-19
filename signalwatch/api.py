@@ -1,22 +1,27 @@
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
 import secrets
 import threading
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .config import VERSION
 from .engine import Engine, now
+from .ingestion import StagingWorker, staging_queue
+from .staging import QueueFull
 from .store import Store
 
 
@@ -90,6 +95,41 @@ class CompanyAssetRequest(BaseModel):
     source_url: str = Field(default="", max_length=2000)
 
 
+class StagingRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=200)
+    adapter: str = Field(default="auto", min_length=1, max_length=80)
+    content_type: str = Field(default="application/octet-stream", min_length=1, max_length=200)
+    source_url: str = Field(default="", max_length=2000)
+    stream_key: str = Field(default="", max_length=200)
+    idempotency_key: str = Field(default="", max_length=200)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    observed_at: str | None = None
+    payload_encoding: Literal["utf-8", "json", "base64"] = "utf-8"
+    payload: Any
+
+    @field_validator("source", "adapter", "content_type")
+    @classmethod
+    def nonblank(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Source, adapter, and content type cannot be blank")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def timestamp(cls, value):
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("observed_at requires an ISO timestamp with timezone")
+        return parsed.astimezone(timezone.utc).isoformat()
+
+
+class StagingRetryRequest(BaseModel):
+    adapter: str | None = Field(default=None, min_length=1, max_length=80)
+
+
 def compact_records(result):
     items = []
     for row in result["items"]:
@@ -105,6 +145,8 @@ def compact_records(result):
 def create_app(config, auto_collect=True):
     store = Store(config["db"])
     engine = Engine(config, store)
+    ingress = staging_queue(store, config)
+    ingress_worker = StagingWorker(store, config, ingress)
     tasks = set()
     config_lock = threading.Lock()
 
@@ -117,6 +159,7 @@ def create_app(config, auto_collect=True):
     @asynccontextmanager
     async def lifespan(app):
         async with engine:
+            tasks.add(asyncio.create_task(ingress_worker.run(), name="staging-worker"))
             if auto_collect:
                 task = asyncio.create_task(engine.schedule())
                 tasks.add(task)
@@ -130,6 +173,7 @@ def create_app(config, auto_collect=True):
     app = FastAPI(title="SignalWatch", version=VERSION, lifespan=lifespan)
     app.state.store = store
     app.state.engine = engine
+    app.state.staging = ingress
     api_token = config.get("api_token", "").encode("utf-8")
     @app.middleware("http")
     async def authorize(request, call_next):
@@ -170,7 +214,7 @@ def create_app(config, auto_collect=True):
                 if row.get("status") == "running":
                     row["status"] = "interrupted"
         return {
-            "stats": store.stats(), "running": running,
+            "stats": store.stats(), "running": running, "staging": ingress.stats(),
             "current_sources": (sorted(engine.current_sources) or [row["name"] for row in sources if row.get("status") == "running"]) if running else [], "sources": sources,
             "last_result": engine.last_result, "error": engine.last_error,
             "config": {key: config[key] for key in ("concurrency", "per_host", "interval_minutes", "crawl_pages", "crawl_batch", "sources", "sbom_max_mb", "events_max_rows", "events_retention_days")}
@@ -210,6 +254,73 @@ def create_app(config, auto_collect=True):
         if result is None:
             raise HTTPException(404, "Record not found")
         return result
+
+    @app.get("/api/staging/stats")
+    def staging_stats():
+        return {**ingress.stats(), "worker_result": ingress_worker.last_result, "worker_error": ingress_worker.last_error}
+
+    @app.get("/api/staging")
+    def staging_list(status: Literal["", "pending", "processing", "processed", "dead"] = "",
+                     limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+        return ingress.list(status=status, limit=limit, offset=offset)
+
+    @app.get("/api/staging/{item_id}/payload")
+    def staging_payload(item_id: int):
+        item = ingress.get(item_id, include_payload=True)
+        if item is None:
+            raise HTTPException(404, "Staged record not found")
+        return Response(item["payload"], media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="staging-{item_id}.bin"', "X-Content-Type-Options": "nosniff"})
+
+    @app.get("/api/staging/{item_id}")
+    def staging_detail(item_id: int):
+        item = ingress.get(item_id)
+        if item is None:
+            raise HTTPException(404, "Staged record not found")
+        return item
+
+    @app.post("/api/staging", status_code=202)
+    async def stage_record(request: Request):
+        maximum = int(float(config.get("staging_max_payload_mb", 8)) * 1024 * 1024)
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > 2 * maximum + 65536:
+                raise HTTPException(413, "Staging request exceeds the configured size limit")
+            body.extend(chunk)
+        try:
+            supplied = StagingRequest.model_validate_json(body)
+        except ValidationError as error:
+            raise HTTPException(422, "Expected source, payload, encoding, and optional format/provenance fields") from error
+        try:
+            if len(json.dumps(supplied.metadata, allow_nan=False).encode()) > 16384:
+                raise ValueError("Staging metadata exceeds 16 KiB")
+            if supplied.payload_encoding == "json":
+                payload = json.dumps(supplied.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            elif supplied.payload_encoding == "base64":
+                if not isinstance(supplied.payload, str):
+                    raise ValueError("Base64 payload must be a string")
+                payload = base64.b64decode(supplied.payload, validate=True)
+            else:
+                if not isinstance(supplied.payload, str):
+                    raise ValueError("UTF-8 payload must be a string")
+                payload = supplied.payload.encode("utf-8")
+            if len(payload) > maximum:
+                raise HTTPException(413, "Payload exceeds the configured staging size limit")
+            values = supplied.model_dump(exclude={"payload", "payload_encoding"})
+            return await asyncio.to_thread(ingress.enqueue, payload, **values)
+        except QueueFull as error:
+            raise HTTPException(503, str(error), headers={"Retry-After": "30"}) from error
+        except (ValueError, UnicodeError, binascii.Error) as error:
+            raise HTTPException(400, str(error)) from error
+
+    @app.post("/api/staging/{item_id}/retry")
+    def staging_retry(item_id: int, request: StagingRetryRequest):
+        try:
+            return ingress.retry(item_id, adapter=request.adapter)
+        except LookupError as error:
+            raise HTTPException(404, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
 
     @app.post("/api/collect")
     async def collect(request: CollectRequest):
