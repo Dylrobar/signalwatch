@@ -347,6 +347,8 @@ Edit the generated `config.json`. Restart after editing it externally. RSS addit
 
 Existing configurations gain the new collector switches from defaults. An existing explicit `feeds` array is preserved; copy additional feed entries from `config.example.json` to adopt the expanded RSS list while retaining custom feeds. The bundled list replaces the currently unavailable Cisco RSS endpoint with SecurityWeek.
 
+Optional [server-side rotating proxies](docs/proxies.md) use an environment-supplied gateway list and separate credentials. Rotation handles transient transport failures within existing retry limits; origin authentication failures and missing pages still require valid credentials or URLs. Destination cooldowns persist across collection runs and apply across proxies. HackerTarget passive DNS also shares a durable budget of 20 queries per rolling 24 hours.
+
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `concurrency` / `per_host` | 32 / 4 | Shared connection pool and per-host connection limit |

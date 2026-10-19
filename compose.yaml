@@ -6,6 +6,10 @@ services:
     environment:
       - SIGNALWATCH_API_TOKEN
       - SIGNALWATCH_CORS_ORIGINS
+      - SIGNALWATCH_PROXY_LIST_JSON
+      - SIGNALWATCH_PROXY_LIST_FILE
+      - SIGNALWATCH_PROXY_USERNAME
+      - SIGNALWATCH_PROXY_PASSWORD
     volumes:
       - ./data:/data
     restart: unless-stopped
