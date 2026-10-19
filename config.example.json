@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.7.0 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.8.0 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,
@@ -44,6 +44,83 @@
   "staging_poll_seconds": 2,
   "staging_retention_days": 7,
   "staging_max_completed": 10000,
+  "source_intervals": {
+    "news": 15,
+    "threat": 15,
+    "nvd": 360,
+    "kev": 360,
+    "epss": 360,
+    "github": 360,
+    "osv": 360,
+    "cve_program": 360,
+    "csaf": 360,
+    "exposure": 10080,
+    "corporate": 10080,
+    "developer": 10080,
+    "hardware": 43200
+  },
+  "public_source_batch": 3,
+  "public_source_records": 100,
+  "public_source_concurrency": 4,
+  "threat_source_batch": 8,
+  "source_targets": [
+    {
+      "name": "Apache Software Foundation",
+      "domain": "apache.org",
+      "github_org": "apache"
+    },
+    {
+      "name": "Cisco",
+      "domain": "cisco.com",
+      "github_org": "cisco"
+    },
+    {
+      "name": "Microsoft",
+      "domain": "microsoft.com",
+      "github_org": "microsoft",
+      "cik": "0000789019"
+    }
+  ],
+  "watch_products": [],
+  "exploit_keywords": [
+    "exploit",
+    "zero-day",
+    "zero day",
+    "rce",
+    "remote code execution",
+    "security fix",
+    "security patch",
+    "actively exploited",
+    "authentication bypass",
+    "memory corruption"
+  ],
+  "provider_settings": {
+    "crtsh": {
+      "enabled": true
+    },
+    "dns_txt": {
+      "enabled": true
+    },
+    "fulldisclosure": {
+      "enabled": true
+    },
+    "oss_security": {
+      "enabled": true
+    },
+    "zdi_published": {
+      "enabled": true
+    },
+    "zdi_upcoming": {
+      "enabled": true
+    },
+    "dark_reading": {
+      "enabled": true
+    },
+    "apple_security": {
+      "enabled": true
+    }
+  },
+  "provider_credentials": {},
   "sources": {
     "nvd": true,
     "kev": true,
@@ -55,7 +132,12 @@
     "network": true,
     "wikidata": true,
     "news": true,
-    "web": true
+    "web": true,
+    "exposure": true,
+    "corporate": true,
+    "developer": true,
+    "threat": true,
+    "hardware": true
   },
   "feeds": [
     {

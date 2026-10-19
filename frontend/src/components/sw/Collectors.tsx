@@ -3,13 +3,16 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import { fmtDate, num, safeHref, text, type R } from "@/lib/format";
-import { feedList, mergeSources, sbomLimitMiB, sourceErrors, sourceHealth, sourceRecords, type Health } from "@/lib/sources";
+import { feedList, mergeSources, sbomLimitMiB, sourceErrors, sourceHealth, sourceInterval, sourceRecords, type Health } from "@/lib/sources";
 import { Badge, ExtLink } from "./bits";
 import { SourceIssues } from "./SourceIssues";
+import { SourceCatalog } from "./SourceCatalog";
 
 const HEALTH: Record<Health, [string, string]> = {
   collecting: ["Collecting…", "ok"], error: ["Error", "kev"], partial: ["Partial", "warn"], interrupted: ["Interrupted", "warn"],
   disabled: ["Disabled", ""], not_collected: ["Not collected", ""], healthy: ["Healthy", "ok"], unknown: ["Unknown", ""],
+  unconfigured: ["Needs setup", "warn"],
+  skipped: ["Skipped", ""],
 };
 const COUNT_KEYS = ["targets", "pages", "enriched", "routed", "feeds", "feed_pages_pending", "dns_hosts", "dns_records", "dns_failed", "dns_fallbacks"];
 
@@ -108,7 +111,7 @@ const needUrl = (u: string) => {
 
 export function Collectors({ status, refresh }: { status: R; refresh: () => void }) {
   const qc = useQueryClient();
-  const refreshAll = () => { refresh(); qc.invalidateQueries({ queryKey: ["list"] }); };
+  const refreshAll = () => { refresh(); qc.invalidateQueries({ queryKey: ["list"] }); qc.invalidateQueries({ queryKey: ["source-catalog"] }); };
   const { families, historical } = mergeSources(status);
   const running: string[] = (status["current_sources"] ?? []).map(String);
   const busy = Boolean(status["running"]);
@@ -128,7 +131,7 @@ export function Collectors({ status, refresh }: { status: R; refresh: () => void
         {status["error"] && <div role="alert" className="border-b border-border p-3 text-xs"><p className="font-semibold">Last job error</p><SourceIssues errors={[String(status["error"])]} /></div>}
         <div className="sw-scroll" tabIndex={0} aria-label="Collector health">
           <table className="sw-table">
-            <thead><tr><th>Source</th><th>Health</th><th>Last success</th><th title="Most recent reported batch, not total stored records">Last batch records</th><th>Coverage</th><th /></tr></thead>
+            <thead><tr><th>Source</th><th>Health</th><th>Last success</th><th>Schedule</th><th title="Most recent reported batch, not total stored records">Last batch records</th><th>Coverage</th><th /></tr></thead>
             <tbody>
               {families.map((s) => {
                 const h = HEALTH[sourceHealth(s, running.includes(s["name"]))];
@@ -139,6 +142,7 @@ export function Collectors({ status, refresh }: { status: R; refresh: () => void
                     <td className="font-mono text-xs">{s["name"]}{s["enabled"] === false && <div className="text-muted-foreground">disabled in config</div>}</td>
                     <td><Badge tone={h[1]}>{h[0]}</Badge><SourceIssues errors={errs} retryAt={s["retry_at"]} /></td>
                     <td className="whitespace-nowrap text-xs">{s["persisted"] ? fmtDate(s["last_success"], true, "never") : "not collected"}</td>
+                    <td className="whitespace-nowrap text-xs"><div>{sourceInterval(s)}</div><div className="mt-1 text-muted-foreground">Next: {s["enabled"] === false ? "disabled" : fmtDate(s["next_run"], true, "not reported")}</div>{s["last_run"] && <div className="mt-1 text-muted-foreground">Last run: {fmtDate(s["last_run"], true)}</div>}</td>
                     <td className="text-xs" title={s["counts"] ? Object.entries(s["counts"]).filter(([, v]) => typeof v === "number").map(([k, v]) => `${k}: ${v}`).join(" · ") : undefined}>{rec === null ? "unknown" : num(rec)}</td>
                     <td><Coverage s={s} /></td>
                     <td><button type="button" className="sw-btn" disabled={busy || !s["configured"]} onClick={() => runCollect([s["name"]], refresh)} aria-label={`Run ${s["name"]} collector`}>Run</button></td>
@@ -149,6 +153,7 @@ export function Collectors({ status, refresh }: { status: R; refresh: () => void
           </table>
         </div>
       </section>
+      <SourceCatalog families={families} />
       {news && <Feeds s={news} />}
 
       <div className="grid gap-3 md:grid-cols-2">

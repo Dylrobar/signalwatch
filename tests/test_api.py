@@ -56,6 +56,34 @@ class ApiContractTests(unittest.TestCase):
         self.assertNotIn("private-nvd-value", result)
         self.assertNotIn("private-github-value", result)
 
+    def test_source_catalog_exposes_capabilities_without_credentials(self):
+        catalog = self.request("/api/sources/catalog")
+        rows = {row["id"]: row for row in catalog["items"]}
+        self.assertEqual(catalog["total"], len(rows))
+        self.assertIn("wigle", rows)
+        self.assertEqual(rows["shodan"]["status"], "unconfigured")
+        encoded = json.dumps(catalog) + json.dumps(self.request("/api/sources/settings"))
+        self.assertNotIn("private-nvd-value", encoded)
+        self.assertNotIn("private-github-value", encoded)
+
+    def test_source_settings_persist_and_invalid_updates_have_no_effect(self):
+        before = self.request("/api/sources/settings")
+        try:
+            changed = self.request("/api/sources/settings", {"source_targets": [{"name": "Example", "domain": "Example.COM"}], "source_intervals": {"news": 17}, "watch_products": ["nginx"], "provider_settings": {"zdi_published": {"enabled": False}}})
+            self.assertTrue(changed["saved"])
+            self.assertEqual(changed["source_targets"][0]["domain"], "example.com")
+            self.assertEqual(self.request("/api/status")["config"]["source_intervals"]["news"], 17)
+            disk = json.loads(self.config.read_text())
+            self.assertEqual(disk["watch_products"], ["nginx"])
+            current = self.request("/api/sources/settings")
+            for invalid in ({"source_intervals": {"news": 0}}, {"source_intervals": {"unknown": 5}}, {"source_targets": [{"domain": "bad/domain"}]}, {"source_targets": [{"domain": "bad\u0000domain"}]}, {"provider_settings": {"shodan": {"api_key": "must-not-store"}}}, {"provider_settings": {"shodan": {"token": "must-not-store"}}}, {"provider_credentials": {"shodan": "must-not-store"}}, {"provider_settings": {"shodan": {"url": " HTTPS://user:pass@example.test/"}}}, {"provider_settings": {"shodan": {"url": "https://example.test/?%61%70%69%5f%6b%65%79=must-not-store"}}}, {"provider_settings": {"shodan": {"url": []}}}, {"provider_settings": {"shodan": {"enabled": "yes"}}}):
+                with self.subTest(invalid=invalid), self.assertRaises(urllib.error.HTTPError) as raised:
+                    self.request("/api/sources/settings", invalid)
+                self.assertEqual(raised.exception.code, 422)
+                self.assertEqual(self.request("/api/sources/settings"), current)
+        finally:
+            self.request("/api/sources/settings", before)
+
     def test_unified_staging_preserves_bytes_and_processes_in_background(self):
         raw = b"\x00\xff wireless export\r\n"
         request = {"source": "api-staging-bytes", "adapter": "opaque", "payload_encoding": "base64",

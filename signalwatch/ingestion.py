@@ -26,7 +26,7 @@ class StagingWorker:
         self.last_error = None
         self.needs_matching = True
 
-    def drain(self, limit=None):
+    def drain(self, limit=None, *, reconcile=True):
         limit = int(limit if limit is not None else self.config.get("staging_batch", 25))
         if not 1 <= limit <= 500:
             raise ValueError("Staging processing limit must be between 1 and 500")
@@ -51,7 +51,7 @@ class StagingWorker:
                     result["dead" if state["status"] == "dead" else "retried"] += 1
                 except LeaseLost:
                     result["lease_lost"] += 1
-        if self.needs_matching:
+        if self.needs_matching and reconcile:
             try:
                 result["matching"] = self.store.reconcile()
                 result["events_pruned"] = self.store.prune_events(

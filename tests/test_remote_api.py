@@ -115,6 +115,7 @@ class RemoteApiTests(unittest.TestCase):
     def test_reads_exports_and_mutations_fail_closed_before_side_effects(self):
         reads = ["/api/status", "/api/search", "/api/advisories", "/api/alerts", "/api/articles", "/api/events", "/api/event?id=1", "/api/entity?id=anything", "/api/export?kind=entities", "/api/export?kind=events"]
         reads.extend(["/api/staging", "/api/staging/stats", "/api/staging/1", "/api/staging/1/payload"])
+        reads.extend(["/api/sources/catalog", "/api/sources/settings"])
         mutations = {
             "/api/collect": {"sources": []}, "/api/seeds": {"urls": ["https://unauthorized.example"]},
             "/api/sources/feed": {"name": "Unauthorized", "url": "https://unauthorized.example/feed"},
@@ -124,6 +125,7 @@ class RemoteApiTests(unittest.TestCase):
             "/api/companies/assets": {"company_id": "company:unauthorized", "asset_url": "https://unauthorized.example", "status": "automatic"},
             "/api/staging": {"source": "unauthorized", "payload": "not accepted"},
             "/api/staging/1/retry": {},
+            "/api/sources/settings": {"source_targets": []},
         }
         store = Store(self.server.root / "test.db")
         before = store.stats()

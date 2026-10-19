@@ -3,14 +3,16 @@ import base64
 import binascii
 import json
 import logging
+import math
 import os
+import re
 import secrets
 import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,6 +132,16 @@ class StagingRetryRequest(BaseModel):
     adapter: str | None = Field(default=None, min_length=1, max_length=80)
 
 
+class SourceSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_targets: list[dict[str, Any]] | None = Field(default=None, max_length=100)
+    source_intervals: dict[str, float] | None = None
+    sources: dict[str, bool] | None = None
+    provider_settings: dict[str, dict[str, Any]] | None = None
+    watch_products: list[str] | None = Field(default=None, max_length=1000)
+    exploit_keywords: list[str] | None = Field(default=None, max_length=200)
+
+
 def compact_records(result):
     items = []
     for row in result["items"]:
@@ -205,7 +217,7 @@ def create_app(config, auto_collect=True):
     @app.get("/api/status")
     def status():
         fields = ("name", "status", "started_at", "finished_at", "last_success", "duration", "counts", "error", "retry_at",
-                  "coverage", "coverage_scope", "coverage_floor", "coverage_through", "pending", "feed_health", "checked_at", "gap")
+                  "coverage", "coverage_scope", "coverage_floor", "coverage_through", "pending", "feed_health", "checked_at", "gap", "last_run", "next_run", "interval_minutes")
         sources = [{key: row[key] for key in fields if key in row} for row in store.sources()
                    if row["name"] in config["sources"] or row["name"].startswith("nvd-")]
         running = engine.busy()
@@ -217,8 +229,108 @@ def create_app(config, auto_collect=True):
             "stats": store.stats(), "running": running, "staging": ingress.stats(),
             "current_sources": (sorted(engine.current_sources) or [row["name"] for row in sources if row.get("status") == "running"]) if running else [], "sources": sources,
             "last_result": engine.last_result, "error": engine.last_error,
-            "config": {key: config[key] for key in ("concurrency", "per_host", "interval_minutes", "crawl_pages", "crawl_batch", "sources", "sbom_max_mb", "events_max_rows", "events_retention_days")}
+            "config": {key: config[key] for key in ("concurrency", "per_host", "interval_minutes", "crawl_pages", "crawl_batch", "sources", "sbom_max_mb", "events_max_rows", "events_retention_days", "source_intervals", "public_source_batch", "public_source_records")}
         }
+
+    @app.get("/api/sources/catalog")
+    def catalog():
+        from .sourcehub import source_catalog
+        return source_catalog(config, store)
+
+    @app.get("/api/sources/settings")
+    def source_settings():
+        from .sourcehub import public_settings
+        return public_settings({key: config[key] for key in ("source_targets", "source_intervals", "sources", "provider_settings", "watch_products", "exploit_keywords")})
+
+    @app.post("/api/sources/settings")
+    async def save_source_settings(request: Request):
+        from .sourcehub import definitions
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > 65536:
+                raise HTTPException(413, "Source settings exceed 64 KiB")
+            body.extend(chunk)
+        try:
+            supplied = SourceSettingsRequest.model_validate_json(body).model_dump(exclude_none=True)
+            providers = {row["id"] for row in definitions()}
+            if set(supplied.get("sources", {})) - set(config["sources"]) or set(supplied.get("source_intervals", {})) - set(config["sources"]):
+                raise ValueError("Unknown source family")
+            if set(supplied.get("provider_settings", {})) - providers:
+                raise ValueError("Unknown provider")
+            if any(not math.isfinite(value) or not 0 < value <= 525600 for value in supplied.get("source_intervals", {}).values()):
+                raise ValueError("Source intervals must be positive minutes, at most one year")
+
+            def validate(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if re.search(r"(?:password|secret|token|api[_-]?key|authorization|credentials|headers)|^key$", key, re.I):
+                            raise ValueError("Configure provider credentials through environment variables")
+                        if key == "enabled" and type(child) is not bool:
+                            raise ValueError("Provider enabled must be a boolean")
+                        if key in {"url", "query", "user_agent"} and not isinstance(child, str):
+                            raise ValueError(f"Provider {key} must be a string")
+                        if key == "urls" and (not isinstance(child, list) or any(not isinstance(location, str) for location in child)):
+                            raise ValueError("Provider urls must be an array of strings")
+                        if key == "url" and child:
+                            public_url(child)
+                        if key == "urls":
+                            for location in child:
+                                public_url(location)
+                        validate(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        validate(child)
+                elif isinstance(value, str):
+                    if len(value) > 4000:
+                        raise ValueError("Source setting strings must be at most 4000 characters")
+                    if re.match(r"https?://", value.strip(), re.I):
+                        location = public_url(value.strip())
+                        if any(re.search(r"(?:key|token|secret|password|signature|credential)", key, re.I) for key, _ in parse_qsl(urlsplit(location).query, keep_blank_values=True)):
+                            raise ValueError("Public source URLs must not include credentials")
+                elif isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError("Source settings must contain finite numbers")
+
+            validate(supplied)
+            for target in supplied.get("source_targets", []):
+                domain = target.get("domain", "")
+                if not isinstance(domain, str) or not domain.strip() or any(char in domain for char in "/:@?#* "):
+                    raise ValueError("Each source target requires a plain domain name")
+                domain = domain.rstrip(".").encode("idna").decode().lower()
+                if len(domain) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in domain.split(".")):
+                    raise ValueError("Invalid target domain name")
+                target["domain"] = domain
+                for key in ("document_urls", "javascript_urls", "sourcemap_urls", "dkim_selectors", "bssids"):
+                    if key in target and (not isinstance(target[key], list) or any(not isinstance(value, str) for value in target[key])):
+                        raise ValueError(f"Target {key} must be an array of strings")
+                for key in ("document_urls", "javascript_urls", "sourcemap_urls"):
+                    for location in target.get(key, []):
+                        public_url(location)
+                if "provider_urls" in target:
+                    if not isinstance(target["provider_urls"], dict) or any(not isinstance(locations, list) or any(not isinstance(location, str) for location in locations) for locations in target["provider_urls"].values()):
+                        raise ValueError("Target provider_urls must map providers to URL arrays")
+                    for locations in target["provider_urls"].values():
+                        for location in locations:
+                            public_url(location)
+        except (ValidationError, ValueError, UnicodeError, RecursionError) as error:
+            raise HTTPException(422, str(error)[:300] if isinstance(error, ValueError) and not isinstance(error, ValidationError) else "Invalid source settings") from error
+        with config_lock:
+            changes = {}
+            for key, value in supplied.items():
+                if key in {"sources", "source_intervals"}:
+                    changes[key] = {**config[key], **value}
+                elif key == "provider_settings":
+                    changes[key] = {**config[key], **{provider: {**config[key].get(provider, {}), **options} for provider, options in value.items()}}
+                else:
+                    changes[key] = value
+            path = Path(config["config_path"])
+            disk = json.loads(path.read_text()) if path.exists() else {}
+            disk.update(changes)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(disk, indent=2) + "\n")
+            os.replace(temporary, path)
+            config.update(changes)
+        return {"saved": True, **source_settings()}
 
     @app.get("/api/search")
     def search(q: str = "", kind: str = "", limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):

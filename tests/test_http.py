@@ -99,6 +99,26 @@ class HTTPRetryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, r"^Connection timed out: https://example.test/feed$"):
             await self.http.get("https://example.test/feed?query=private", max_attempts=1)
 
+    async def test_post_bounds_response_and_never_persists_request_credentials(self):
+        self.http.session.post.return_value = Response(200)
+        result = await self.http.post("https://example.test/search", json={"query": "host"}, headers={"Authorization": "Bearer private-value"})
+        self.assertEqual(result.path.read_bytes(), b'{"ok": true}')
+        self.assertFalse(list(Path(self.temp.name).glob("*.json")))
+        self.http.session.post.assert_called_once()
+        self.assertFalse(self.http.session.post.call_args.kwargs["allow_redirects"])
+        with self.assertRaisesRegex(ValueError, "Response exceeds"):
+            await self.http.post("https://example.test/search", data={"token": "private-value"}, max_bytes=1)
+        for path in Path(self.temp.name).iterdir():
+            self.assertNotIn(b"private-value", path.read_bytes())
+
+    async def test_post_uses_host_cooldown_and_has_no_implicit_retry(self):
+        self.http.session.post.return_value = Response(429, headers={"Retry-After": "120"})
+        with self.assertRaises(HTTPError) as raised:
+            await self.http.post("https://example.test/search", json={"q": "test"})
+        self.assertEqual(raised.exception.retry_after, 120)
+        self.assertEqual(self.http.session.post.call_count, 1)
+        self.assertEqual(self.waits, [])
+
 
 class HTTPDiagnosticTests(unittest.TestCase):
     def test_retry_after_http_date_and_invalid_numbers(self):

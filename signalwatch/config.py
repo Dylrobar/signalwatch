@@ -1,10 +1,11 @@
 import json
+import math
 import os
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 
 DEFAULTS = {
@@ -53,6 +54,23 @@ DEFAULTS = {
     "staging_poll_seconds": 2,
     "staging_retention_days": 7,
     "staging_max_completed": 10000,
+    "source_intervals": {"news": 15, "threat": 15, "nvd": 360, "kev": 360, "epss": 360,
+                         "github": 360, "osv": 360, "cve_program": 360, "csaf": 360,
+                         "exposure": 10080, "corporate": 10080, "developer": 10080, "hardware": 43200},
+    "public_source_batch": 3,
+    "public_source_records": 100,
+    "public_source_concurrency": 4,
+    "threat_source_batch": 8,
+    "source_targets": [{"name": "Apache Software Foundation", "domain": "apache.org", "github_org": "apache"},
+                       {"name": "Cisco", "domain": "cisco.com", "github_org": "cisco"},
+                       {"name": "Microsoft", "domain": "microsoft.com", "github_org": "microsoft", "cik": "0000789019"}],
+    "watch_products": [],
+    "exploit_keywords": ["exploit", "zero-day", "zero day", "rce", "remote code execution", "security fix", "security patch", "actively exploited", "authentication bypass", "memory corruption"],
+    "provider_settings": {"crtsh": {"enabled": True}, "dns_txt": {"enabled": True},
+                          "fulldisclosure": {"enabled": True}, "oss_security": {"enabled": True},
+                          "zdi_published": {"enabled": True}, "zdi_upcoming": {"enabled": True},
+                          "dark_reading": {"enabled": True}, "apple_security": {"enabled": True}},
+    "provider_credentials": {},
     "sources": {
         "nvd": True,
         "kev": True,
@@ -64,7 +82,12 @@ DEFAULTS = {
         "network": True,
         "wikidata": True,
         "news": True,
-        "web": True
+        "web": True,
+        "exposure": True,
+        "corporate": True,
+        "developer": True,
+        "threat": True,
+        "hardware": True
     },
     "feeds": [
         {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},
@@ -101,13 +124,28 @@ def load_config(path="config.json"):
     if path.exists():
         supplied = json.loads(path.read_text())
         for key, value in supplied.items():
-            if key == "sources":
+            if key in {"sources", "source_intervals", "provider_settings", "provider_credentials"}:
                 config[key].update(value)
             else:
                 config[key] = value
     config["nvd_api_key"] = os.environ.get("NVD_API_KEY", config["nvd_api_key"])
     config["github_token"] = os.environ.get("GITHUB_TOKEN", config["github_token"])
     config["api_token"] = os.environ.get("SIGNALWATCH_API_TOKEN", config["api_token"])
+    for key, value in os.environ.items():
+        if key.startswith("SIGNALWATCH_") and key.endswith("_CREDENTIALS"):
+            provider = key[len("SIGNALWATCH_"):-len("_CREDENTIALS")].lower()
+            try:
+                config["provider_credentials"][provider] = json.loads(value)
+            except ValueError:
+                config["provider_credentials"][provider] = value
+    for provider, name in {"shodan": "SHODAN_API_KEY", "fofa": "FOFA_API_KEY", "netlas": "NETLAS_API_KEY",
+                           "zoomeye": "ZOOMEYE_API_KEY", "greynoise": "GREYNOISE_API_KEY", "urlhaus": "URLHAUS_AUTH_KEY",
+                           "vulncheck": "VULNCHECK_API_KEY", "attackerkb": "ATTACKERKB_API_KEY", "sam_gov": "SAM_GOV_API_KEY",
+                           "opencorporates": "OPENCORPORATES_API_KEY", "censys": "CENSYS_API_KEY"}.items():
+        if name in os.environ:
+            config["provider_credentials"][provider] = os.environ[name]
+    if "SIGNALWATCH_SEC_USER_AGENT" in os.environ:
+        config["provider_settings"].setdefault("sec_edgar", {})["user_agent"] = os.environ["SIGNALWATCH_SEC_USER_AGENT"]
     if "SIGNALWATCH_CORS_ORIGINS" in os.environ:
         config["cors_origins"] = [origin.strip() for origin in os.environ["SIGNALWATCH_CORS_ORIGINS"].split(",") if origin.strip()]
     if not isinstance(config["api_token"], str):
@@ -130,16 +168,33 @@ def load_config(path="config.json"):
     for name in ("concurrency", "per_host", "timeout", "crawl_pages", "crawl_batch", "interval_minutes",
                  "osv_max_records", "osv_index_chunk_mb", "osv_index_chunks", "osv_index_max_chunks", "cve_max_records",
                  "staging_max_records", "staging_batch", "staging_max_completed",
+                 "public_source_batch", "public_source_records", "public_source_concurrency", "threat_source_batch",
                  "cve_max_zip_mb", "csaf_max_records", "network_batch", "network_interval_hours", "news_concurrency"):
         if int(config[name]) < 1:
             raise ValueError(f"{name} must be positive")
     for name in ("dns_timeout", "dns_concurrency", "sbom_max_mb", "events_max_rows", "events_retention_days",
                  "staging_max_payload_mb", "staging_max_mb", "staging_poll_seconds", "staging_retention_days"):
-        if float(config[name]) <= 0:
+        if not math.isfinite(float(config[name])) or float(config[name]) <= 0:
             raise ValueError(f"{name} must be positive")
     if config["dns_mode"] not in {"system", "fallback", "doh"}:
         raise ValueError("dns_mode must be system, fallback, or doh")
     if int(config["staging_batch"]) > 500:
         raise ValueError("staging_batch must be at most 500")
+    if int(config["public_source_records"]) > 5000:
+        raise ValueError("public_source_records must be at most 5000")
+    if not isinstance(config["source_intervals"], dict) or any(not math.isfinite(float(value)) or float(value) <= 0 for value in config["source_intervals"].values()):
+        raise ValueError("source_intervals must map source families to positive minutes")
+    if not isinstance(config["source_targets"], list) or any(not isinstance(target, dict) for target in config["source_targets"]):
+        raise ValueError("source_targets must be an array of target objects")
+    for name in ("provider_settings", "provider_credentials"):
+        if not isinstance(config[name], dict):
+            raise ValueError(f"{name} must be an object")
+    if any(not isinstance(value, dict) for value in config["provider_settings"].values()):
+        raise ValueError("Provider settings must be objects")
+    if any(not isinstance(value, (str, dict)) for value in config["provider_credentials"].values()):
+        raise ValueError("Provider credentials must be strings or objects")
+    for name in ("watch_products", "exploit_keywords"):
+        if not isinstance(config[name], list) or any(not isinstance(value, str) for value in config[name]):
+            raise ValueError(f"{name} must be an array of strings")
     config["config_path"] = str(path)
     return config

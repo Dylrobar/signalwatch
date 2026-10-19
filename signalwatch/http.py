@@ -106,7 +106,21 @@ class PublicHTTP:
         async with lock:
             return await self._get(request_url, key, headers or {}, max_bytes, cache, force, allow_redirects, max_attempts)
 
-    async def _get(self, url, key, headers, max_bytes, cache, force, allow_redirects, max_attempts):
+    async def post(self, url, *, json=None, data=None, headers=None, max_bytes=None, allow_redirects=False, max_attempts=1):
+        from json import dumps
+        if not 1 <= max_attempts <= 4:
+            raise ValueError("max_attempts must be between 1 and 4")
+        if json is not None and data is not None:
+            raise ValueError("Supply JSON or form data, not both")
+        representation = dumps([json, data, headers or {}], sort_keys=True, default=str, separators=(",", ":"))
+        key = hashlib.sha256((url + "\nPOST\n" + representation).encode()).hexdigest()
+        lock = self.locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            return await self._get(url, key, headers or {}, max_bytes, False, True, allow_redirects,
+                                   max_attempts, method="POST", request_body={"json": json, "data": data})
+
+    async def _get(self, url, key, headers, max_bytes, cache, force, allow_redirects, max_attempts,
+                   method="GET", request_body=None):
         body = self.cache / f"{key}.body"
         meta_path = self.cache / f"{key}.json"
         meta = {}
@@ -134,7 +148,8 @@ class PublicHTTP:
                 delay = self.host_wait.get(host, 0) - time.monotonic()
             temp = self.cache / f"{key}.{os.getpid()}.{random.getrandbits(64):016x}.part"
             try:
-                async with self.session.get(url, headers=request_headers, allow_redirects=allow_redirects) as response:
+                request = self.session.get if method == "GET" else self.session.post
+                async with request(url, headers=request_headers, allow_redirects=allow_redirects, **(request_body or {})) as response:
                     response_headers = dict(response.headers)
                     if response.status == 304 and body.exists():
                         return FetchResult(body, 304, {**meta.get("headers", {}), **response_headers}, str(response.url), False, meta.get("digest", ""))

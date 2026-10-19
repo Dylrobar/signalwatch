@@ -12,7 +12,7 @@ signalwatch init
 signalwatch serve
 ```
 
-Open http://127.0.0.1:8765. Collection starts immediately and repeats every 30 minutes while the service runs. Configuration and data belong to the directory containing `config.json`. Stop with Ctrl+C; restart with the same configuration to resume checkpoints.
+Open http://127.0.0.1:8765. Collection starts when enabled sources are due and follows independent persisted schedules. Configuration and data belong to the directory containing `config.json`. Stop with Ctrl+C; restart with the same configuration to resume checkpoints.
 
 ```bash
 docker compose up --build -d
@@ -104,6 +104,13 @@ The bundled interface at `/` has no token entry; use `frontend/` for a protected
 | Wikidata | Companies and their published official websites | Small batches with per-class continuation |
 | Security/vendor RSS | Article titles, summaries, publication dates, CVE mentions | Conditional fetches and URL deduplication |
 | Public websites/DNS | Visible technology fingerprints, version evidence, domain/IP relationships | Bounded regular HTTP crawling, robots rules, scheduled refresh |
+| Exposure | CT certificates, passive DNS, TXT/SPF/DMARC/DKIM, credentialed indexed banners, configured network exports | Weekly bounded target rotation |
+| Corporate | Public job APIs, registry/procurement evidence, PDF/OOXML metadata, configured exports | Weekly per-provider budgets and continuation |
+| Developer | Public repository manifests, archive indexes, registry tags, configured JS/API/app metadata | Weekly bounded discovery and manifest rotation |
+| Threat | Disclosure lists, ZDI, Apple release index, news, credentialed telemetry, configured social/bug exports | 15-minute family schedule and product/indicator qualification |
+| Hardware | Scoped WiGLE queries, FCC exports, credentialed industrial device indexes | Monthly bounded query rotation |
+
+Version 0.8.0 adds a searchable 83-entry provider/collector catalog with public, credentialed, configured URL, and import-only access modes. The catalog distinguishes available capabilities from successful collection. [Source setup, schedules, evidence rules, and the complete provider matrix](docs/sources.md) document all additions. The initial target selection uses Apache, Cisco, and Microsoft from existing website seeds; it can be changed through authenticated source settings.
 
 The 12 default RSS/Atom feeds include The Hacker News, BleepingComputer, Krebs on Security, SANS ISC, CERT-EU, Microsoft MSRC, SecurityWeek, Fortinet PSIRT, Debian, Ubuntu, CERT/CC, and Palo Alto Networks. Add feeds and website seeds through Collectors. NVD vendor advisory references and Wikidata websites expand the crawl queue automatically. Discovery counts show URLs accepted or rejected at the configured queue ceiling.
 
@@ -239,7 +246,13 @@ Existing configurations gain the new collector switches from defaults. An existi
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `concurrency` / `per_host` | 32 / 4 | Shared connection pool and per-host connection limit |
-| `interval_minutes` | 30 | Collection cycle interval |
+| `interval_minutes` | 30 | Fallback family interval |
+| `source_intervals` | RSS/threat 15 minutes, vulnerability sources 360, recon 10080, hardware 43200 | Independent family schedules; manual collection bypasses intervals |
+| `source_targets` | Apache, Cisco, Microsoft | Explicit domains and optional public job-board/repository/CIK/document identifiers |
+| `provider_settings` / `provider_credentials` | Public defaults / Empty | Provider options and environment-loaded credentials; see source matrix |
+| `public_source_batch` / `public_source_records` / `public_source_concurrency` | 3 / 100 / 4 | Extension target/request budgets, parsed records per response, concurrent requests per family |
+| `threat_source_batch` | 8 | Threat-provider request budget per cycle; deferred coverage remains visible |
+| `watch_products` / `exploit_keywords` | Empty / Exploit and patch indicators | Mandatory product-and-indicator filter for social qualification |
 | `crawl_batch` / `crawl_pages` / `crawl_depth` | 50 / 8 / 1 | Hosts per cycle and bounded same-host page traversal |
 | `crawl_interval_hours` | 24 | Website refresh interval |
 | `max_discovered_domains` | 10000 | Automatic source expansion ceiling |
@@ -302,6 +315,8 @@ Validation on 2026-10-18: 165 automated tests and nine Chromium browser check gr
 Version 0.5.0 validation: 175 Python tests and 12 frontend tests passed, as did strict TypeScript checking and the frontend production build. Remote API tests use real HTTP requests to verify optional authentication, protected exports and mutations, exact-origin preflights, reverse-proxy paths, credential omission, and readable error responses. Fourteen local Chromium interaction groups covered authentication, filtered exports, navigation, forms, and mobile layouts. A separate flow imported explicit test inventory against an actual stored public advisory, displayed a potential warning, then cleared the inventory and verified the local warning-clearance event. Browser validation used a copied database and local frontend source; it did not publish or synchronize a Lovable project. The wheel builds successfully with all package files included.
 
 Version 0.7.0 validation: all 256 backend tests passed, including all five heterogeneous input families, exact raw bytes, authenticated HTTP ingestion, background processing, CLI round trips, malformed inputs, explicit idempotency expiry, concurrent capacity/claims, lease fencing, atomic rollback, stream ordering, failed-record replay guards, and retention. Independent queue/adapter review cleared. No frontend files or dependencies changed in this release.
+
+Version 0.8.0 validation: all 378 backend tests and 47 frontend tests passed, with strict TypeScript and a production build. Independent reviews covered source attribution, raw staging, retries/deferred coverage, credentials, settings persistence, and target rotation. Actual-API Chromium checks passed at desktop/mobile sizes against the 83-entry catalog. A bounded isolated live run fetched public DNS, GitHub, ZDI, Dark Reading, and Apple records and processed all nine raw responses, producing articles/software/network evidence with zero invented deployment observations. The wheel builds with all extension modules and the PDF metadata dependency.
 
 ## Primary source documentation
 

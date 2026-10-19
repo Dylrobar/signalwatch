@@ -1,23 +1,42 @@
 import { describe, toArray, type R } from "./format";
 
-export const FAMILIES = ["nvd", "kev", "epss", "github", "osv", "cve_program", "csaf", "network", "wikidata", "news", "web"];
+export const FAMILIES = ["nvd", "kev", "epss", "github", "osv", "cve_program", "csaf", "network", "wikidata", "news", "web", "exposure", "corporate", "developer", "threat", "hardware"];
 
-export type Health = "collecting" | "error" | "partial" | "interrupted" | "disabled" | "not_collected" | "healthy" | "unknown";
+export type Health = "collecting" | "error" | "partial" | "skipped" | "interrupted" | "unconfigured" | "disabled" | "not_collected" | "healthy" | "unknown";
+
+export type SourceProvider = {
+  id: string;
+  name: string;
+  category: string;
+  family: string;
+  access: "public" | "api_key" | "configured_url" | "import" | "native";
+  description: string;
+  homepage: string;
+  required: string[];
+  status: string;
+  requirements: string[];
+  credential_configured: boolean;
+  enabled: boolean;
+  health?: R;
+};
+
+export type SourceCatalog = { items: SourceProvider[]; total: number };
 
 export function sourceErrors(s: R): string[] {
   const out = new Set<string>();
   if (s?.["error"]) out.add(describe(s["error"]));
-  const e = s?.["counts"]?.["errors"];
-  if (typeof e === "number" && e > 0) out.add(`${e} errors reported`);
-  else if (typeof e === "string" && e) out.add(e);
-  else if (Array.isArray(e))
-    for (const item of e) {
-      if (item && typeof item === "object") {
-        const where = item["source"] || item["name"] || item["url"];
-        const what = item["error"] || item["message"] || describe(item);
-        out.add([where, what].filter(Boolean).join(": "));
-      } else if (item) out.add(String(item));
-    }
+  for (const e of [s?.["errors"], s?.["counts"]?.["errors"]]) {
+    if (typeof e === "number" && e > 0) out.add(`${e} errors reported`);
+    else if (typeof e === "string" && e) out.add(e);
+    else if (Array.isArray(e))
+      for (const item of e) {
+        if (item && typeof item === "object") {
+          const where = item["source"] || item["name"] || item["url"];
+          const what = item["error"] || item["message"] || describe(item);
+          out.add([where, what].filter(Boolean).join(": "));
+        } else if (item) out.add(String(item));
+      }
+  }
   return [...out].filter(Boolean);
 }
 
@@ -59,11 +78,14 @@ export function sourceIssues(errors: string[]) {
 
 export function sourceHealth(s: R, running: boolean): Health {
   if (running) return "collecting";
+  if (s["status"] === "unconfigured") return "unconfigured";
   if (!s["persisted"]) return s["enabled"] === false ? "disabled" : "not_collected";
   if (s["status"] === "error") return "error";
   if (s["status"] === "interrupted") return "interrupted";
   if (s["status"] === "running") return "collecting";
-  if (sourceErrors(s).length || s["status"] === "partial") return s["last_success"] ? "partial" : "error";
+  if (s["status"] === "partial") return "partial";
+  if (s["status"] === "skipped") return "skipped";
+  if (sourceErrors(s).length) return s["last_success"] ? "partial" : "error";
   if (s["enabled"] === false) return "disabled";
   if (s["last_success"]) return "healthy";
   return "unknown";
@@ -79,6 +101,7 @@ export function sourceRecords(s: R): number | null {
 
 export function mergeSources(status: R | undefined) {
   const configured: Record<string, boolean> = status?.["config"]?.["sources"] ?? {};
+  const intervals: Record<string, unknown> = status?.["config"]?.["source_intervals"] ?? {};
   const names = Object.keys(configured).length ? Object.keys(configured) : FAMILIES;
   const saved = toArray(status?.["sources"]).filter(Boolean).map((s) => (typeof s === "string" ? { name: s } : s)) as R[];
   const byName = new Map(saved.map((s) => [String(s["name"]), s]));
@@ -87,10 +110,33 @@ export function mergeSources(status: R | undefined) {
     enabled: configured[name],
     configured: Object.prototype.hasOwnProperty.call(configured, name),
     ...(byName.get(name) ?? {}),
+    interval_minutes: intervals[name] ?? byName.get(name)?.["interval_minutes"],
     persisted: byName.has(name),
   }));
   const historical = saved.filter((s) => !names.includes(String(s["name"])));
   return { families, historical };
+}
+
+export function providerStatus(provider: SourceProvider, health: R | undefined): string {
+  if (!provider.enabled) return "disabled";
+  if (provider.status === "unconfigured" || provider.requirements.length) return "unconfigured";
+  return String(health?.["status"] ?? provider.status ?? "unknown");
+}
+
+export function providerRecords(health: R | undefined): number | null {
+  if (!health) return null;
+  for (const key of ["records", "staged"])
+    if (typeof health[key] === "number" && Number.isFinite(health[key])) return health[key];
+  return sourceRecords(health);
+}
+
+export function sourceInterval(source: R): string {
+  const minutes = Number(source["interval_minutes"]);
+  if (!Number.isFinite(minutes) || minutes <= 0) return "not reported";
+  if (minutes % 10080 === 0) return `Every ${minutes / 10080 === 1 ? "week" : `${minutes / 10080} weeks`}`;
+  if (minutes % 1440 === 0) return `Every ${minutes / 1440 === 1 ? "day" : `${minutes / 1440} days`}`;
+  if (minutes % 60 === 0) return `Every ${minutes / 60 === 1 ? "hour" : `${minutes / 60} hours`}`;
+  return `Every ${minutes} min`;
 }
 
 export function feedList(raw: unknown): R[] {

@@ -380,7 +380,12 @@ def auto(item, maximum):
     return ADAPTERS[_auto_adapter(item)](item, maximum)
 
 
-ADAPTERS = {"auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque}
+def public_source(item, maximum):
+    from .sourcehub import normalize_public_source
+    return normalize_public_source(item, max_records=maximum)
+
+
+ADAPTERS = {"auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source}
 
 
 def normalize(item, max_records=5000):
