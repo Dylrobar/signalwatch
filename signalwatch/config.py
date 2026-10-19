@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 
 
 DEFAULTS = {
@@ -59,7 +59,7 @@ DEFAULTS = {
     "source_intervals": {"news": 15, "threat": 15, "prerelease": 60, "nvd": 360, "kev": 360, "epss": 360,
                          "github": 360, "osv": 360, "cve_program": 360, "csaf": 360,
                          "web": 5, "wikidata": 15, "network": 15,
-                         "exposure": 30, "corporate": 60, "developer": 360, "hardware": 43200, "nmap": 1440},
+                         "exposure": 30, "corporate": 15, "developer": 360, "hardware": 43200, "nmap": 1440},
     "public_source_batch": 3,
     "public_source_records": 100,
     "public_source_concurrency": 4,
@@ -72,7 +72,10 @@ DEFAULTS = {
     "provider_settings": {"nmap": {"enabled": True, "profile": "quick", "targets": [], "timeout": 900},
                           "ctlogs": {"enabled": True}, "certspotter": {"enabled": False},
                           "crtsh": {"enabled": True}, "dns_txt": {"enabled": True},
-                          "gleif": {"enabled": True}, "corporate_discovery": {"enabled": True},
+                          "gleif": {"enabled": True}, "corporate_discovery": {"enabled": True, "batch": 12},
+                          "greenhouse": {"enabled": True}, "lever": {"enabled": True},
+                          "ashby": {"enabled": True}, "company_feeds": {"enabled": True},
+                          "technographics": {"enabled": True},
                           "importyeti_public": {"enabled": True},
                           "circl_misp": {"enabled": True}, "greynoise_public": {"enabled": True},
                           "fulldisclosure": {"enabled": True}, "oss_security": {"enabled": True},

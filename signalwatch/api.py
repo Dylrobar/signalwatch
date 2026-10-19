@@ -268,6 +268,7 @@ def create_app(config, auto_collect=True):
         try:
             supplied = SourceSettingsRequest.model_validate_json(body).model_dump(exclude_none=True)
             providers = {row["id"] for row in definitions()}
+            providers.add("technographics")
             if set(supplied.get("sources", {})) - set(config["sources"]) or set(supplied.get("source_intervals", {})) - set(config["sources"]):
                 raise ValueError("Unknown source family")
             if set(supplied.get("provider_settings", {})) - providers:
@@ -317,10 +318,10 @@ def create_app(config, auto_collect=True):
                 if len(domain) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in domain.split(".")):
                     raise ValueError("Invalid target domain name")
                 target["domain"] = domain
-                for key in ("document_urls", "javascript_urls", "sourcemap_urls", "dkim_selectors", "bssids"):
+                for key in ("document_urls", "javascript_urls", "sourcemap_urls", "feed_urls", "dkim_selectors", "bssids"):
                     if key in target and (not isinstance(target[key], list) or any(not isinstance(value, str) for value in target[key])):
                         raise ValueError(f"Target {key} must be an array of strings")
-                for key in ("document_urls", "javascript_urls", "sourcemap_urls"):
+                for key in ("document_urls", "javascript_urls", "sourcemap_urls", "feed_urls"):
                     for location in target.get(key, []):
                         public_url(location)
                 if "provider_urls" in target:
@@ -383,6 +384,9 @@ def create_app(config, auto_collect=True):
         result = store.detail(id)
         if result is None:
             raise HTTPException(404, "Record not found")
+        if "technographics" in result:
+            from .technographic_verifier import verifier_enabled
+            result["technographics"]["verification"] = {"enabled": verifier_enabled(config)}
         return result
 
     @app.get("/api/staging/stats")

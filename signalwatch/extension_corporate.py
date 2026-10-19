@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import csv
 import hashlib
 import html
@@ -13,17 +14,20 @@ from urllib.robotparser import RobotFileParser
 from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
+import feedparser
 
 
 SOURCE_DEFINITIONS = [
     {"id": provider, "name": name, "category": "corporate", "family": "corporate", "access": access,
      "description": description, "homepage": homepage, "required": required}
     for provider, name, access, description, homepage, required in [
-        ("corporate_discovery", "Company public evidence discovery", "public", "Discover linked public job boards and document URLs from configured company domains, with bounded weekly rotation; links remain evidence rather than deployment claims.", "https://github.com/Dylrobar/signalwatch", ["source_targets.domain"]),
+        ("corporate_discovery", "Company public evidence discovery", "public", "Discover linked public job boards, company RSS/Atom feeds, and document URLs from configured company domains, with bounded weekly rotation; links remain evidence rather than deployment claims.", "https://github.com/Dylrobar/signalwatch", ["source_targets.domain"]),
         ("gleif", "GLEIF legal entities and reported parents", "public", "Keyless LEI legal-name search and reported direct/ultimate parent relationships; name matches remain identity candidates.", "https://www.gleif.org/en/lei-data/gleif-api/", ["source_targets.name"]),
         ("importyeti_public", "ImportYeti public company tables", "public", "Visible public supplier, HTS, and recent shipment tables from company-name candidate pages; locked fields and search APIs are not requested and shipments do not establish installed infrastructure.", "https://www.importyeti.com/", ["source_targets.name"]),
         ("greenhouse", "Greenhouse public job boards", "public", "Published jobs from configured or company-linked board IDs; hiring text is evidence, not verified deployment.", "https://docs.greenhouse.io/job-board", ["source_targets.domain or greenhouse_board"]),
         ("lever", "Lever public postings", "public", "Published jobs from configured or company-linked Lever sites, including EU boards; no employment or deployment inference.", "https://github.com/lever/postings-api", ["source_targets.domain or lever_site"]),
+        ("ashby", "Ashby public postings", "public", "Published jobs from configured or company-linked Ashby boards using the public Job Postings API; hiring text remains attributed evidence.", "https://developers.ashbyhq.com/docs/public-job-posting-api", ["source_targets.domain or ashby_board"]),
+        ("company_feeds", "Company engineering and publication feeds", "public", "Company-linked RSS and Atom engineering, blog, and news publications; original article URLs and publication dates are preserved.", "https://www.rssboard.org/rss-specification", ["source_targets.domain or feed_urls"]),
         ("sec_edgar", "SEC EDGAR submissions", "public", "Current filer metadata and bounded recent filing metadata for configured CIKs; older filing archives are not automatically followed.", "https://www.sec.gov/search-filings/edgar-application-programming-interfaces", ["source_targets.cik", "provider_settings.sec_edgar.user_agent"]),
         ("opencorporates", "OpenCorporates", "api_key", "Credentialed company-name search results remain registry evidence requiring identity review.", "https://api.opencorporates.com/documentation/API-Reference", ["provider_credentials.opencorporates", "source_targets.name"]),
         ("sam_gov", "SAM.gov public entity registrations", "api_key", "Credentialed public entity-registration search; no sensitive or FOUO sections are requested.", "https://open.gsa.gov/api/entity-api/", ["provider_credentials.sam_gov", "source_targets.name"]),
@@ -71,8 +75,16 @@ def _bounded(value, limit=12000):
     return {"truncated": True, "preview": encoded.encode("utf-8")[:limit // 2].decode("utf-8", errors="replace")}
 
 
-def _plain(value, limit=12000):
-    return BeautifulSoup(html.unescape(str(value or "")), "html.parser").get_text(" ", strip=True)[:limit]
+def _plain(value, limit=12000, paragraphs=False):
+    soup = BeautifulSoup(html.unescape(str(value or "")), "html.parser")
+    if not paragraphs:
+        return soup.get_text(" ", strip=True)[:limit]
+    for node in soup.find_all(["p", "li", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        node.insert_before("\n")
+        node.insert_after("\n")
+    for node in soup.find_all("br"):
+        node.replace_with("\n")
+    return "\n".join(" ".join(line.split()) for line in soup.get_text(" ").splitlines() if line.strip())[:limit]
 
 
 def _record(item, provider, identity, name, fields, *, kind="corporate_record", role="public_record", truncated=False):
@@ -87,14 +99,18 @@ def _record(item, provider, identity, name, fields, *, kind="corporate_record", 
     provenance = {"raw_reference": "staging:" + str(item["id"]), "payload_hash": item["payload_hash"],
                   "source": item.get("source") or provider, "provider": provider,
                   "observed_at": item.get("observed_at") or item.get("received_at")}
-    compact_fields = _bounded(fields)
+    if metadata.get("source_response_hash"):
+        provenance["source_response_hash"] = metadata["source_response_hash"]
+    compact_fields = _bounded(fields, 64000 if kind in {"job_posting", "company_article"} else 12000)
     entity = {"id": entity_id, "kind": kind, "name": str(name or identity)[:1000], "value": json.dumps(compact_fields, ensure_ascii=False)[:4096],
               "metadata": {"provider": provider, "evidence_role": role, "company_context": context,
                            "fields": compact_fields, "deployment_verified": False, "ownership_verified": False,
-                           "coverage_truncated": bool(truncated), "staging": provenance},
+                           "coverage_truncated": bool(truncated or metadata.get("coverage_truncated")), "staging": provenance},
               "source_url": source_url, "observed_at": provenance["observed_at"], "confidence": 1.0}
     if metadata.get("discovered_from"):
         entity["metadata"]["discovered_from"] = metadata["discovered_from"]
+    if "source_record_offset" in metadata:
+        entity["metadata"]["source_selection"] = {"offset": metadata["source_record_offset"], "total_records": metadata["source_total_records"]}
     edge = None
     if context.get("company_id"):
         edge = {"from_id": context["company_id"], "to_id": entity_id, "relation": "has_public_evidence",
@@ -102,24 +118,59 @@ def _record(item, provider, identity, name, fields, *, kind="corporate_record", 
     return entity, edge
 
 
-def _jobs(provider, payload, maximum):
-    jobs = payload.get("jobs") if provider == "greenhouse" and isinstance(payload, dict) else payload
+def _jobs(provider, payload, maximum, offset=0):
+    jobs = payload.get("jobs") if provider in {"greenhouse", "ashby"} and isinstance(payload, dict) else payload
     if not isinstance(jobs, list):
         raise ValueError("Job board response lacks a jobs array")
     records = []
-    for job in jobs[:maximum]:
-        if not isinstance(job, dict) or job.get("id") is None or not isinstance(job.get("title", job.get("text")), str):
+    for job in jobs[offset:offset + maximum]:
+        if not isinstance(job, dict) or (job.get("jobUrl") if provider == "ashby" else job.get("id")) is None or not isinstance(job.get("title", job.get("text")), str):
             raise ValueError("Job record lacks an ID or title")
         title = job.get("title", job.get("text"))
         if provider == "greenhouse":
-            fields = {key: job.get(key) for key in ("id", "title", "absolute_url", "updated_at", "location", "departments", "offices")}
-            fields["description"] = _plain(job.get("content"))
+            fields = {key: job.get(key) for key in ("id", "title", "absolute_url", "first_published", "updated_at", "location", "departments", "offices")}
+            fields["description"] = _plain(job.get("content"), paragraphs=True)
+            fields.update(url=job.get("absolute_url"), published_at=job.get("first_published"))
+        elif provider == "ashby":
+            fields = {key: job.get(key) for key in ("title", "jobUrl", "publishedAt", "location", "department", "team", "workplaceType", "employmentType")}
+            fields["description"] = _plain(job.get("descriptionPlain") or job.get("descriptionHtml"), paragraphs=True)
+            fields.update(url=job["jobUrl"], published_at=job.get("publishedAt"))
         else:
             fields = {key: job.get(key) for key in ("id", "text", "hostedUrl", "createdAt", "categories", "workplaceType", "country")}
-            fields["description"] = _plain(job.get("descriptionPlain") or job.get("description"))
+            text = [_plain(job.get("descriptionPlain") or job.get("description"), paragraphs=True)]
+            text.extend(_plain(section.get("text")) + "\n" + _plain(section.get("content"), paragraphs=True)
+                        for section in job.get("lists") or [] if isinstance(section, dict))
+            fields["description"] = "\n".join(value.strip() for value in text if value.strip())[:12000]
             fields["lists"] = _bounded(job.get("lists") or [], 6000)
-        records.append((str(job["id"]), title, fields, "job_posting", "job_advertisement"))
-    return records, len(jobs) > maximum or (provider == "lever" and len(jobs) == maximum)
+            published = job.get("createdAt")
+            if isinstance(published, (int, float)) and not isinstance(published, bool):
+                try:
+                    published = datetime.fromtimestamp(published / 1000, timezone.utc).isoformat()
+                except (ValueError, OverflowError, OSError):
+                    published = None
+            fields.update(title=title, url=job.get("hostedUrl"), published_at=published)
+        records.append((str(job["jobUrl"] if provider == "ashby" else job["id"]), title, fields, "job_posting", "job_advertisement"))
+    return records, offset > 0 or len(jobs) > maximum
+
+
+def _company_feed(payload, source_url, maximum):
+    parsed = feedparser.parse(payload)
+    if parsed.get("bozo") or not str(parsed.get("version", "")).startswith(("rss", "atom")):
+        raise ValueError("Company publication response is not valid RSS or Atom")
+    records = []
+    for entry in parsed.entries[:maximum]:
+        location = entry.get("link") or entry.get("id")
+        if not isinstance(location, str) or not location.strip():
+            continue
+        location = _public_url(urljoin(source_url, location))
+        date = entry.get("published_parsed") or entry.get("updated_parsed")
+        published = datetime.fromtimestamp(calendar.timegm(date), timezone.utc).isoformat() if date else None
+        contents = entry.get("content") or []
+        description = "\n".join(value.get("value", "") for value in contents if isinstance(value, dict)) or entry.get("summary") or entry.get("description") or ""
+        title = _plain(entry.get("title"), 1000)
+        fields = {"title": title, "url": location, "description": _plain(description, paragraphs=True), "published_at": published}
+        records.append((str(entry.get("id") or location), title or location, fields, "company_article", "company_publication"))
+    return records, len(parsed.entries) > maximum
 
 
 def _sec(payload, target, maximum):
@@ -268,7 +319,21 @@ def _importyeti(payload, maximum, target):
 
 def _discovered_links(payload, page_url, domain):
     soup = BeautifulSoup(payload.decode("utf-8", errors="replace"), "html.parser")
-    found = {"boards": [], "document_urls": [], "pages": [], "ciks": []}
+    found = {"boards": [], "document_urls": [], "feed_urls": [], "pages": [], "ciks": []}
+    for link in soup.find_all("link", href=True, limit=100):
+        if "alternate" not in link.get("rel", []) or str(link.get("type", "")).lower().split(";", 1)[0].strip() not in {"application/rss+xml", "application/atom+xml"}:
+            continue
+        try:
+            location = _public_url(urljoin(page_url, link["href"]))
+        except (TypeError, ValueError):
+            continue
+        host = (urlsplit(location).hostname or "").lower()
+        if host != domain and not host.endswith("." + domain):
+            continue
+        if location not in found["feed_urls"]:
+            found["feed_urls"].append(location)
+        if len(found["feed_urls"]) == 4:
+            break
     seen = set()
     for link in soup.find_all(["a", "iframe"], limit=3000):
         value = link.get("href") if link.name == "a" else link.get("src")
@@ -292,6 +357,8 @@ def _discovered_links(payload, page_url, domain):
         elif host in {"jobs.lever.co", "jobs.eu.lever.co"}:
             provider, slug = "lever", parts[0]
             region = "eu" if host == "jobs.eu.lever.co" else "global"
+        elif host == "jobs.ashbyhq.com":
+            provider, slug = "ashby", parts[0]
         if host in {"www.sec.gov", "sec.gov"}:
             cik = parse_qs(parsed.query).get("CIK", parse_qs(parsed.query).get("cik", [None]))[0]
             archive = re.match(r"/Archives/edgar/data/(\d{1,10})(?:/|$)", parsed.path)
@@ -305,8 +372,12 @@ def _discovered_links(payload, page_url, domain):
         if host == domain or host.endswith("." + domain):
             if parsed.path.lower().endswith((".pdf", ".docx", ".xlsx", ".pptx")) and len(found["document_urls"]) < 4:
                 found["document_urls"].append(location)
-            elif re.search(r"careers?|jobs|about|investor|reports?", parsed.path, re.I) and len(found["pages"]) < 8:
+            elif re.search(r"careers?|jobs|engineering|developers?|blogs?|news|about|investor|reports?", parsed.path + " " + host.removesuffix(domain), re.I) and len(found["pages"]) < 24 and location != page_url:
                 found["pages"].append(location)
+    found["pages"].sort(key=lambda value: 0 if re.search(r"careers?|jobs", value, re.I) else 1 if re.search(r"engineering|developers?|blogs?|news", value, re.I) else 2)
+    priority = [next((value for value in found["pages"] if re.search(pattern, value, re.I)), None)
+                for pattern in (r"careers?|jobs", r"engineering|developers?|blogs?|news")]
+    found["pages"] = list(dict.fromkeys([value for value in priority if value] + found["pages"]))[:8]
     found["boards"] = found["boards"][:4]
     return found
 
@@ -327,18 +398,21 @@ async def _discover(config, store, http, state):
             candidates.append((target, domain.lower().rstrip(".")))
     if options.get("enabled") is False or not candidates:
         return targets, state, None
-    now, maximum = time.time(), max(1, min(10, int(config.get("public_source_batch", 3))))
+    now, maximum = time.time(), max(1, min(50, int(options.get("batch", 12))))
     cursor = int(state.get("discovery_cursor", 0)) % len(candidates)
     selected = (candidates[cursor:] + candidates[:cursor])[:maximum]
-    for target, domain in selected:
+    semaphore = asyncio.Semaphore(max(1, min(8, int(config.get("public_source_concurrency", 4)))))
+
+    async def discover_target(target, domain):
+        nonlocal attempted, staged
         cached = cache.get(domain) or {}
-        if now - float(cached.get("checked_at", 0)) < 7 * 86400:
-            continue
+        if cached.get("version") == 2 and now - float(cached.get("checked_at", 0)) < 7 * 86400:
+            return
         attempted += 1
-        found = {"boards": [], "document_urls": [], "pages": [], "ciks": []}
+        found = {"boards": [], "document_urls": [], "feed_urls": [], "pages": [], "ciks": []}
         pages, robots = ["https://" + domain + "/"], {}
         try:
-            for index in range(2):
+            for index in range(3):
                 if index >= len(pages):
                     break
                 url = pages[index]
@@ -379,23 +453,30 @@ async def _discover(config, store, http, state):
                 queued = await stage_payload(config, store, body, provider="corporate_discovery", source_url=final_url,
                                              metadata={"target": {key: target[key] for key in ("name", "domain", "company_id") if target.get(key)}})
                 staged += int(not queued.get("duplicate", False))
-            cache[domain] = {"checked_at": now, **found}
+            cache[domain] = {"checked_at": now, "version": 2, **found}
         except Exception as error:
             status = getattr(error, "status", None)
             errors.append(domain + ": " + ("HTTP " + str(status) if isinstance(status, int) else type(error).__name__))
-            cache[domain] = {"checked_at": now - 6 * 86400, **found}
+            cache[domain] = {"checked_at": now - 6 * 86400, "version": 2, **found}
+
+    async def discover_bounded(target, domain):
+        async with semaphore:
+            await discover_target(target, domain)
+
+    await asyncio.gather(*(discover_bounded(target, domain) for target, domain in selected))
     for target in targets:
         cached = cache.get(str(target.get("domain", "")).lower()) or {}
         merged = dict(target)
         merged["document_urls"] = list(dict.fromkeys((target.get("document_urls") or []) + cached.get("document_urls", [])))[:20]
+        merged["feed_urls"] = list(dict.fromkeys((target.get("feed_urls") or []) + cached.get("feed_urls", [])))[:8]
         if not target.get("cik") and len(cached.get("ciks", [])) == 1:
             merged["cik"] = cached["ciks"][0]
         derived.append(merged)
         for board in cached.get("boards", [])[:4]:
-            field = "greenhouse_board" if board["provider"] == "greenhouse" else "lever_site"
+            field = {"greenhouse": "greenhouse_board", "lever": "lever_site", "ashby": "ashby_board"}[board["provider"]]
             if target.get(field) == board["slug"]:
                 continue
-            derived.append({key: value for key, value in {**target, "document_urls": [], "greenhouse_board": None, "lever_site": None,
+            derived.append({key: value for key, value in {**target, "document_urls": [], "feed_urls": [], "greenhouse_board": None, "lever_site": None, "ashby_board": None,
                                                         field: board["slug"], "_lever_region": board["region"],
                                                         "_discovered_from": board["linked_from"]}.items() if value is not None})
     valid_domains = {domain for _, domain in candidates}
@@ -491,14 +572,19 @@ def normalize_corporate(item, max_records=5000):
     limit = metadata.get("record_limit", max_records)
     if type(limit) is not int or limit < 1:
         raise ValueError("Corporate record limit must be positive")
+    offset = metadata.get("record_offset", 0)
+    if type(offset) is not int or offset < 0:
+        raise ValueError("Corporate record offset must be nonnegative")
     maximum = min(max_records, limit)
     payload = item["payload"]
     if provider == "gleif":
         return _gleif(item, _json(payload), maximum)
     if provider == "importyeti_public":
         records, truncated = _importyeti(payload, maximum, target)
-    elif provider in {"greenhouse", "lever"}:
-        records, truncated = _jobs(provider, _json(payload), maximum)
+    elif provider in {"greenhouse", "lever", "ashby"}:
+        records, truncated = _jobs(provider, _json(payload), maximum, offset)
+    elif provider == "company_feeds":
+        records, truncated = _company_feed(payload, item.get("source_url") or "", maximum)
     elif provider == "sec_edgar":
         records, truncated = _sec(_json(payload), target, maximum)
     elif provider in {"opencorporates", "sam_gov"}:
@@ -562,21 +648,23 @@ def _requests(config):
             continue
         candidates = [{}] if provider in {"public_procurement", "freight_exports"} else targets
         for target in candidates:
-            if target.get("_discovered_from") and provider not in {"greenhouse", "lever"}:
+            if target.get("_discovered_from") and provider not in {"greenhouse", "lever", "ashby"}:
                 continue
             url, params, headers, private = None, {}, {}, False
             try:
-                if provider in {"greenhouse", "lever"}:
-                    slug = target.get("greenhouse_board" if provider == "greenhouse" else "lever_site")
+                if provider in {"greenhouse", "lever", "ashby"}:
+                    slug = target.get({"greenhouse": "greenhouse_board", "lever": "lever_site", "ashby": "ashby_board"}[provider])
                     if not slug:
                         continue
                     if not isinstance(slug, str) or not _SLUG.fullmatch(slug):
                         raise ValueError("Configured job board ID is invalid")
                     if provider == "greenhouse":
                         url, params = "https://boards-api.greenhouse.io/v1/boards/" + quote(slug, safe="") + "/jobs", {"content": "true"}
+                    elif provider == "ashby":
+                        url = "https://api.ashbyhq.com/posting-api/job-board/" + quote(slug, safe="")
                     else:
                         host = "api.eu.lever.co" if target.get("_lever_region", options.get("region")) == "eu" else "api.lever.co"
-                        url, params = "https://" + host + "/v0/postings/" + quote(slug, safe=""), {"mode": "json", "limit": maximum}
+                        url, params = "https://" + host + "/v0/postings/" + quote(slug, safe=""), {"mode": "json"}
                 elif provider == "gleif":
                     if not isinstance(target.get("name"), str) or not target["name"].strip():
                         continue
@@ -607,13 +695,13 @@ def _requests(config):
                         url, params = "https://api.sam.gov/entity-information/v3/entities", {"api_key": key, "legalBusinessName": target["name"], "includeSections": "entityRegistration", "page": 0, "size": min(10, maximum)}
                         headers = {"Accept": "application/json"}
                     private = True
-                elif provider == "company_documents":
-                    documents = target.get("document_urls") or []
-                    if not isinstance(documents, list):
-                        raise ValueError("document_urls must be an array")
-                    for document in documents:
-                        document = _public_url(document)
-                        requests.append((provider, document, {}, {}, target, False))
+                elif provider in {"company_documents", "company_feeds"}:
+                    field = "document_urls" if provider == "company_documents" else "feed_urls"
+                    locations = target.get(field) or []
+                    if not isinstance(locations, list):
+                        raise ValueError(field + " must be an array")
+                    for location in locations:
+                        requests.append((provider, _public_url(location), {}, {}, target, False))
                     continue
                 else:
                     if not options.get("url"):
@@ -656,6 +744,7 @@ async def collect_corporate_sources(config, store, http):
         cursors[provider] = (cursor + len(chosen)) % len(candidates)
         health[provider]["pending_targets"] = len(candidates) - len(chosen)
     digests = dict(state.get("digests") or {})
+    job_pages = dict(state.get("job_pages") or {})
     semaphore, sec_lock, trade_lock = asyncio.Semaphore(concurrency), asyncio.Lock(), asyncio.Lock()
     trade_robots = None
     sec_last = 0.0
@@ -674,6 +763,7 @@ async def collect_corporate_sources(config, store, http):
         if target.get("_gleif_child_lei"):
             metadata.update(gleif_child_lei=target["_gleif_child_lei"], gleif_relation=target["_gleif_relation"])
         identity = hashlib.sha256(json.dumps([provider, url, public_params, metadata], sort_keys=True).encode()).hexdigest()
+        job_provider = provider in {"greenhouse", "lever", "ashby"}
         phase = "request"
         staged = 0
         try:
@@ -693,7 +783,8 @@ async def collect_corporate_sources(config, store, http):
                         if delay > 0:
                             await asyncio.sleep(delay)
                         sec_last = time.monotonic()
-                response = await http.get(url, params=params or None, headers=headers or None, max_bytes=maximum,
+                response_limit = int(float(config.get("max_response_mb", 32)) * 1024 * 1024) if job_provider else maximum
+                response = await http.get(url, params=params or None, headers=headers or None, max_bytes=response_limit,
                                           cache=not private, allow_redirects=not private, max_attempts=1)
                 if response.status not in (200, 304):
                     raise ValueError("Provider returned a non-success HTTP status")
@@ -702,10 +793,36 @@ async def collect_corporate_sources(config, store, http):
                     final = urlsplit(source_url)
                     if final.scheme != "https" or final.hostname != "www.importyeti.com" or not re.fullmatch(r"/company/[a-z0-9-]+/?", final.path):
                         raise ValueError("ImportYeti response redirects outside a public company report")
-                if getattr(response, "changed", True) is False and digests.get(identity) == response.digest and (provider not in {"gleif", "importyeti_public"} or target.get("_gleif_child_lei")):
+                page = job_pages.get(identity) or {}
+                same_jobs = job_provider and page.get("digest") == response.digest
+                offset = int(page.get("next_offset", 0)) if same_jobs else 0
+                unchanged = same_jobs and page.get("complete") if job_provider else getattr(response, "changed", True) is False and digests.get(identity) == response.digest
+                if unchanged and (provider not in {"gleif", "importyeti_public"} or target.get("_gleif_child_lei")):
+                    if provider in {"greenhouse", "lever", "ashby", "company_feeds"} and hasattr(store, "touch_technographic_source"):
+                        await asyncio.to_thread(store.touch_technographic_source, source_url, metadata["target"], datetime.now(timezone.utc).isoformat())
                     return provider, {"unchanged": 1, "successful": 1}
                 payload = await asyncio.to_thread(response.path.read_bytes)
                 content_type = next((value for key, value in response.headers.items() if key.lower() == "content-type"), "application/octet-stream")
+                if job_provider:
+                    phase = "job board selection"
+                    try:
+                        parsed = _json(payload)
+                        jobs = parsed.get("jobs") if isinstance(parsed, dict) else parsed
+                        if not isinstance(jobs, list):
+                            raise ValueError("Job board response lacks a jobs array")
+                    except ValueError:
+                        queued = await stage_payload(config, store, payload, provider=provider, source_url=source_url,
+                                                     content_type=content_type, stream_key=identity, metadata=metadata)
+                        staged = int(not queued.get("duplicate", False))
+                        raise
+                    selection = jobs[offset:offset + record_limit]
+                    while True:
+                        payload = json.dumps({"jobs": selection} if provider != "lever" else selection, ensure_ascii=False, separators=(",", ":")).encode()
+                        if len(payload) <= maximum or len(selection) <= 1:
+                            break
+                        selection = selection[:max(1, len(selection) // 2)]
+                    metadata.update(record_offset=0, source_record_offset=offset, source_total_records=len(jobs),
+                                    source_response_hash=response.digest, coverage_truncated=offset > 0 or offset + len(selection) < len(jobs))
                 phase = "durable staging"
                 queued = await stage_payload(config, store, payload, provider=provider, source_url=source_url,
                                              content_type=content_type, stream_key=identity, metadata=metadata)
@@ -714,6 +831,12 @@ async def collect_corporate_sources(config, store, http):
                 preview = normalize_corporate({"id": queued["id"], "source": provider, "source_url": source_url, "payload": payload,
                                                "payload_hash": hashlib.sha256(payload).hexdigest(), "metadata": metadata,
                                                "observed_at": queued.get("observed_at") or datetime.now(timezone.utc).isoformat()}, max_records=record_limit)
+                if queued.get("duplicate") and provider in {"greenhouse", "lever", "ashby", "company_feeds"} and hasattr(store, "touch_technographic_source"):
+                    await asyncio.to_thread(store.touch_technographic_source, source_url, metadata["target"], datetime.now(timezone.utc).isoformat())
+                if job_provider:
+                    next_offset = offset + len(preview["entities"])
+                    complete = next_offset >= len(jobs)
+                    job_pages[identity] = {"digest": response.digest, "next_offset": 0 if complete else next_offset, "complete": complete}
                 digests[identity] = response.digest
                 followups = []
                 if provider == "gleif" and not target.get("_gleif_child_lei"):
@@ -760,6 +883,6 @@ async def collect_corporate_sources(config, store, http):
             row["coverage_truncated"] = row.get("coverage_truncated", False) or result.get("truncated", False)
         row["status"] = "partial" if row["errors"] and row["successful"] else "error" if row["errors"] else "ok"
     await asyncio.to_thread(store.update_source, "corporate_sources", cursors=cursors, digests=digests,
-                            gleif_pages=gleif_pages, discovery=state.get("discovery", {}), discovery_cursor=state.get("discovery_cursor", 0))
+                            gleif_pages=gleif_pages, job_pages=job_pages, discovery=state.get("discovery", {}), discovery_cursor=state.get("discovery_cursor", 0))
     errors = [provider + ": " + message for provider, row in health.items() for message in row["errors"]]
     return {**totals, "errors": errors, "provider_health": health}

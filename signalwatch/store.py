@@ -13,6 +13,7 @@ from .matching import cpe_fields, ecosystem_identity, identifier, normalize, osv
 from .staging import STAGING_SCHEMA
 from .wireless import WIRELESS_SCHEMA, ingest_wireless
 from .wireless_attribution import ATTRIBUTION_SCHEMA, company_wireless_summary
+from .technographic_store import SCHEMA as TECHNOGRAPHIC_SCHEMA
 
 
 SCHEMA = """
@@ -270,6 +271,7 @@ class Store:
             conn.executescript(STAGING_SCHEMA)
             conn.executescript(WIRELESS_SCHEMA)
             conn.executescript(ATTRIBUTION_SCHEMA)
+            conn.executescript(TECHNOGRAPHIC_SCHEMA)
             if "superseded_by" not in {row[1] for row in conn.execute("PRAGMA table_info(raw_ingress)")}:
                 conn.execute("ALTER TABLE raw_ingress ADD COLUMN superseded_by INTEGER")
             if not had_advisory_seen:
@@ -437,6 +439,10 @@ class Store:
                 self._entity(conn, item, timestamp)
             for item in batch.get("edges") or []:
                 self._edge(conn, item, timestamp)
+            from .technographic_store import project as project_technographics
+            for item in batch.get("entities") or []:
+                for key, value in project_technographics(self, conn, item, timestamp).items():
+                    counts[key] = counts.get(key, 0) + value
             for item in batch.get("advisories") or []:
                 advisory_id = identifier(item["id"])
                 canonical = self._canonical(conn, [advisory_id] + (item.get("aliases") or []))
@@ -563,6 +569,8 @@ class Store:
                     continue
                 reasons = ["Exact normalized product and vendor/ecosystem match.", reason,
                  "Potential match: deployment, CPE configuration logic, and operating-system prerequisites require verification."]
+                if row["origin"].startswith("technographic:"):
+                    reasons.append("Technology use is asserted in public company text; current deployment and affected version are unverified.")
                 is_kev = row["kev_cve"] is not None
                 if is_kev:
                     reasons.append("CISA KEV lists this CVE as exploited in the wild; this asset's exploitability is unverified.")
@@ -609,6 +617,8 @@ class Store:
             counts["entity_kinds"] = {row[0]: row[1] for row in conn.execute("SELECT kind,count(*) FROM entities GROUP BY kind")}
             counts["kev_alerts"] = conn.execute("SELECT count(*) FROM alerts WHERE kev=1").fetchone()[0]
             counts["sources"] = conn.execute("SELECT count(*) FROM sources").fetchone()[0]
+            counts["technographic_documents"] = conn.execute("SELECT count(*) FROM technographic_documents").fetchone()[0]
+            counts["tech_fingerprints"] = conn.execute("SELECT count(*) FROM tech_fingerprints").fetchone()[0]
             return counts
 
     def _page(self, conn, table, where, values, order, limit, offset, select="*"):
@@ -782,6 +792,8 @@ class Store:
             asset_ids = {entity_id}
             if entity and entity.get("kind") == "company":
                 result["company_profile"] = company_profile(conn, entity)
+                from .technographic_store import company_evidence
+                result["technographics"] = company_evidence(conn, entity_id)
                 result["wireless_summary"] = company_wireless_summary(conn, entity_id)
                 result["name"] = result["company_profile"]["name"]
                 profile = result["company_profile"]
@@ -854,6 +866,16 @@ class Store:
              WHERE c.kind='company' GROUP BY lower(d.value) ORDER BY lower(d.value) LIMIT ?""",
              (max(1, int(limit)),))
             return [dict(row) for row in rows]
+
+    def technographic_document_seen(self, context, content_hash):
+        from .technographic_store import document_seen
+        with self.connection() as conn:
+            return document_seen(conn, context, content_hash)
+
+    def touch_technographic_source(self, source_url, target, observed_at):
+        from .technographic_store import touch_source
+        with self.connection(write=True) as conn:
+            return touch_source(conn, source_url, target, observed_at)
 
     def company_crawl_candidates(self, configured_domains=(), limit=50):
         domains = sorted({str(domain).lower().rstrip(".") for domain in configured_domains if domain})

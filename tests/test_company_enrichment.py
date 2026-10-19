@@ -83,7 +83,7 @@ class CompanyEnrichmentTests(unittest.IsolatedAsyncioTestCase):
 
     def test_default_cadence_prioritizes_company_mapping(self):
         self.assertEqual({key: self.config["source_intervals"][key] for key in ("web", "wikidata", "network", "exposure", "corporate", "developer")},
-                         {"web": 5, "wikidata": 15, "network": 15, "exposure": 30, "corporate": 60, "developer": 360})
+                         {"web": 5, "wikidata": 15, "network": 15, "exposure": 30, "corporate": 15, "developer": 360})
 
     def test_certificate_subdomain_evidence_connects_to_the_official_company_domain(self):
         self.add_company("Acme", "acme.test")

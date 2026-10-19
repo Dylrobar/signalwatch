@@ -157,7 +157,7 @@ class ZeroSetupCorporateTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM observations").fetchone()[0], 0)
 
     def test_discovery_rotates_targets_and_honors_robot_exclusion(self):
-        self.config["provider_settings"]["corporate_discovery"] = {"enabled": True}
+        self.config["provider_settings"]["corporate_discovery"] = {"enabled": True, "batch": 1}
         self.config["source_targets"] = [{"domain": "one.example"}, {"domain": "two.example"}]
         http = RoutedHTTP(self.root, {"https://one.example/robots.txt": (b"User-agent: *\nDisallow: /", "text/plain"),
                                      "https://two.example/robots.txt": HTTPError(404, "https://two.example/robots.txt"),

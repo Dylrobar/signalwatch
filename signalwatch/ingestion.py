@@ -38,6 +38,8 @@ class StagingWorker:
             result["claimed"] += 1
             try:
                 batch = normalize(item)
+                from .technographic_verifier import verify_batch
+                batch = verify_batch(batch, self.config, self.store)
                 self.queue.complete(item["id"], item["lease_token"], batch)
                 result["processed"] += 1
                 if set(batch) != {"wireless_batch"}:

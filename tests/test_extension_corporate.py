@@ -176,7 +176,7 @@ class CorporateCollectionTests(unittest.TestCase):
         self.assertEqual(result["staged"], 0)
         self.assertTrue(all(row["status"] == "unconfigured" for row in result["provider_health"].values()))
 
-    def test_raw_bytes_are_staged_once_and_first_cached_fetch_is_not_lost(self):
+    def test_selected_jobs_are_staged_once_and_first_cached_fetch_is_not_lost(self):
         self.config["provider_settings"]["greenhouse"] = {"enabled": True}
         self.config["source_targets"] = [{"domain": "example.com", "name": "Example", "greenhouse_board": "example"}]
         raw = b' {"jobs":[{"id":1,"title":"SRE","content":"nginx"}]}\n'
@@ -184,7 +184,11 @@ class CorporateCollectionTests(unittest.TestCase):
         first = self.run_collect(http)
         self.assertEqual(first["staged"], 1)
         queued = staging_queue(self.store, self.config).list()["items"][0]
-        self.assertEqual(staging_queue(self.store, self.config).get(queued["id"], include_payload=True)["payload"], raw)
+        selected = staging_queue(self.store, self.config).get(queued["id"], include_payload=True)["payload"]
+        self.assertEqual(json.loads(selected), json.loads(raw))
+        self.assertEqual(queued["metadata"]["source_response_hash"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(queued["metadata"]["source_record_offset"], 0)
+        self.assertEqual(queued["metadata"]["source_total_records"], 1)
         self.assertEqual(queued["adapter"], "public_source")
         self.assertEqual(queued["metadata"]["provider"], "greenhouse")
         http.response.status = 304

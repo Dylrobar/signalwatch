@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.15.0 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.16.0 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,
@@ -58,7 +58,7 @@
     "cve_program": 360,
     "csaf": 360,
     "exposure": 30,
-    "corporate": 60,
+    "corporate": 15,
     "developer": 360,
     "hardware": 43200,
     "nmap": 1440,
@@ -112,7 +112,8 @@
       "enabled": true
     },
     "corporate_discovery": {
-      "enabled": true
+      "enabled": true,
+      "batch": 12
     },
     "importyeti_public": {
       "enabled": true
@@ -161,6 +162,21 @@
       "profile": "quick",
       "targets": [],
       "timeout": 900
+    },
+    "greenhouse": {
+      "enabled": true
+    },
+    "lever": {
+      "enabled": true
+    },
+    "ashby": {
+      "enabled": true
+    },
+    "company_feeds": {
+      "enabled": true
+    },
+    "technographics": {
+      "enabled": true
     }
   },
   "provider_credentials": {},

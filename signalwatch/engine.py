@@ -21,7 +21,7 @@ SOURCE_INTERVALS = {
     "news": 15, "threat": 15, "prerelease": 60, "nmap": 1440,
     **{name: 360 for name in ("nvd", "kev", "epss", "github", "osv", "cve_program", "csaf")},
     "web": 5, "wikidata": 15, "network": 15,
-    "exposure": 30, "developer": 360, "corporate": 60, "hardware": 43200,
+    "exposure": 30, "developer": 360, "corporate": 15, "hardware": 43200,
 }
 EXTENSION_ADAPTERS = {
     "exposure": ("extension_network", "collect_network_sources"),
