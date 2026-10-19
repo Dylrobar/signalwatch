@@ -242,6 +242,8 @@ def normalize_network(item, max_records=5000):
         entities.append({"id": record_id, "kind": "source_record", "name": provider + ": " + label, "value": label, "source_url": item.get("source_url", ""), "observed_at": stamp, "confidence": 1.0, "metadata": {"provider": provider, "record_type": record_type, "target_domain": target, "provider_fields": fields, "staging": provenance, "attribution": "provider_report_only", **({"coverage": metadata["coverage"]} if metadata.get("coverage") else {})}})
         for kind, value in selected:
             anchor(kind, value, record_id)
+        if provider in CT_PROVIDERS and target and target not in names and remaining >= 1 + int("domain:" + target not in anchors):
+            anchor("domain", target, record_id, relation="certificate_lookup_scope")
     return {"entities": entities, "edges": edges}
 
 

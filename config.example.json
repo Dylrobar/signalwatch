@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.13.0 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.14.0 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,
@@ -57,11 +57,14 @@
     "osv": 360,
     "cve_program": 360,
     "csaf": 360,
-    "exposure": 10080,
-    "corporate": 10080,
-    "developer": 10080,
+    "exposure": 30,
+    "corporate": 60,
+    "developer": 360,
     "hardware": 43200,
-    "nmap": 1440
+    "nmap": 1440,
+    "web": 5,
+    "wikidata": 15,
+    "network": 15
   },
   "public_source_batch": 3,
   "public_source_records": 100,
@@ -229,6 +232,22 @@
     {
       "name": "Palo Alto Networks PSIRT",
       "url": "https://security.paloaltonetworks.com/rss.xml"
+    },
+    {
+      "name": "BBC News - Technology",
+      "url": "https://feeds.bbci.co.uk/news/technology/rss.xml"
+    },
+    {
+      "name": "The Guardian - Technology",
+      "url": "https://www.theguardian.com/uk/technology/rss"
+    },
+    {
+      "name": "NPR - Technology",
+      "url": "https://feeds.npr.org/1019/rss.xml"
+    },
+    {
+      "name": "MIT Technology Review",
+      "url": "https://www.technologyreview.com/feed/"
     }
   ],
   "csaf_feeds": [

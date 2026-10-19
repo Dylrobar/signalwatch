@@ -38,7 +38,7 @@ class ZeroSetupNetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(domains)
         self.assertTrue(all(name == "example.com" or name.endswith(".example.com") for name in domains))
         self.assertTrue(all(row["kind"] in {"source_record", "domain"} for row in batch["entities"]))
-        self.assertEqual({edge["relation"] for edge in batch["edges"]}, {"reports_on"})
+        self.assertEqual({edge["relation"] for edge in batch["edges"]}, {"reports_on", "certificate_lookup_scope"})
         evidence = next(row for row in batch["entities"] if row["kind"] == "source_record")
         self.assertEqual(evidence["metadata"]["coverage"], "bounded public index")
         self.assertEqual(evidence["metadata"]["attribution"], "provider_report_only")
@@ -240,4 +240,4 @@ class ZeroSetupNetworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(counts["records"], 2)
             self.assertEqual(StagingWorker(store, config).drain()["processed"], 1)
             with store.connection() as conn:
-                self.assertEqual(conn.execute("SELECT count(*) FROM entities WHERE kind='domain'").fetchone()[0], 2)
+                self.assertEqual({row[0] for row in conn.execute("SELECT value FROM entities WHERE kind='domain'")}, {"example.com", "one.example.com", "two.example.com"})

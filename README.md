@@ -145,6 +145,14 @@ Searches, filters, and pagination survive tab switches. The current view is enco
 
 Follow company/domain/product relationships, advisory IDs, and article references inside the evidence drawer; its Back control restores the previous record. Product catalog details show their published advisories even when no deployment has been observed. CVE aliases resolve to the actual stored source document. Package details retain both enumerated versions and affected ranges.
 
+### Continuous company mapping
+
+Company discovery adds official websites to the existing web queue. Each infrastructure, corporate and developer collection also reads official company-domain relationships from the database, so new companies enter enrichment without editing a static target list or restarting. Explicit target settings take precedence. Shared official domains are enriched without choosing a single company identity. Certificate records retain their lookup-domain relationships so discovered subdomains connect back to the company footprint in the graph. Existing per-provider cursors, batches, caches and quotas remain in use; this does not populate active Nmap scan targets.
+
+Default collection intervals are 5 minutes for queued web/DNS/technology mapping, 15 minutes for company discovery and IP routing context, 30 minutes for infrastructure indexes, 60 minutes for corporate evidence and 6 hours for developer artifacts. Individual websites and company-linked discovery retain their existing refresh intervals. This drains new work frequently while reusing existing observations and cached responses.
+
+World News Sources supplied four additional RSS endpoints, validated with the native feed parser: BBC Technology, Guardian Technology, NPR Technology and MIT Technology Review. News stays in the existing news collector; company ownership and deployed technology come from the infrastructure evidence pipeline.
+
 ### Nmap scans
 
 The Docker image includes Nmap. Configure `provider_settings.nmap` through `/api/sources/settings`: `{"profile":"quick","targets":["192.0.2.10","192.0.2.0/24"],"timeout":900}`. Targets are explicit IPs, CIDRs or hostnames; the initial list is empty. Run `signalwatch collect --sources nmap` or POST `{"sources":["nmap"]}` to `/api/collect`. The scheduled interval defaults to 1,440 minutes.

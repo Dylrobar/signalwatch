@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 
 
 DEFAULTS = {
@@ -58,7 +58,8 @@ DEFAULTS = {
     "wireless_chunk_rows": 5000,
     "source_intervals": {"news": 15, "threat": 15, "prerelease": 60, "nvd": 360, "kev": 360, "epss": 360,
                          "github": 360, "osv": 360, "cve_program": 360, "csaf": 360,
-                         "exposure": 10080, "corporate": 10080, "developer": 10080, "hardware": 43200, "nmap": 1440},
+                         "web": 5, "wikidata": 15, "network": 15,
+                         "exposure": 30, "corporate": 60, "developer": 360, "hardware": 43200, "nmap": 1440},
     "public_source_batch": 3,
     "public_source_records": 100,
     "public_source_concurrency": 4,
@@ -100,6 +101,10 @@ DEFAULTS = {
         "prerelease": True
     },
     "feeds": [
+        {"name": "BBC News - Technology", "url": "https://feeds.bbci.co.uk/news/technology/rss.xml"},
+        {"name": "The Guardian - Technology", "url": "https://www.theguardian.com/uk/technology/rss"},
+        {"name": "NPR - Technology", "url": "https://feeds.npr.org/1019/rss.xml"},
+        {"name": "MIT Technology Review", "url": "https://www.technologyreview.com/feed/"},
         {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},
         {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
         {"name": "Krebs on Security", "url": "https://krebsonsecurity.com/feed/"},

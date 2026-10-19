@@ -844,6 +844,17 @@ class Store:
                 found[item["id"]] = item
         return sorted(found.values(), key=lambda item: item.get("published") or "", reverse=True)[:100]
 
+    def company_enrichment_targets(self, limit=10000):
+        with self.connection() as conn:
+            rows = conn.execute("""SELECT lower(d.value) AS domain,
+             CASE WHEN count(DISTINCT c.id)=1 THEN min(c.id) ELSE '' END AS company_id,
+             CASE WHEN count(DISTINCT c.id)=1 THEN min(c.name) ELSE '' END AS name
+             FROM entities c JOIN edges e ON e.from_id=c.id AND e.relation='official_website'
+             JOIN entities d ON d.id=e.to_id AND d.kind='domain'
+             WHERE c.kind='company' GROUP BY lower(d.value) ORDER BY lower(d.value) LIMIT ?""",
+             (max(1, int(limit)),))
+            return [dict(row) for row in rows]
+
     def network_targets(self, limit=100, refresh_hours=24):
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=float(refresh_hours))).isoformat(timespec="seconds")
         with self.connection() as conn:

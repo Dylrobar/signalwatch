@@ -47,6 +47,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         return (ClockDatetime.current + timedelta(minutes=minutes)).isoformat(timespec="seconds")
 
     async def test_independent_family_schedules_persist_across_restart(self):
+        self.config["source_intervals"].update(corporate=10080, web=30)
         first = await self.engine.run(scheduled=True)
         self.assertEqual({row["source"] for row in first["sources"]}, set(self.config["sources"]))
         self.assertEqual(self.store.source_state("news")["next_run"], self.stamp(15))
@@ -140,7 +141,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         state = self.store.source_state("corporate")
         self.assertEqual(state["status"], "unconfigured")
         self.assertIsNone(state["last_success"])
-        self.assertEqual(state["next_run"], self.stamp(10080))
+        self.assertEqual(state["next_run"], self.stamp(60))
         self.assertTrue(result["sources"][0]["skipped"])
         self.assertFalse(result["sources"][0]["ok"])
 
@@ -173,7 +174,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state["status"], "partial")
                 self.assertEqual(state.get("last_success"), previous)
                 self.assertIsNone(state["error"])
-                self.assertEqual(state["next_run"], self.stamp(10080))
+                self.assertEqual(state["next_run"], self.stamp(60))
                 self.assertTrue(result["sources"][0]["skipped"])
                 self.assertFalse(result["sources"][0]["ok"])
 
@@ -291,11 +292,11 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.engine.interval(name), 15)
         for name in ("nvd", "kev", "epss", "github", "osv", "cve_program", "csaf"):
             self.assertEqual(self.engine.interval(name), 360)
-        for name in ("corporate", "exposure", "developer"):
-            self.assertEqual(self.engine.interval(name), 10080)
+        for name, minutes in {"corporate": 60, "exposure": 30, "developer": 360, "web": 5, "network": 15, "wikidata": 15}.items():
+            self.assertEqual(self.engine.interval(name), minutes)
         self.assertEqual(self.engine.interval("hardware"), 43200)
         self.config["interval_minutes"] = 42
-        self.assertEqual(self.engine.interval("wikidata"), 42)
+        self.assertEqual(self.engine.interval("unspecified"), 42)
         self.assertEqual(source_outcome({"provider_health": {}})[0], "unconfigured")
         self.assertEqual(source_outcome({"provider_health": {"provider": {"status": "healthy"}}})[0], "ok")
         self.assertEqual(source_outcome({"provider_health": {}, "errors": ["Real error"]})[0], "error")

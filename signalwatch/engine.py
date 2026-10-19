@@ -20,7 +20,8 @@ log = logging.getLogger("signalwatch")
 SOURCE_INTERVALS = {
     "news": 15, "threat": 15, "prerelease": 60, "nmap": 1440,
     **{name: 360 for name in ("nvd", "kev", "epss", "github", "osv", "cve_program", "csaf")},
-    "exposure": 10080, "developer": 10080, "corporate": 10080, "hardware": 43200,
+    "web": 5, "wikidata": 15, "network": 15,
+    "exposure": 30, "developer": 360, "corporate": 60, "hardware": 43200,
 }
 EXTENSION_ADAPTERS = {
     "exposure": ("extension_network", "collect_network_sources"),
@@ -156,7 +157,19 @@ class Engine:
         if name in EXTENSION_ADAPTERS:
             module, function = EXTENSION_ADAPTERS[name]
             adapter = getattr(importlib.import_module("." + module, __package__), function)
-            return await adapter(self.config, self.store, self.collector.http)
+            config = self.config
+            discovered = []
+            if name in {"exposure", "corporate", "developer"}:
+                discovered = await asyncio.to_thread(self.store.company_enrichment_targets, self.config.get("max_discovered_domains", 10000))
+                if discovered:
+                    targets = list(self.config.get("source_targets", []))
+                    domains = {str(target.get("domain", "")).lower().rstrip(".") for target in targets}
+                    targets.extend(target for target in discovered if target["domain"] not in domains)
+                    config = {**self.config, "source_targets": targets}
+            result = await adapter(config, self.store, self.collector.http)
+            if discovered:
+                result.update(company_targets=len(config["source_targets"]), discovered_company_targets=len(discovered))
+            return result
         if name in adapters:
             return await adapters[name](self.config, self.store, self.collector.http)
         return await self.collector.run_source(name)
