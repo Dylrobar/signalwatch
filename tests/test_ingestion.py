@@ -56,6 +56,28 @@ class IngestionTests(unittest.TestCase):
         self.assertIn("JSON", self.queue.get(bad["id"])["error"])
         self.assertEqual(self.queue.get(good["id"])["status"], "processed")
 
+    def test_auto_native_advisory_wrapper_preserves_packages_and_withdrawals(self):
+        record = {"id": "PYSEC-2026-12345", "modified": "2026-10-01T00:00:00Z", "summary": "Package advisory",
+                  "affected": [{"package": {"ecosystem": "PyPI", "name": "example"}, "versions": ["1.0"]}]}
+        first = self.queue.enqueue(json.dumps({"advisories": [record]}).encode(), source="advisory-export",
+                                   content_type="application/json")
+        result = self.worker.drain()
+        self.assertEqual((result["processed"], result["dead"]), (1, 0))
+        self.assertEqual(self.queue.get(first["id"])["status"], "processed")
+        with self.store.connection() as conn:
+            advisory = conn.execute("SELECT id,source,rejected FROM advisories").fetchone()
+            self.assertEqual(tuple(advisory), ("OSV:PYSEC-2026-12345", "osv", 0))
+            product = conn.execute("SELECT raw FROM affected WHERE advisory_id=?", (advisory["id"],)).fetchone()
+            self.assertIsNotNone(product)
+            self.assertEqual(json.loads(product["raw"])["package"], "example")
+        withdrawn = {**record, "withdrawn": "2026-10-02T00:00:00Z", "modified": "2026-10-02T00:00:00Z"}
+        self.queue.enqueue(json.dumps({"advisories": [withdrawn]}).encode(), source="advisory-export",
+                           content_type="application/json")
+        self.assertEqual(self.worker.drain()["processed"], 1)
+        with self.store.connection() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM advisories WHERE rejected=1").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM affected").fetchone()[0], 0)
+
     def test_transient_failure_retries_without_blocking_other_sources(self):
         bad = self.queue.enqueue(b"temporary", source="transient", adapter="opaque")
         self.queue.enqueue(b"valid", source="other", adapter="opaque")

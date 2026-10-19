@@ -119,13 +119,13 @@ def _advisory_format(record):
         return None
     if isinstance(record.get("ghsa_id"), str) and any(key in record for key in ("vulnerabilities", "description", "summary")):
         return "github"
-    if isinstance(record.get("id"), str) and any(key in record for key in ("descriptions", "configurations", "vulnStatus")):
-        return "nvd"
     if isinstance(record.get("id"), str) and "modified" in record and isinstance(record.get("affected"), list) and any(key in record for key in ("details", "summary")):
-        if any(isinstance(value, dict) and "package" in value for value in record["affected"]) or "details" in record:
+        if any(isinstance(value, dict) and isinstance(value.get("package"), dict) for value in record["affected"]) or "details" in record:
             return "osv"
     if isinstance(record.get("id"), str) and isinstance(record.get("affected"), list) and any(key in record for key in ("title", "summary")):
         return "canonical"
+    if isinstance(record.get("id"), str) and any(key in record for key in ("descriptions", "configurations", "vulnStatus")):
+        return "nvd"
     return None
 
 
@@ -363,6 +363,14 @@ def _auto_adapter(item):
     if content_type == "application/json" or content_type.endswith("+json"):
         value = _json(item)
         if isinstance(value, dict):
+            if set(value) == {"advisories"} and isinstance(value["advisories"], list):
+                # The native advisory wrapper overlaps Store.ingest's batch
+                # shape. Parse source records before accepting them as already
+                # normalized, while preserving canonical batches as supplied.
+                formats = [_advisory_format(record.get("cve", record) if isinstance(record, dict) else record)
+                           for record in value["advisories"]]
+                if formats and all(formats) and any(kind != "canonical" for kind in formats):
+                    return "vulnerability_json"
             if value and not set(value) - BATCH_KEYS:
                 return "normalized_batch"
             if _advisory_format(value) or isinstance(value.get("cve"), dict) and _advisory_format(value["cve"]):

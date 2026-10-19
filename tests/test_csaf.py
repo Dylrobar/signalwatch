@@ -143,6 +143,43 @@ class CSAFCollectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(counts["records"], 1)
             self.assertIn(older, http.calls)
 
+    async def test_unchanged_root_revisits_older_pages_for_revised_documents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(str(Path(folder) / "test.db"))
+            root, older, item = "https://vendor.example/feed.json", "https://vendor.example/older.json", "https://vendor.example/a.json"
+            http = FixtureHTTP(folder, {root: feed([], older), older: feed([(item, "2026-10-18T00:00:00Z")]), item: document()})
+            config = {"csaf_max_records": 1, "csaf_feed_pages": 1, "csaf_feeds": [root]}
+            await collect_csaf(config, store, http)
+            self.assertEqual(store.source_state("csaf")["pending_feed_pages"], [])
+            http.fixtures[older] = feed([(item, "2026-10-19T00:00:00Z")])
+            http.fixtures[item] = document(cves=["CVE-2026-12346"])
+            http.calls.clear()
+
+            counts = await collect_csaf(config, store, http)
+
+            self.assertEqual(counts["records"], 1)
+            self.assertEqual(http.calls, [root, older, item])
+            with store.connection() as conn:
+                rows = conn.execute("SELECT aliases,rejected FROM advisories ORDER BY id").fetchall()
+            self.assertEqual([(json.loads(row["aliases"]), row["rejected"]) for row in rows], [(["CVE-2026-12345"], 1), (["CVE-2026-12346"], 0)])
+
+    async def test_unchanged_pages_resume_deep_history_within_page_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(str(Path(folder) / "test.db"))
+            pages = [f"https://vendor.example/page-{index}.json" for index in range(4)]
+            item = "https://vendor.example/a.json"
+            fixtures = {page: feed([], pages[index + 1]) for index, page in enumerate(pages[:-1])}
+            fixtures.update({pages[-1]: feed([(item, "2026-10-18T00:00:00Z")]), item: document()})
+            http = FixtureHTTP(folder, fixtures)
+            config = {"csaf_max_records": 1, "csaf_feed_pages": 1, "csaf_feeds": [pages[0]]}
+            counts = []
+            for _ in range(4):
+                http.calls.clear()
+                counts.append((await collect_csaf(config, store, http))["records"])
+                self.assertLessEqual(sum(url in pages for url in http.calls), 2)
+            self.assertEqual(sum(counts), 1)
+            self.assertIn(item, store.source_state("csaf")["documents"])
+
 
     async def test_feed_failure_preserves_last_success(self):
         with tempfile.TemporaryDirectory() as folder:

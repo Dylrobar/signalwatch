@@ -48,6 +48,54 @@ class NormalizationTests(unittest.TestCase):
         self.assertNotIn("raw", records[1])
         self.assertEqual(records[1]["_staging"]["payload_hash"], staged([github, osv])["payload_hash"])
 
+    def test_auto_advisory_wrappers_parse_native_source_records(self):
+        records = [
+            {"ghsa_id": "GHSA-aaaa-bbbb-cccc", "summary": "GitHub record", "vulnerabilities": []},
+            {"id": "CVE-2026-12345", "descriptions": [{"lang": "en", "value": "NVD record"}], "configurations": []},
+            {"id": "OSV-2026-1", "modified": "2026-10-01T00:00:00Z", "summary": "OSV record", "affected": [
+                {"package": {"ecosystem": "PyPI", "name": "example"}, "versions": ["1.0"]}]},
+        ]
+        for record in records:
+            for wrapped in (record, {"cve": record}):
+                with self.subTest(record=record, wrapped=wrapped):
+                    payload = {"advisories": [wrapped]}
+                    actual = normalize(staged(payload))["advisories"][0]
+                    expected = normalize(staged(payload, "vulnerability_json"))["advisories"][0]
+                    actual.pop("_staging")
+                    expected.pop("_staging")
+                    self.assertEqual(actual, expected)
+
+    def test_canonical_advisories_are_not_reparsed_as_nvd_or_osv(self):
+        records = [
+            {"id": "CVE-2026-12345", "descriptions": [{"lang": "en", "value": "NVD record"}],
+             "configurations": [], "references": [{"url": "https://vendor.example/advisory"}],
+             "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 9.8}}]}},
+            {"id": "OSV-2026-1", "modified": "2026-10-01T00:00:00Z", "summary": "OSV record", "affected": [
+                {"package": {"ecosystem": "PyPI", "name": "example"}, "versions": ["1.0"]}]},
+        ]
+        for native in records:
+            canonical = normalize(staged(native, "vulnerability_json"))["advisories"][0]
+            canonical.pop("_staging")
+            for adapter in ("auto", "vulnerability_json"):
+                for payload in (canonical, [canonical], {"advisories": [canonical]}):
+                    with self.subTest(native=native, adapter=adapter, payload=payload):
+                        actual = normalize(staged(payload, adapter))["advisories"][0]
+                        actual.pop("_staging")
+                        self.assertEqual(actual, canonical)
+
+    def test_auto_advisory_wrappers_preserve_canonical_batches_and_mixed_records(self):
+        canonical = {"id": "CVE-2026-12345", "title": "Canonical", "affected": [], "configurations": []}
+        empty = {"advisories": []}
+        self.assertEqual(normalize(staged(empty)), empty)
+        record = normalize(staged({"advisories": [canonical]}))["advisories"][0]
+        record.pop("_staging")
+        self.assertEqual(record, canonical)
+        mixed = {"advisories": [canonical, {"ghsa_id": "GHSA-aaaa-bbbb-cccc", "summary": "GitHub record", "vulnerabilities": []}]}
+        records = normalize(staged(mixed))["advisories"]
+        self.assertEqual([record["id"] for record in records], ["CVE-2026-12345", "GHSA-aaaa-bbbb-cccc"])
+        self.assertEqual(records[0]["title"], "Canonical")
+        self.assertEqual(records[1]["source"], "GitHub Advisory Database")
+
     def test_canonical_advisory_does_not_invent_publication_time(self):
         record = {"id": "CVE-2026-12345", "title": "Canonical", "affected": [], "aliases": []}
         advisory = normalize(staged(record, "vulnerability_json"))["advisories"][0]

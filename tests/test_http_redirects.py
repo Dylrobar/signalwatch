@@ -123,6 +123,24 @@ class RedirectTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("auth", other.kwargs)
         self.assertNotIn("fixture", first.args[0])
 
+    async def test_cross_origin_drops_provider_api_keys_but_same_origin_retains_them(self):
+        credentials = {"apiKey": "fixture-nvd", "X-API-Key": "fixture-provider", "Auth-Key": "fixture-urlhaus",
+                       "X-Auth-Token": "fixture-token", "API-KEY": "fixture-zoom", "Key": "fixture-greynoise"}
+        self.http.config["headers"] = {"apiKey": credentials["apiKey"], "Accept": "application/json"}
+        self.http.session.get.side_effect = [
+            Response(302, "https://first.example.test/start", {"Location": "/same"}),
+            Response(302, "https://first.example.test/same", {"Location": "https://second.example.test/final"}),
+            Response(200, "https://second.example.test/final"),
+        ]
+        await self.http.get("https://first.example.test/start", headers=credentials, max_attempts=1)
+        first, same, other = [call.kwargs["headers"] for call in self.http.session.get.call_args_list]
+        for headers in (first, same):
+            for name, value in credentials.items():
+                self.assertEqual(headers[name], value)
+        for name in credentials:
+            self.assertNotIn(name, other)
+        self.assertEqual(other["Accept"], "application/json")
+
     async def test_session_defaults_do_not_restore_removed_credentials(self):
         self.http.config["headers"] = {"authorization": "Bearer configured-fixture", "Cookie": "fixture=value"}
         with patch("signalwatch.http.aiohttp.TCPConnector"), patch("signalwatch.http.aiohttp.ClientSession") as session:
@@ -130,6 +148,19 @@ class RedirectTests(unittest.IsolatedAsyncioTestCase):
         supplied = CIMultiDict(session.call_args.kwargs["headers"])
         self.assertNotIn("Authorization", supplied)
         self.assertNotIn("Cookie", supplied)
+
+    async def test_provider_key_is_dropped_for_port_or_scheme_change(self):
+        for target in ("http://origin.example.test/final", "https://origin.example.test:8443/final"):
+            with self.subTest(target=target):
+                self.http.session.get.reset_mock()
+                self.http.session.get.side_effect = [
+                    Response(302, "https://origin.example.test/start", {"Location": target}),
+                    Response(200, target),
+                ]
+                await self.http.get("https://origin.example.test/start", headers={"aPi_KeY": "fixture-secret"})
+                first, redirected = self.http.session.get.call_args_list
+                self.assertEqual(first.kwargs["headers"]["api_key"], "fixture-secret")
+                self.assertNotIn("api_key", redirected.kwargs["headers"])
 
     async def test_relative_location_uri_fallback_and_encoding(self):
         self.http.session.get.side_effect = [

@@ -19,6 +19,13 @@ from multidict import CIMultiDict
 from .proxies import ProxyPool, ProxyUnavailableError, direct_hosts_from_env
 
 
+_REDIRECT_CREDENTIAL_HEADERS = frozenset({
+    "authorization", "proxyauthorization", "cookie", "apikey", "xapikey", "key",
+    "authkey", "xauthkey", "authtoken", "xauthtoken", "apitoken", "xapitoken",
+    "accesstoken", "xaccesstoken", "xgoogapikey",
+})
+
+
 def display_url(url):
     """Keep the useful request location without query strings or credentials."""
     try:
@@ -264,8 +271,12 @@ class PublicHTTP:
                                 raise PublicRequestError("Invalid HTTP redirect", str(current)) from None
                             if cross_origin:
                                 auth = None
-                                for name in ("Authorization", "Cookie", "Proxy-Authorization"):
-                                    request_headers.popall(name, None)
+                                # Provider keys (including NVD's apiKey) are
+                                # credentials too, even without Authorization.
+                                for name in tuple(request_headers):
+                                    normalized = name.lower().replace("-", "").replace("_", "")
+                                    if normalized in _REDIRECT_CREDENTIAL_HEADERS:
+                                        request_headers.popall(name, None)
                             if response.status == 303 or (response.status in {301, 302} and method == "POST"):
                                 method = "GET"
                                 request_body = {}

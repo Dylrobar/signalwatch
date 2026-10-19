@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from signalwatch.store import Store
@@ -113,6 +114,85 @@ class ApiContractTests(unittest.TestCase):
                     self.assertNotIn("must-not-store", raised.exception.read().decode())
                     self.assertEqual(self.request("/api/sources/settings"), before)
                     self.assertEqual(self.config.read_bytes(), disk_before)
+
+    def test_source_targets_reject_stale_snapshot_without_changing_any_settings(self):
+        before = self.request("/api/sources/settings")
+        try:
+            first = self.request("/api/sources/settings", {
+                "source_targets": [{"domain": "Example.COM", "feed_urls": ["https://example.test/feed?topic=release%20notes"]}],
+                "expected_source_targets": before["source_targets"],
+            })
+            self.assertEqual(first["source_targets"][0]["domain"], "example.com")
+            self.assertIn("topic=release+notes", first["source_targets"][0]["feed_urls"][0])
+            unchanged = self.request("/api/sources/settings", {
+                "source_targets": first["source_targets"],
+                "expected_source_targets": first["source_targets"],
+            })
+            self.assertEqual(first, unchanged)
+            current = self.request("/api/sources/settings")
+            disk_before = self.config.read_bytes()
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.request("/api/sources/settings", {
+                    "source_targets": [{"domain": "stale.example.invalid"}],
+                    "expected_source_targets": before["source_targets"],
+                    "watch_products": ["must-not-replace"],
+                })
+            self.assertEqual(raised.exception.code, 409)
+            self.assertIn("Reload before saving", raised.exception.read().decode())
+            self.assertEqual(self.request("/api/sources/settings"), current)
+            self.assertEqual(self.config.read_bytes(), disk_before)
+            self.assertNotIn("expected_source_targets", current)
+            self.assertNotIn("expected_source_targets", json.loads(disk_before))
+        finally:
+            self.request("/api/sources/settings", before)
+
+    def test_competing_source_target_updates_have_exactly_one_winner(self):
+        before = self.request("/api/sources/settings")
+        try:
+            self.request("/api/sources/settings", {"source_targets": []})
+
+            def save(domain):
+                try:
+                    result = self.request("/api/sources/settings", {
+                        "source_targets": [{"domain": domain}], "expected_source_targets": [],
+                    })
+                    return 200, result["source_targets"]
+                except urllib.error.HTTPError as error:
+                    error.close()
+                    return error.code, None
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(save, ["first.example.invalid", "second.example.invalid"]))
+            self.assertEqual(sorted(status for status, _ in outcomes), [200, 409])
+            winner = next(targets for status, targets in outcomes if status == 200)
+            self.assertEqual(self.request("/api/sources/settings")["source_targets"], winner)
+            self.assertEqual(json.loads(self.config.read_text())["source_targets"], winner)
+        finally:
+            self.request("/api/sources/settings", before)
+
+    def test_expected_source_targets_require_a_replacement(self):
+        disk_before = self.config.read_bytes()
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.request("/api/sources/settings", {"expected_source_targets": []})
+        self.assertEqual(raised.exception.code, 422)
+        self.assertEqual(self.config.read_bytes(), disk_before)
+
+    def test_source_target_snapshot_does_not_reduce_settings_size_budget(self):
+        before = self.request("/api/sources/settings")
+        targets = [{"domain": f"target-{index}.example.invalid", "notes": "x" * 3900} for index in range(12)]
+        try:
+            self.request("/api/sources/settings", {"source_targets": targets})
+            request = {"source_targets": targets, "expected_source_targets": targets}
+            self.assertGreater(len(json.dumps(request)), 65536)
+            self.assertTrue(self.request("/api/sources/settings", request)["saved"])
+            disk_before = self.config.read_bytes()
+            oversized = targets + [{"domain": f"extra-{index}.example.invalid", "notes": "x" * 3900} for index in range(5)]
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.request("/api/sources/settings", {"source_targets": oversized, "expected_source_targets": targets})
+            self.assertEqual(raised.exception.code, 413)
+            self.assertEqual(self.config.read_bytes(), disk_before)
+        finally:
+            self.request("/api/sources/settings", before)
 
     def test_source_settings_preserve_public_url_queries(self):
         before = self.request("/api/sources/settings")

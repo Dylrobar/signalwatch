@@ -11,6 +11,8 @@ from fastapi import HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from .async_utils import to_thread
+
 
 class WirelessDecision(BaseModel):
     company_id: str = Field(min_length=1, max_length=300)
@@ -40,7 +42,7 @@ class EnrichmentRequest(BaseModel):
 async def _sqlite_write(function, *args, **kwargs):
     for attempt in range(3):
         try:
-            return await asyncio.to_thread(function, *args, **kwargs)
+            return await to_thread(function, *args, **kwargs)
         except sqlite3.OperationalError as error:
             code = getattr(error, "sqlite_errorcode", None)
             locked = (code & 255) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} if isinstance(code, int) else str(error).lower() in {
@@ -78,7 +80,7 @@ def register_wireless_routes(app, config, store, imports):
 
     async def retain(payload, source, location, content_type, metadata, version):
         try:
-            return await asyncio.to_thread(staging_queue(store, config).enqueue, payload, source=source, adapter="opaque",
+            return await to_thread(staging_queue(store, config).enqueue, payload, source=source, adapter="opaque",
                                            source_url=location, content_type=content_type, metadata=metadata,
                                            idempotency_key=hashlib.sha256(payload + location.encode() + version.encode()).hexdigest())
         except QueueFull as error:
@@ -99,8 +101,7 @@ def register_wireless_routes(app, config, store, imports):
 
     @app.get("/api/wireless/datasets/{dataset_id}")
     def dataset(dataset_id: str):
-        rows = data.datasets(store, limit=500)["items"]
-        row = next((row for row in rows if row["id"] == dataset_id), None)
+        row = data.get_dataset(store, dataset_id)
         if row is None:
             raise HTTPException(404, "Wireless dataset does not exist")
         state = imports.state(dataset_id)
@@ -231,7 +232,7 @@ def register_wireless_routes(app, config, store, imports):
         await retain(raw, "wireless-registry:" + registry, location, request.headers.get("Content-Type", "text/plain"),
                      {"registry": registry, "version": version}, version)
         try:
-            return await asyncio.to_thread(attribution.import_manufacturer_registry, store, raw, registry, location, version=version)
+            return await to_thread(attribution.import_manufacturer_registry, store, raw, registry, location, version=version)
         except (ValueError, UnicodeError) as error:
             raise HTTPException(400, str(error)) from error
 
@@ -252,7 +253,7 @@ def register_wireless_routes(app, config, store, imports):
                 raise ValueError("Enrichment requires up to 10000 records")
             raw = bytes(payload)
             await retain(raw, "wireless-device-enrichment", location, "application/json", {"version": version}, version)
-            return await asyncio.to_thread(attribution.import_device_enrichment, store, records, location, version)
+            return await to_thread(attribution.import_device_enrichment, store, records, location, version)
         except (ValueError, TypeError, UnicodeError) as error:
             raise HTTPException(400, str(error)) from error
 
@@ -271,7 +272,7 @@ def register_wireless_routes(app, config, store, imports):
             records = json.loads(payload)
             raw = bytes(payload)
             await retain(raw, "wireless-business-import", location, "application/json", {}, "")
-            return await asyncio.to_thread(attribution.import_osm_facilities, store, records)
+            return await to_thread(attribution.import_osm_facilities, store, records)
         except (ValueError, TypeError, UnicodeError) as error:
             raise HTTPException(400, str(error)) from error
 
@@ -285,7 +286,7 @@ def register_wireless_routes(app, config, store, imports):
             if request.facilities:
                 cells = []
                 if request.lookup_businesses:
-                    cells = [[request.bbox[1], request.bbox[0], request.bbox[3], request.bbox[2]]] if request.bbox else await asyncio.to_thread(attribution.dense_scan_cells, store, limit=request.cells)
+                    cells = [[request.bbox[1], request.bbox[0], request.bbox[3], request.bbox[2]]] if request.bbox else await to_thread(attribution.dense_scan_cells, store, limit=request.cells)
                 fetched, errors = [], []
                 await _sqlite_write(store.update_source, "wireless_enrichment", phase="business_lookup", cells_total=len(cells), cells_completed=0)
                 async with PublicHTTP({**config, "timeout": max(60, float(config.get("timeout", 30)))}) as http:

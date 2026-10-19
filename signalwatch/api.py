@@ -135,6 +135,7 @@ class StagingRetryRequest(BaseModel):
 class SourceSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_targets: list[dict[str, Any]] | None = Field(default=None, max_length=100)
+    expected_source_targets: list[dict[str, Any]] | None = Field(default=None, max_length=100)
     source_intervals: dict[str, float] | None = None
     sources: dict[str, bool] | None = None
     provider_settings: dict[str, dict[str, Any]] | None = None
@@ -260,14 +261,21 @@ def create_app(config, auto_collect=True):
 
     @app.post("/api/sources/settings")
     async def save_source_settings(request: Request):
-        from .sourcehub import definitions
+        from .sourcehub import definitions, public_settings
         body = bytearray()
         async for chunk in request.stream():
-            if len(body) + len(chunk) > 65536:
-                raise HTTPException(413, "Source settings exceed 64 KiB")
+            # Reserve room for the original snapshot without reducing the
+            # existing 64 KiB budget for the settings being saved.
+            if len(body) + len(chunk) > 2 * 65536 + 1024:
+                raise HTTPException(413, "Source settings request exceeds 129 KiB")
             body.extend(chunk)
         try:
             supplied = SourceSettingsRequest.model_validate_json(body).model_dump(exclude_none=True)
+            expected_targets = supplied.pop("expected_source_targets", None)
+            if len(json.dumps(supplied, ensure_ascii=False, separators=(",", ":")).encode()) > 65536:
+                raise HTTPException(413, "Source settings exceed 64 KiB")
+            if expected_targets is not None and "source_targets" not in supplied:
+                raise ValueError("Expected source targets require a source targets update")
             providers = {row["id"] for row in definitions()}
             providers.add("technographics")
             if set(supplied.get("sources", {})) - set(config["sources"]) or set(supplied.get("source_intervals", {})) - set(config["sources"]):
@@ -340,6 +348,10 @@ def create_app(config, auto_collect=True):
         except (ValidationError, ValueError, UnicodeError, RecursionError) as error:
             raise HTTPException(422, str(error)[:300] if isinstance(error, ValueError) and not isinstance(error, ValidationError) else "Invalid source settings") from error
         with config_lock:
+            # Compare the same public snapshot returned by GET, inside the write
+            # lock so another save cannot pass between the check and replacement.
+            if expected_targets is not None and expected_targets != public_settings(config["source_targets"]):
+                raise HTTPException(409, "Source targets changed since you opened them. Reload before saving to preserve other changes.")
             changes = {}
             for key, value in supplied.items():
                 if key in {"sources", "source_intervals"}:

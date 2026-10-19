@@ -245,11 +245,23 @@ class Collector:
                 self.nvd_next_request = time.monotonic() + (0.7 if headers else 6.1)
                 response = await self.http.get("https://services.nvd.nist.gov/rest/json/cves/2.0", params=params, headers=headers, cache=False)
                 payload = await asyncio.to_thread(read_json, response.path)
-                records = [parse_nvd(row["cve"]) for row in payload.get("vulnerabilities", [])]
+                if (not isinstance(payload, dict)
+                        or not isinstance(payload.get("vulnerabilities"), list)
+                        or any(type(payload.get(key)) is not int or payload[key] < 0
+                               for key in ("totalResults", "startIndex", "resultsPerPage"))):
+                    raise ValueError("NVD API response lacks valid records and pagination metadata")
+                rows = payload["vulnerabilities"]
+                total_results = payload["totalResults"]
+                if (payload["startIndex"] != index
+                        or payload["resultsPerPage"] != len(rows)
+                        or index + len(rows) > total_results
+                        or not rows and index < total_results):
+                    raise ValueError("NVD API returned an incomplete or inconsistent page; the current collection window was not completed")
+                records = [parse_nvd(row["cve"]) for row in rows]
                 await self.emit({"advisories": records, "entities": [entity for record in records for entity in product_entities(record["affected"], record["url"])]})
                 total += len(records)
                 index += len(records)
-                if not records or index >= payload.get("totalResults", 0):
+                if index >= total_results:
                     break
             await self.checkpoint("nvd", initialized=True, watermark=end.isoformat())
             start = end

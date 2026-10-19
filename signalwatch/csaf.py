@@ -206,16 +206,17 @@ async def collect_csaf(config, store, http):
         previous_health = health.get(feed_url, {})
         try:
             response = await http.get(feed_url, max_bytes=16 * 1024 * 1024)
-            entry_count = previous_health.get("entries", 0)
+            # A later page can change independently of its parent. Revisit its
+            # links even when this page's cached body is unchanged.
+            payload = await asyncio.to_thread(read_json, response.path)
+            entries, pages = parse_feed(payload, feed_url, name)
             if feed_digests.get(feed_url) != response.digest:
-                payload = await asyncio.to_thread(read_json, response.path)
-                entries, pages = parse_feed(payload, feed_url, name)
                 for entry in entries:
                     if revisions.get(entry["url"], {}).get("revision") != entry["revision"] and pending.get(entry["url"], {}).get("revision") != entry["revision"]:
                         pending[entry["url"]] = entry
-                queue.extend((url, name) for url in pages if url not in visited)
                 feed_digests[feed_url] = response.digest
-                entry_count = len(entries)
+            queue.extend((url, name) for url in pages if url not in visited)
+            entry_count = len(entries)
             successful_feeds += 1
             health[feed_url] = {**previous_health, "name": name, "url": feed_url, "status": "ok", "ok": True, "last_attempt": attempted, "last_success": datetime.now(timezone.utc).isoformat(), "entries": entry_count, "error": None}
         except Exception as error:

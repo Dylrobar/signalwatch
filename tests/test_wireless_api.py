@@ -213,6 +213,30 @@ class WirelessApiTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(self.wait_import(dataset_id)["observations"], 3)
 
+    def test_dataset_detail_finds_an_export_older_than_the_latest_500(self):
+        from signalwatch.store import Store
+
+        dataset_id, _ = self.upload("Older detail.csv.gz", [observation("02:00:00:00:60:01")])
+        store = Store(self.root / "monitor.db")
+        with store.connection(write=True) as conn:
+            conn.execute("UPDATE wireless_datasets SET created_at='2000-01-01' WHERE id=?", (dataset_id,))
+            conn.executemany("""INSERT INTO wireless_datasets
+                (id,name,source_hash,status,header,created_at,updated_at)
+                VALUES(?,?,?,'complete','[]','2026-01-01','2026-01-01')""",
+                [("wireless:" + format(number, "064x"), "Newer export", format(number, "064x"))
+                 for number in range(500)])
+        try:
+            path = "/api/wireless/datasets/" + urllib.parse.quote(dataset_id, safe="")
+            status, _, detail = self.request(path)
+            self.assertEqual(status, 200, detail)
+            self.assertEqual((detail["id"], detail["observations"], detail["devices"]), (dataset_id, 1, 1))
+            self.assertEqual(detail["job"]["status"], "complete")
+            self.assertEqual(self.request("/api/wireless/datasets/missing")[0], 404)
+        finally:
+            with store.connection(write=True) as conn:
+                conn.executemany("DELETE FROM wireless_datasets WHERE id=?",
+                                 [("wireless:" + format(number, "064x"),) for number in range(500)])
+
     def test_detail_company_links_are_arrays_and_locations_keep_provenance(self):
         rows = [observation("02:00:00:00:20:01", "Example detail network"),
                 observation("02:00:00:00:20:01", "Example detail network", "44.001", "-73.001", timestamp="2026-01-02 12:00:00")]
