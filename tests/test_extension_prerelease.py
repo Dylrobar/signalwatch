@@ -71,6 +71,25 @@ class PrereleaseTests(unittest.TestCase):
             rss = f'<rss version="2.0"><channel><item><title>{title}</title><link>https://developer.apple.com/news/releases/?id=stable</link><description>Resolved a security bug introduced in beta releases.</description></item></channel></rss>'.encode()
             self.assertEqual(feed_notes(rss, provider), [])
 
+    def test_apple_final_note_suppresses_older_beta_before_classification(self):
+        raw = b'''<rss version="2.0"><channel>
+          <item><title>Xcode 27.1 beta (27A9269)</title><link>https://developer.apple.com/news/releases/?id=old</link><pubDate>Mon, 05 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="https://developer.apple.com/go/?utm_source=rss&amp;id=xcode-27_1-sdk-rn">Notes</a>]]></description></item>
+          <item><title>Xcode 27.1 (27A9275)</title><link>https://developer.apple.com/news/releases/?id=final</link><pubDate>Fri, 16 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="/go/?id=xcode-27_1-sdk-rn#overview">Notes</a>]]></description></item>
+          <item><title>Xcode 27.2 beta 3 (27B5038j)</title><link>https://developer.apple.com/news/releases/?id=current</link><pubDate>Wed, 14 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="/go/?id=xcode-27_2-sdk-rn">Notes</a>]]></description></item>
+        </channel></rss>'''
+        rows = feed_notes(raw, 'apple_developer')
+        self.assertEqual([row['version'] for row in rows], ['27.2 beta 3'])
+
+    def test_apple_newest_note_preserves_distinct_products_and_branches(self):
+        raw = b'''<rss version="2.0"><channel>
+          <item><title>iOS 27.2 beta 3 (24B5100a)</title><link>https://developer.apple.com/news/releases/?id=older-ios</link><pubDate>Mon, 12 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="/go/?id=ios-27_2-rn">Notes</a>]]></description></item>
+          <item><title>iOS 27.2 beta 4 (24B5110a)</title><link>https://developer.apple.com/news/releases/?id=ios</link><pubDate>Wed, 14 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="/go/?id=ios-27_2-rn">Notes</a>]]></description></item>
+          <item><title>iPadOS 27.2 beta 4 (24B5110a)</title><link>https://developer.apple.com/news/releases/?id=ipados</link><pubDate>Wed, 14 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="/go/?id=ipados-27_2-rn">Notes</a>]]></description></item>
+          <item><title>iOS 27.3 beta (24C5001a)</title><link>https://developer.apple.com/news/releases/?id=next-ios</link><pubDate>Thu, 15 Oct 2026 17:00:00 GMT</pubDate><description><![CDATA[<a href="/go/?id=ios-27_3-rn">Notes</a>]]></description></item>
+        </channel></rss>'''
+        rows = feed_notes(raw, 'apple_developer')
+        self.assertEqual({(row['product'], row['version']) for row in rows}, {('iOS', '27.2 beta 4'), ('iPadOS', '27.2 beta 4'), ('iOS', '27.3 beta')})
+
     def test_invalid_feed_html_and_docc_are_errors(self):
         for raw in (b'<html>Access denied</html>', b'<rss><item>'):
             with self.assertRaises(NormalizationError):

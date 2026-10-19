@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
 import feedparser
@@ -168,15 +168,33 @@ def _identity(provider, title, text):
     return "Apple", match.group(1).strip(), match.group(2).strip(), stage
 
 
+def _apple_note_url(body):
+    for anchor in BeautifulSoup(body, "html.parser").select("a[href]"):
+        parsed = urlsplit(canonical_url(urljoin("https://developer.apple.com", anchor["href"])))
+        identifiers = parse_qs(parsed.query).get("id", [])
+        if parsed.scheme == "https" and parsed.hostname == "developer.apple.com" and parsed.port in {None, 443} and parsed.path == "/go/" and len(identifiers) == 1 and identifiers[0]:
+            return "https://developer.apple.com/go/?" + urlencode({"id": identifiers[0]})
+    return ""
+
+
 def feed_notes(payload, provider):
     parsed = feedparser.parse(payload)
     if parsed.get("bozo") or not str(parsed.get("version", "")).startswith(("rss", "atom")):
         raise NormalizationError("Pre-release source returned invalid RSS/Atom or an error page")
-    rows = []
-    for entry in parsed.entries[:30]:
+    entries = parsed.entries[:30]
+    if provider == "apple_developer":
+        entries = sorted(entries, key=lambda entry: _date(entry) or "", reverse=True)
+    rows, apple_notes = [], set()
+    for entry in entries:
         title = BeautifulSoup(entry.get("title", ""), "html.parser").get_text(" ", strip=True)
         body = next((value.get("value", "") for value in entry.get("content", []) if value.get("value")), entry.get("summary", ""))
         text = BeautifulSoup(body, "html.parser").get_text(" ", strip=True)
+        if provider == "apple_developer":
+            note_url = _apple_note_url(body)
+            if note_url:
+                if note_url in apple_notes:
+                    continue
+                apple_notes.add(note_url)
         if provider == "windows_insider":
             links = []
             for anchor in BeautifulSoup(body, "html.parser").select("a[href]"):
@@ -396,9 +414,7 @@ async def collect_prerelease_sources(config, store, http):
                             if not any(version in BeautifulSoup(payload, "html.parser").get_text(" ", strip=True) for version in note["version"].split(", ")):
                                 raise NormalizationError("Windows public release note does not identify the announced build")
                         if provider == "apple_developer":
-                            page = BeautifulSoup(body, "html.parser")
-                            links = [urljoin("https://developer.apple.com", link["href"]) for link in page.select("a[href]")]
-                            go = next((link for link in links if urlsplit(link).hostname == "developer.apple.com" and urlsplit(link).path == "/go/"), None)
+                            go = _apple_note_url(body)
                             if not go:
                                 raise NormalizationError("Apple beta announcement lacks public release notes")
                             redirect = await get(go, html=True)
