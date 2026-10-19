@@ -30,6 +30,18 @@ def display_url(url):
         return "invalid request URL"
 
 
+class PublicRequestError(RuntimeError):
+    def __init__(self, reason, url):
+        self.reason = reason
+        super().__init__(f"{reason}: {display_url(url)}")
+
+
+def public_error(error):
+    if isinstance(error, (HTTPError, PublicRequestError)):
+        return str(error)
+    return f"{type(error).__name__} while collecting public metadata"
+
+
 class HTTPError(RuntimeError):
     def __init__(self, status, url, detail="", *, retry_after=None):
         self.status = status
@@ -102,9 +114,7 @@ class PublicHTTP:
         request_url = str(aiohttp.client_reqrep.URL(url).with_query(params)) if params else url
         representation = "\n".join(f"{key.lower()}:{value}" for key, value in sorted((headers or {}).items()) if key.lower() in {"range", "accept", "accept-language"})
         key = hashlib.sha256(f"{request_url}\n{representation}".encode()).hexdigest()
-        lock = self.locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            return await self._get(request_url, key, headers or {}, max_bytes, cache, force, allow_redirects, max_attempts)
+        return await self._get(request_url, key, headers or {}, max_bytes, cache, force, allow_redirects, max_attempts)
 
     async def post(self, url, *, json=None, data=None, headers=None, max_bytes=None, allow_redirects=False, max_attempts=1):
         from json import dumps
@@ -114,30 +124,17 @@ class PublicHTTP:
             raise ValueError("Supply JSON or form data, not both")
         representation = dumps([json, data, headers or {}], sort_keys=True, default=str, separators=(",", ":"))
         key = hashlib.sha256((url + "\nPOST\n" + representation).encode()).hexdigest()
-        lock = self.locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            return await self._get(url, key, headers or {}, max_bytes, False, True, allow_redirects,
-                                   max_attempts, method="POST", request_body={"json": json, "data": data})
+        return await self._get(url, key, headers or {}, max_bytes, False, True, allow_redirects,
+                               max_attempts, method="POST", request_body={"json": json, "data": data})
 
     async def _get(self, url, key, headers, max_bytes, cache, force, allow_redirects, max_attempts,
                    method="GET", request_body=None):
         body = self.cache / f"{key}.body"
         meta_path = self.cache / f"{key}.json"
-        meta = {}
-        if cache and meta_path.exists() and body.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-            except (OSError, ValueError):
-                meta = {}
-        request_headers = dict(headers)
-        if not force and meta:
-            if meta.get("etag"):
-                request_headers["If-None-Match"] = meta["etag"]
-            if meta.get("last_modified"):
-                request_headers["If-Modified-Since"] = meta["last_modified"]
         limit = max_bytes if max_bytes is not None else int(self.config["max_response_mb"]) * 1024 * 1024
         host = aiohttp.client_reqrep.URL(url).host
-        for attempt in range(max_attempts):
+        attempt = 0
+        while attempt < max_attempts:
             delay = self.host_wait.get(host, 0) - time.monotonic()
             while delay > 0:
                 if delay > 60:
@@ -148,55 +145,84 @@ class PublicHTTP:
                 delay = self.host_wait.get(host, 0) - time.monotonic()
             temp = self.cache / f"{key}.{os.getpid()}.{random.getrandbits(64):016x}.part"
             try:
-                request = self.session.get if method == "GET" else self.session.post
-                async with request(url, headers=request_headers, allow_redirects=allow_redirects, **(request_body or {})) as response:
-                    response_headers = dict(response.headers)
-                    if response.status == 304 and body.exists():
-                        return FetchResult(body, 304, {**meta.get("headers", {}), **response_headers}, str(response.url), False, meta.get("digest", ""))
-                    if response.status in (429, 503):
-                        wait = max(1.0, retry_delay(response.headers.get("Retry-After"), attempt))
-                        self.host_wait[host] = max(self.host_wait.get(host, 0), time.monotonic() + wait)
-                        self.host_status[host] = response.status
-                        if attempt + 1 < max_attempts and wait <= 60:
-                            continue
-                        raise HTTPError(response.status, str(response.url), retry_after=wait)
-                    if response.status >= 400:
-                        raise HTTPError(response.status, str(response.url))
-                    size = 0
-                    digest = hashlib.sha256()
-                    with temp.open("wb") as stream:
-                        async for chunk in response.content.iter_chunked(256 * 1024):
-                            size += len(chunk)
-                            if size > limit:
-                                raise ValueError(f"Response exceeds {limit} bytes: {display_url(url)}")
-                            stream.write(chunk)
-                            digest.update(chunk)
-                    value = digest.hexdigest()
-                    changed = value != meta.get("digest")
-                    temp.replace(body)
-                    metadata = {
-                        "url": str(response.url), "etag": response.headers.get("ETag"),
-                        "last_modified": response.headers.get("Last-Modified"),
-                        "digest": value, "size": size, "fetched_at": time.time(),
-                        "headers": {key: value for key, value in response_headers.items() if key.lower() != "set-cookie"},
-                    }
-                    if cache:
-                        meta_temp = meta_path.with_suffix(".json.tmp")
-                        meta_temp.write_text(json.dumps(metadata, separators=(",", ":")))
-                        meta_temp.replace(meta_path)
-                    return FetchResult(body, response.status, response_headers, str(response.url), changed, value)
+                lock = self.locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    # A request ahead of us may have established a cooldown while
+                    # we awaited this cache lock. Release it and wait outside;
+                    # cooldown checks never consume a network attempt.
+                    remaining = self.host_wait.get(host, 0) - time.monotonic()
+                    if remaining > 0:
+                        continue
+                    meta = {}
+                    if cache and meta_path.exists() and body.exists():
+                        try:
+                            meta = json.loads(meta_path.read_text())
+                        except (OSError, ValueError):
+                            meta = {}
+                    request_headers = dict(headers)
+                    if not force and meta:
+                        if meta.get("etag"):
+                            request_headers["If-None-Match"] = meta["etag"]
+                        if meta.get("last_modified"):
+                            request_headers["If-Modified-Since"] = meta["last_modified"]
+                    request = self.session.get if method == "GET" else self.session.post
+                    attempt += 1
+                    async with request(url, headers=request_headers, allow_redirects=allow_redirects, **(request_body or {})) as response:
+                        response_headers = dict(response.headers)
+                        if response.status == 304 and body.exists():
+                            return FetchResult(body, 304, {**meta.get("headers", {}), **response_headers}, str(response.url), False, meta.get("digest", ""))
+                        if response.status in (429, 502, 503, 504):
+                            wait = max(1.0, retry_delay(response.headers.get("Retry-After"), attempt - 1))
+                            self.host_wait[host] = max(self.host_wait.get(host, 0), time.monotonic() + wait)
+                            self.host_status[host] = response.status
+                            if attempt < max_attempts and wait <= 60:
+                                continue
+                            raise HTTPError(response.status, str(response.url), retry_after=wait)
+                        if response.status >= 400:
+                            raise HTTPError(response.status, str(response.url))
+                        size = 0
+                        digest = hashlib.sha256()
+                        with temp.open("wb") as stream:
+                            async for chunk in response.content.iter_chunked(256 * 1024):
+                                size += len(chunk)
+                                if size > limit:
+                                    raise ValueError(f"Response exceeds {limit} bytes: {display_url(url)}")
+                                stream.write(chunk)
+                                digest.update(chunk)
+                        value = digest.hexdigest()
+                        changed = value != meta.get("digest")
+                        temp.replace(body)
+                        metadata = {
+                            "url": str(response.url), "etag": response.headers.get("ETag"),
+                            "last_modified": response.headers.get("Last-Modified"),
+                            "digest": value, "size": size, "fetched_at": time.time(),
+                            "headers": {key: value for key, value in response_headers.items() if key.lower() != "set-cookie"},
+                        }
+                        if cache:
+                            meta_temp = meta_path.with_suffix(".json.tmp")
+                            meta_temp.write_text(json.dumps(metadata, separators=(",", ":")))
+                            meta_temp.replace(meta_path)
+                        return FetchResult(body, response.status, response_headers, str(response.url), changed, value)
             except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                if attempt + 1 == max_attempts:
+                permanent = isinstance(error, (aiohttp.ClientSSLError, aiohttp.TooManyRedirects)) or (
+                    isinstance(error, aiohttp.ClientConnectorError) and isinstance(error.os_error, socket.gaierror)
+                    and error.os_error.errno in {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
+                )
+                if attempt == max_attempts or permanent:
                     if isinstance(error, asyncio.TimeoutError):
                         reason = "Connection timed out"
-                    elif isinstance(error, aiohttp.ClientConnectorError) and isinstance(error.os_error, socket.gaierror):
-                        reason = "DNS lookup failed"
+                    elif isinstance(error, aiohttp.ClientConnectorCertificateError):
+                        reason = "TLS certificate verification failed"
                     elif isinstance(error, aiohttp.ClientSSLError):
                         reason = "TLS connection failed"
+                    elif isinstance(error, aiohttp.TooManyRedirects):
+                        reason = "Too many HTTP redirects"
+                    elif isinstance(error, aiohttp.ClientConnectorError) and isinstance(error.os_error, socket.gaierror):
+                        reason = "DNS lookup failed"
                     else:
                         reason = "Connection failed"
-                    raise RuntimeError(f"{reason}: {display_url(url)}") from error
-                await asyncio.sleep(retry_delay(None, attempt))
+                    raise PublicRequestError(reason, url) from error
+                await asyncio.sleep(retry_delay(None, attempt - 1))
             finally:
                 temp.unlink(missing_ok=True)
         raise RuntimeError(f"Request failed: {display_url(url)}")

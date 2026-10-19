@@ -9,6 +9,8 @@ from urllib.parse import parse_qsl, quote, urlsplit
 
 from bs4 import BeautifulSoup
 
+from .http import display_url, public_error
+
 SOURCE_DEFINITIONS = [
     {"id": "github_public", "name": "GitHub public repositories", "category": "developer", "family": "developer", "access": "public", "description": "Explicit organization repositories and bounded dependency manifests; declared dependencies are evidence, not deployed inventory.", "homepage": "https://docs.github.com/en/rest/repos", "required": ["github_org or configured public URL"]},
     {"id": "gitlab_public", "name": "GitLab public projects", "category": "developer", "family": "developer", "access": "public", "description": "Explicit GitLab.com group public project metadata or configured public exports.", "homepage": "https://docs.gitlab.com/api/groups/", "required": ["gitlab_group or configured public URL"]},
@@ -109,8 +111,7 @@ async def collect_developer_sources(config, store, http):
             try:
                 return await fetch(url, context, **kwargs)
             except Exception as error:
-                status = getattr(error, "status", None)
-                message = f"{provider}: HTTP {status}" if isinstance(status, int) else f"{provider}: {type(error).__name__} while collecting public metadata"
+                message = f"{provider}: {public_error(error)} at {display_url(url)}"
                 health["errors"].append(message)
                 result["errors"].append(message)
                 return None
@@ -221,7 +222,7 @@ async def collect_developer_sources(config, store, http):
                         params = {"limit": min(maximum, 100), "onlyActiveTags": "true", "page": 1}
                     await attempt(url, {**context, "repository": repository}, params=params, kind="container_tags", headers=headers)
 
-        health["status"] = "partial" if health["errors"] else "healthy" if health["fetched"] else "unconfigured"
+        health["status"] = ("partial" if health["fetched"] else "error") if health["errors"] else "healthy" if health["fetched"] else "unconfigured"
         if health["status"] == "unconfigured":
             health["requirements"] = next(definition["required"] for definition in SOURCE_DEFINITIONS if definition["id"] == provider)
 

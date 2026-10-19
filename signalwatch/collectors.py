@@ -16,7 +16,7 @@ import ijson
 from bs4 import BeautifulSoup
 
 from .extract import canonical_url, fingerprint_page, open_payload, parse_feed, parse_nvd, product_entities, read_json, utcnow
-from .http import HTTPError, PublicHTTP
+from .http import HTTPError, PublicHTTP, display_url
 
 
 NVD_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0/nvdcve-2.0-"
@@ -85,6 +85,7 @@ class Collector:
         self.dns_errors = self.dns_resolver.errors
         self.dns_results = self.dns_resolver.results
         self.robots = {}
+        self.robot_errors = {}
         self.robot_locks = {}
         self.discovery_lock = threading.Lock()
         self.discovered_hosts = set()
@@ -470,6 +471,8 @@ class Collector:
         origin = f"{parts.scheme}://{parts.netloc}"
         lock = self.robot_locks.setdefault(origin, asyncio.Lock())
         async with lock:
+            if origin in self.robot_errors:
+                raise self.robot_errors[origin]
             if origin not in self.robots or time.time() - self.robots[origin].mtime() > 3600:
                 parser = RobotFileParser()
                 try:
@@ -481,7 +484,11 @@ class Collector:
                     elif error.status == 404:
                         parser.parse([])
                     else:
+                        self.robot_errors[origin] = error
                         raise
+                except Exception as error:
+                    self.robot_errors[origin] = error
+                    raise
                 self.robots[origin] = parser
         return self.robots[origin].can_fetch(self.config["user_agent"].split("/", 1)[0], url)
 
@@ -514,7 +521,7 @@ class Collector:
             try:
                 for redirect in range(6):
                     if not await self._can_fetch(url):
-                        raise ValueError(f"robots.txt disallows {url}")
+                        raise ValueError(f"robots.txt disallows {display_url(url)}")
                     response = await self.http.get(url, allow_redirects=False)
                     if response.status not in (301, 302, 303, 307, 308):
                         break
@@ -553,11 +560,12 @@ class Collector:
                     queue.extend((href, depth + 1) for href in sorted(set(links))[:max_pages])
             except Exception as error:
                 errors.append(str(error))
-        error = "; ".join(errors)[:2000] if not pages and errors else None
+        error = "; ".join(dict.fromkeys(errors))[:2000] if errors else None
         await asyncio.to_thread(self.store.finish_url, target["url"], error=error)
         return {"pages": pages, "observations": observed, "error": error}
 
     async def collect_web(self):
+        self.robot_errors.clear()
         self.dns_errors.clear()
         self.dns_results.clear()
         for url in self.config.get("seed_urls", []):
@@ -571,7 +579,7 @@ class Collector:
                 return await self._crawl(target)
         results = await asyncio.gather(*(crawl(target) for target in targets))
         errors = [row["error"] for row in results if row["error"]]
-        if results and len(errors) == len(results):
+        if results and not any(row["pages"] for row in results) and errors:
             raise RuntimeError("All crawl targets failed: " + "; ".join(errors)[:2000])
         dns_errors = [message for host in sorted(self.dns_errors) for message in self.dns_errors[host]]
         return {"targets": len(targets), "pages": sum(row["pages"] for row in results), "observations": sum(row["observations"] for row in results),

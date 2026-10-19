@@ -7,6 +7,10 @@ import io
 import ipaddress
 import json
 import os
+import re
+from email.parser import Parser
+from email.utils import parsedate_to_datetime
+from urllib.robotparser import RobotFileParser
 from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import quote, urljoin, urlsplit
@@ -58,6 +62,127 @@ FEEDS = {
 }
 SOCIAL = frozenset({"reddit_netsec", "reddit_sysadmin", "mastodon", "bluesky"})
 DEFINITIONS = {value["id"]: value for value in SOURCE_DEFINITIONS}
+
+
+ARCHIVES = {
+    "oss_security": ("https://www.openwall.com/lists/oss-security/", "oss-security"),
+    "fulldisclosure": ("https://lists.openwall.net/full-disclosure/", "full-disclosure"),
+}
+
+
+def _archive_url(provider, url, *, message=False):
+    from .normalization import NormalizationError
+    root, _ = ARCHIVES[provider]
+    parsed, expected = urlsplit(url), urlsplit(root)
+    suffix = parsed.path.removeprefix(expected.path)
+    if (parsed.scheme != "https" or parsed.netloc != expected.netloc or parsed.query or parsed.fragment
+            or not parsed.path.startswith(expected.path) or (message and not re.fullmatch(r"\d{4}/\d{2}/\d{2}/[1-9]\d*", suffix))
+            or (not message and parsed.path != expected.path)):
+        raise NormalizationError("Unexpected mailing-list archive location")
+    return url
+
+
+def _archive_links(payload, provider, source_url, limit):
+    from .normalization import NormalizationError
+    _archive_url(provider, source_url)
+    page = BeautifulSoup(payload, "html.parser")
+    _, name = ARCHIVES[provider]
+    heading = page.find("h2")
+    if not heading or heading.get_text(" ", strip=True) != name + " mailing list":
+        raise NormalizationError("Unexpected mailing-list archive index")
+    links = set()
+    for anchor in page.select("li a[href]"):
+        url = urljoin(source_url, anchor["href"])
+        try:
+            _archive_url(provider, url, message=True)
+            parts = urlsplit(url).path.split("/")[-4:]
+            datetime.strptime("/".join(parts[:3]), "%Y/%m/%d")
+        except (NormalizationError, ValueError):
+            continue
+        if anchor.get_text(" ", strip=True):
+            links.add(url)
+    if not links:
+        raise NormalizationError("Mailing-list archive index has no allowed message links")
+    return sorted(links, key=lambda url: tuple(int(part) for part in urlsplit(url).path.split("/")[-4:]), reverse=True)[:limit]
+
+
+def _archive_record(payload, provider, source_url):
+    from .normalization import NormalizationError
+    _archive_url(provider, source_url, message=True)
+    page = BeautifulSoup(payload, "html.parser")
+    _, name = ARCHIVES[provider]
+    blocks = page.find_all("pre")
+    if not page.title or not page.title.get_text().startswith(name + " - ") or len(blocks) != 1:
+        raise NormalizationError("Unexpected mailing-list archive message")
+    message = Parser().parsestr(blocks[0].get_text().lstrip())
+    subject, date = message.get("Subject"), message.get("Date")
+    if not subject or not date or not message.get("From") or not message.get("Message-ID"):
+        raise NormalizationError("Mailing-list archive message lacks mail headers")
+    try:
+        published = parsedate_to_datetime(date)
+        if published.tzinfo is None:
+            raise ValueError("Missing date timezone")
+        published = published.astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError) as error:
+        raise NormalizationError("Mailing-list archive message has invalid published date") from error
+    return {"id": source_url, "url": source_url, "title": " ".join(subject.split())[:1000],
+            "summary": str(message.get_payload())[:12000], "published": published,
+            "record_type": "news", "claim_type": "attributed_mailing_list_claim",
+            "message_id": message.get("Message-ID")}
+
+
+async def _archive_fallback(config, store, http, provider, limit, max_bytes, metadata):
+    from .http import HTTPError, public_error
+    from .sourcehub import stage_payload
+    root, _ = ARCHIVES[provider]
+    robots_url = urljoin(root, "/robots.txt")
+    parser = RobotFileParser(robots_url)
+    try:
+        response = await http.get(robots_url, max_bytes=min(max_bytes, 128 * 1024), max_attempts=2, allow_redirects=False)
+        if response.status not in (200, 304):
+            raise ValueError("Unexpected mailing-list archive robots response")
+        robots = await asyncio.to_thread(response.path.read_bytes)
+        parser.parse(robots.decode("utf-8").splitlines())
+    except HTTPError as error:
+        if error.status != 404:
+            raise
+        parser.parse([])
+    agent = config.get("user_agent") or "SignalWatch"
+    if not parser.can_fetch(agent, root):
+        raise ValueError("Mailing-list archive robots.txt disallows automated access")
+    # One recent index and at most eight messages; no calendar/history traversal,
+    # off-origin redirects, attachments or links found inside message bodies.
+    response = await http.get(root, max_bytes=min(max_bytes, 1024 * 1024), max_attempts=2, allow_redirects=False)
+    if response.status not in (200, 304):
+        raise ValueError("Unexpected mailing-list archive index response")
+    _archive_url(provider, response.url)
+    payload = await asyncio.to_thread(response.path.read_bytes)
+    urls = _archive_links(payload, provider, root, min(limit, 8))
+    index_metadata = {**metadata, "format": "mail_archive_index"}
+    queued = await stage_payload(config, store, payload, provider=provider, source_url=root, content_type="text/html",
+                                 stream_key=provider + ":archive:index", metadata=index_metadata)
+    staged, duplicates = int(not queued.get("duplicate")), int(bool(queued.get("duplicate")))
+    records, errors = [], []
+    for url in urls:
+        try:
+            if not parser.can_fetch(agent, url):
+                raise ValueError("Mailing-list archive robots.txt disallows automated access")
+            response = await http.get(url, max_bytes=min(max_bytes, 512 * 1024), max_attempts=2, allow_redirects=False)
+            if response.status not in (200, 304):
+                raise ValueError("Unexpected mailing-list archive message response")
+            _archive_url(provider, response.url, message=True)
+            if response.url != url:
+                raise ValueError("Unexpected mailing-list archive message location")
+            payload = await asyncio.to_thread(response.path.read_bytes)
+            record = _archive_record(payload, provider, url)
+            queued = await stage_payload(config, store, payload, provider=provider, source_url=url, content_type="text/html",
+                                         stream_key=provider + ":archive:" + url, metadata={**metadata, "format": "mail_archive_message"})
+            staged += int(not queued.get("duplicate"))
+            duplicates += int(bool(queued.get("duplicate")))
+            records.append(record)
+        except Exception as error:
+            errors.append(public_error(error))
+    return records, staged, duplicates, errors
 
 
 def _clean(value, maximum=12000):
@@ -163,6 +288,11 @@ def _records(item, limit):
     if provider not in DEFINITIONS:
         raise NormalizationError("Unknown public threat-source provider")
     format_name = metadata.get("format", "")
+    if format_name == "mail_archive_index":
+        _archive_links(payload, provider, item["source_url"], min(limit, 8))
+        return []
+    if format_name == "mail_archive_message":
+        return [_archive_record(payload, provider, item["source_url"])]
     if format_name == "apple_index" or provider == "apple_security":
         return _apple_records(payload, item.get("source_url") or DEFINITIONS[provider]["homepage"], limit)
     if format_name == "csv" or provider in {"urlhaus", "exploit_db"} and not payload.lstrip().startswith((b"{", b"[", b"<")):
@@ -284,7 +414,14 @@ def normalize_threat(item, max_records=5000):
             remaining = max_records - len(articles) - len(entities) - len(edges)
             edges.extend({"from_id": entity["id"], "to_id": cve, "relation": "mentions", "source_url": entity["source_url"],
                           "observed_at": entity["observed_at"], "confidence": 1.0} for cve in cves[:min(20, remaining)])
-    return _annotate({"articles": articles, "entities": entities, "edges": edges}, item)
+    batch = _annotate({"articles": articles, "entities": entities, "edges": edges}, item)
+    if metadata.get("fallback_used"):
+        for article in batch["articles"]:
+            # Keep the feed/provider identity; provenance points to the actual archive.
+            article["feed_url"] = metadata["primary_source_url"]
+            article["_staging"].update({key: metadata[key] for key in
+                                      ("fallback_used", "primary_source_url", "primary_error", "claim_type")})
+    return batch
 
 
 def _credential(config, provider):
@@ -348,6 +485,7 @@ def _request(provider, settings, credential, limit):
 
 async def collect_threat_sources(config, store, http):
     from .sourcehub import stage_payload
+    from .http import HTTPError, PublicRequestError, display_url, public_error
     settings_map = config.get("provider_settings") or {}
     products = config.get("watch_products") or []
     indicators = config.get("exploit_keywords") or []
@@ -394,10 +532,38 @@ async def collect_threat_sources(config, store, http):
                     index = int(old.get("ip_offset") or 0) % len(ips)
                     local["ips"] = [ips[index]]
                 request_url, source_url, headers, params, format_name = _request(provider, local, credential, limit)
-                response = await http.get(request_url, headers=headers, params=params or None, max_bytes=max_bytes,
-                                          cache=not bool(credential), allow_redirects=not bool(credential), max_attempts=2)
-                payload = await asyncio.to_thread(response.path.read_bytes)
                 metadata = {"provider": provider, "format": format_name, "record_limit": limit, "watch_products": products, "exploit_keywords": indicators}
+                try:
+                    response = await http.get(request_url, headers=headers, params=params or None, max_bytes=max_bytes,
+                                              cache=not bool(credential), allow_redirects=not bool(credential), max_attempts=2)
+                except (HTTPError, PublicRequestError) as primary:
+                    if provider not in ARCHIVES or local.get("url") or credential:
+                        raise
+                    # Stable sanitized envelope metadata keeps retries deduplicated.
+                    primary_error = (f"HTTP {primary.status}" if isinstance(primary, HTTPError) else primary.reason) + ": " + display_url(request_url)
+                    metadata.update(fallback_used=True, primary_source_url=source_url, primary_error=primary_error,
+                                    claim_type="attributed_mailing_list_claim")
+                    try:
+                        records, archive_staged, duplicates, archive_errors = await _archive_fallback(
+                            config, store, http, provider, limit, max_bytes, metadata)
+                        qualified = sum(qualify_signal(_clean(row["title"]) + " " + _clean(row["summary"]), products, indicators)["qualified"] for row in records)
+                        outcome = {"status": "partial" if records else "error", "checked_at": stamp, "deferred": False,
+                                   "requirements": [], "staged": archive_staged, "duplicates": duplicates,
+                                   "records": len(records), "qualified": qualified, "filtered": len(records) - qualified,
+                                   "qualification_only": True, "fallback_used": True, "primary_error": primary_error,
+                                   "fallback_source_url": ARCHIVES[provider][0], "errors": archive_errors,
+                                   "error": primary_error + ("; " + "; ".join(archive_errors) if archive_errors else "")}
+                        if records:
+                            outcome["last_success"] = stamp
+                    except Exception as fallback:
+                        reason = str(fallback) if isinstance(fallback, ValueError) and str(fallback) == "Mailing-list archive robots.txt disallows automated access" else public_error(fallback)
+                        outcome = {"status": "error", "checked_at": stamp, "deferred": False, "requirements": [],
+                                   "staged": 0, "records": 0, "qualified": 0, "filtered": 0,
+                                   "fallback_used": False, "primary_error": primary_error,
+                                   "fallback_source_url": ARCHIVES[provider][0], "error": primary_error + "; " + reason}
+                    await asyncio.to_thread(store.update_source, "provider:" + provider, **outcome)
+                    return provider, outcome
+                payload = await asyncio.to_thread(response.path.read_bytes)
                 if provider == "greynoise":
                     metadata["ip"] = str(ipaddress.ip_address(local["ips"][0]))
                 mime = "application/rss+xml" if format_name == "rss" else "text/html" if format_name == "apple_index" else "text/csv" if format_name == "csv" else "application/json"
@@ -413,7 +579,9 @@ async def collect_threat_sources(config, store, http):
                     reasons.update(signal["reasons"])
                 outcome = {"status": "unchanged" if staged.get("duplicate") else "ok", "checked_at": stamp, "last_success": stamp, "deferred": False,
                            "requirements": [], "staged": int(not staged.get("duplicate")), "records": len(records), "qualified": qualified,
-                           "filtered": len(records) - qualified, "reason_counts": dict(reasons), "qualification_only": True}
+                           "filtered": len(records) - qualified, "reason_counts": dict(reasons), "qualification_only": True, "error": ""}
+                if provider in ARCHIVES:
+                    outcome.update(fallback_used=False, primary_error="", fallback_source_url="", errors=[])
                 if provider == "greynoise":
                     outcome["ip_offset"] = index + 1
                 await asyncio.to_thread(store.update_source, "provider:" + provider, **outcome)

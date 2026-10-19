@@ -300,11 +300,11 @@ class DeveloperCollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(http.requests), 2)
         self.assertTrue(all(not request[1]["headers"] for request in http.requests))
 
-    async def test_errors_are_partial_without_echoing_url_queries_or_error_text(self):
+    async def test_all_failed_errors_without_echoing_url_queries_or_error_text(self):
         self.config["provider_settings"]["postman_public"] = {"url": "https://public.example/export?item=public"}
         http = FakeHTTP(self.directory.name, {"https://public.example/export?item=public": RuntimeError("secret-error-content")})
         result = await collect_developer_sources(self.config, None, http)
-        self.assertEqual(result["provider_health"]["postman_public"]["status"], "partial")
+        self.assertEqual(result["provider_health"]["postman_public"]["status"], "error")
         self.assertNotIn("secret-error-content", json.dumps(result))
         self.assertNotIn("item=public", json.dumps(result))
 
@@ -313,5 +313,5 @@ class DeveloperCollectorTests(unittest.IsolatedAsyncioTestCase):
         http = FakeHTTP(self.directory.name, {})
         result = await collect_developer_sources(self.config, None, http)
         self.assertEqual(http.requests, [])
-        self.assertEqual(result["provider_health"]["postman_public"]["status"], "partial")
+        self.assertEqual(result["provider_health"]["postman_public"]["status"], "error")
         self.assertNotIn("private", json.dumps(result))

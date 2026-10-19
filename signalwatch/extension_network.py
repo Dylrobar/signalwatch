@@ -9,6 +9,7 @@ import re
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .normalization import NormalizationError
+from .http import public_error
 
 
 SOURCE_DEFINITIONS = [
@@ -320,7 +321,7 @@ async def collect_network_sources(config, store, http):
                         if body is not None:
                             fetched = await http.post(url, json=body, headers=headers, max_bytes=payload_limit, max_attempts=1, allow_redirects=False)
                         else:
-                            fetched = await http.get(url, params=params, headers=headers, max_bytes=payload_limit, cache=provider not in {"shodan", "fofa", "censys", "netlas"}, max_attempts=1, allow_redirects=not bool(credentials))
+                            fetched = await http.get(url, params=params, headers=headers, max_bytes=payload_limit, cache=provider not in {"shodan", "fofa", "censys", "netlas"}, max_attempts=2 if provider == "crtsh" else 1, allow_redirects=not bool(credentials))
                         payload = await asyncio.to_thread(fetched.path.read_bytes)
                         content_type = fetched.headers.get("Content-Type", "text/plain" if provider == "passive_dns" else "application/json").split(";", 1)[0]
                         queued = await stage_payload(config, store, payload, provider=provider, source_url=provenance_url, content_type=content_type, stream_key=provider + ":" + name, metadata=metadata)
@@ -331,7 +332,7 @@ async def collect_network_sources(config, store, http):
                     status["records"] += min(len(rows), record_limit)
                     successful += 1
             except Exception as exc:
-                reason = " ".join(str(exc).split())[:300]
+                reason = public_error(exc)
                 for value in credentials.values():
                     if isinstance(value, str) and value:
                         reason = reason.replace(value, "[redacted]")
