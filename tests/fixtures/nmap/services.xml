@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" start="1792389600" version="7.95" xmloutputversion="1.05">
+  <host endtime="1792389601">
+    <status state="up" reason="syn-ack"/>
+    <address addr="192.0.2.10" addrtype="ipv4"/>
+    <address addr="00:11:22:33:44:55" addrtype="mac" vendor="Example"/>
+    <hostnames><hostname name="edge.example.test" type="user"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.6p1" extrainfo="Ubuntu" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:9.6p1</cpe><cpe>cpe:/o:linux:linux_kernel</cpe></service></port>
+      <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="http" product="nginx" version="1.24.0" tunnel="ssl" method="probed" conf="9"><cpe>cpe:2.3:a:nginx:nginx:1.24.0:*:*:*:*:*:*:*</cpe></service></port>
+      <port protocol="tcp" portid="80"><state state="closed" reason="reset"/><service name="http" method="table" conf="3"/></port>
+      <port protocol="udp" portid="161"><state state="open|filtered" reason="no-response"/><service name="snmp" method="table" conf="3"/></port>
+    </ports>
+  </host>
+  <host><status state="up"/><address addr="2001:db8::10" addrtype="ipv6"/><ports><port protocol="udp" portid="53"><state state="open"/><service name="domain" method="table" conf="3"/></port></ports></host>
+  <host><status state="down"/><address addr="192.0.2.20" addrtype="ipv4"/><ports><port protocol="tcp" portid="22"><state state="open"/></port></ports></host>
+  <runstats><finished time="1792389602" exit="success"/><hosts up="2" down="1" total="3"/></runstats>
+</nmaprun>

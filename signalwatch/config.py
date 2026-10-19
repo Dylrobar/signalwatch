@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.12.1"
+VERSION = "0.13.0"
 
 
 DEFAULTS = {
@@ -58,7 +58,7 @@ DEFAULTS = {
     "wireless_chunk_rows": 5000,
     "source_intervals": {"news": 15, "threat": 15, "prerelease": 60, "nvd": 360, "kev": 360, "epss": 360,
                          "github": 360, "osv": 360, "cve_program": 360, "csaf": 360,
-                         "exposure": 10080, "corporate": 10080, "developer": 10080, "hardware": 43200},
+                         "exposure": 10080, "corporate": 10080, "developer": 10080, "hardware": 43200, "nmap": 1440},
     "public_source_batch": 3,
     "public_source_records": 100,
     "public_source_concurrency": 4,
@@ -68,7 +68,8 @@ DEFAULTS = {
                        {"name": "Microsoft", "domain": "microsoft.com", "github_org": "microsoft", "cik": "0000789019"}],
     "watch_products": [],
     "exploit_keywords": ["exploit", "zero-day", "zero day", "rce", "remote code execution", "security fix", "security patch", "actively exploited", "authentication bypass", "memory corruption"],
-    "provider_settings": {"ctlogs": {"enabled": True}, "certspotter": {"enabled": False},
+    "provider_settings": {"nmap": {"enabled": True, "profile": "quick", "targets": [], "timeout": 900},
+                          "ctlogs": {"enabled": True}, "certspotter": {"enabled": False},
                           "crtsh": {"enabled": True}, "dns_txt": {"enabled": True},
                           "gleif": {"enabled": True}, "corporate_discovery": {"enabled": True},
                           "importyeti_public": {"enabled": True},
@@ -87,6 +88,7 @@ DEFAULTS = {
         "cve_program": True,
         "csaf": True,
         "network": True,
+        "nmap": True,
         "wikidata": True,
         "news": True,
         "web": True,

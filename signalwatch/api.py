@@ -306,6 +306,9 @@ def create_app(config, auto_collect=True):
                     raise ValueError("Source settings must contain finite numbers")
 
             validate(supplied)
+            if "nmap" in supplied.get("provider_settings", {}):
+                from .nmap import scan_options
+                scan_options({**config["provider_settings"].get("nmap", {}), **supplied["provider_settings"]["nmap"]})
             for target in supplied.get("source_targets", []):
                 domain = target.get("domain", "")
                 if not isinstance(domain, str) or not domain.strip() or any(char in domain for char in "/:@?#* "):

@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.12.1 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.13.0 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,
@@ -60,7 +60,8 @@
     "exposure": 10080,
     "corporate": 10080,
     "developer": 10080,
-    "hardware": 43200
+    "hardware": 43200,
+    "nmap": 1440
   },
   "public_source_batch": 3,
   "public_source_records": 100,
@@ -151,6 +152,12 @@
     },
     "mikrotik_testing": {
       "enabled": true
+    },
+    "nmap": {
+      "enabled": true,
+      "profile": "quick",
+      "targets": [],
+      "timeout": 900
     }
   },
   "provider_credentials": {},
@@ -171,7 +178,8 @@
     "developer": true,
     "threat": true,
     "hardware": true,
-    "prerelease": true
+    "prerelease": true,
+    "nmap": true
   },
   "feeds": [
     {

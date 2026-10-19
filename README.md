@@ -145,6 +145,14 @@ Searches, filters, and pagination survive tab switches. The current view is enco
 
 Follow company/domain/product relationships, advisory IDs, and article references inside the evidence drawer; its Back control restores the previous record. Product catalog details show their published advisories even when no deployment has been observed. CVE aliases resolve to the actual stored source document. Package details retain both enumerated versions and affected ranges.
 
+### Nmap scans
+
+The Docker image includes Nmap. Configure `provider_settings.nmap` through `/api/sources/settings`: `{"profile":"quick","targets":["192.0.2.10","192.0.2.0/24"],"timeout":900}`. Targets are explicit IPs, CIDRs or hostnames; the initial list is empty. Run `signalwatch collect --sources nmap` or POST `{"sources":["nmap"]}` to `/api/collect`. The scheduled interval defaults to 1,440 minutes.
+
+Profiles scan TCP: `quick` uses the top 1,000 ports, `full` scans ports 1–65,535, and `service_version` uses the top 1,000 with `-sV --version-light`. Targets are batched by IPv4/IPv6 using `-sT -n --unprivileged -T4 --open --max-retries 1`. Results use the existing staging queue and become `ip → open_port → service_banner → cpe_product` graph records. Port-table names remain port metadata; banners and products require detected service evidence. Closed and `open|filtered` states are excluded. These records do not automatically assert company ownership or a confirmed vulnerability.
+
+Import existing XML with `signalwatch stage scan.xml --source nmap --adapter nmap_xml`, then process it with `signalwatch staging work`. Large generated scans are split into queue-sized XML fragments. Non-Docker installations require `nmap` on `PATH`.
+
 ### Sources without account setup
 
 Version 0.12.0 enables ctlogs hostnames with crt.sh fallback, GLEIF registry/parent evidence, company-linked job/document discovery, public ImportYeti freight tables, CIRCL public MISP reports/observables, and capped anonymous GreyNoise IP context. Public repository collection now parses more manifests/lock files, records redacted static secret candidates, and checks exact dependency versions through OSV. Everything uses the existing workers, queue, graph, and dashboard. Existing explicit operator settings remain intact. [Coverage, limits, and setup-dependent integrations omitted from this update](docs/zero-setup-sources.md).

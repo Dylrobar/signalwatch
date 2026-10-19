@@ -390,6 +390,13 @@ def wigle_csv(item, maximum):
     return normalize_wigle(item, max_records=maximum)
 
 
+def nmap_xml(item, maximum):
+    from .nmap import parse_nmap_xml
+    batch = parse_nmap_xml(item["payload"], _stamp(item))
+    _limit(sum(map(len, batch.values())), maximum)
+    return _annotate(batch, item)
+
+
 def public_signals(item, maximum):
     value = _json(item)
     records = value.get("items", value.get("records")) if isinstance(value, dict) else value
@@ -417,7 +424,7 @@ def public_signals(item, maximum):
     return _annotate({"articles": articles}, item)
 
 
-ADAPTERS = {"public_signals": public_signals, "auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source, "wigle_csv": wigle_csv}
+ADAPTERS = {"nmap_xml": nmap_xml, "public_signals": public_signals, "auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source, "wigle_csv": wigle_csv}
 
 
 def normalize(item, max_records=5000):

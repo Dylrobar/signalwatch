@@ -11,13 +11,14 @@ from .collectors import Collector
 from .cve_program import collect_cve_program
 from .csaf import collect_csaf
 from .network import collect_network
+from .nmap import collect_nmap
 from .osv import collect_osv
 
 
 log = logging.getLogger("signalwatch")
 
 SOURCE_INTERVALS = {
-    "news": 15, "threat": 15, "prerelease": 60,
+    "news": 15, "threat": 15, "prerelease": 60, "nmap": 1440,
     **{name: 360 for name in ("nvd", "kev", "epss", "github", "osv", "cve_program", "csaf")},
     "exposure": 10080, "developer": 10080, "corporate": 10080, "hardware": 43200,
 }
@@ -151,7 +152,7 @@ class Engine:
 
     async def _collect_source(self, name):
         adapters = {"osv": collect_osv, "cve_program": collect_cve_program,
-                    "csaf": collect_csaf, "network": collect_network}
+                    "csaf": collect_csaf, "network": collect_network, "nmap": collect_nmap}
         if name in EXTENSION_ADAPTERS:
             module, function = EXTENSION_ADAPTERS[name]
             adapter = getattr(importlib.import_module("." + module, __package__), function)

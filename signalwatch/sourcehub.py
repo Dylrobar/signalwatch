@@ -25,6 +25,7 @@ NATIVE = [
     ("cve_program", "CVE Program", "vulnerability", "https://www.cve.org/"),
     ("csaf", "Vendor CSAF", "vulnerability", "https://www.csaf.io/"),
     ("network", "RIPEstat routing", "network", "https://stat.ripe.net/"),
+    ("nmap", "Nmap port and service scans", "network", "https://nmap.org/"),
     ("wikidata", "Wikidata company websites", "corporate", "https://www.wikidata.org/"),
     ("news", "Security/vendor RSS", "threat", "https://github.com/Dylrobar/signalwatch#collection"),
     ("web", "Public websites and DNS", "network", "https://github.com/Dylrobar/signalwatch#collection"),
@@ -72,7 +73,8 @@ async def stage_payload(config, store, payload, *, provider, source_url="", cont
 
 def definitions():
     rows = [{"id": name, "name": label, "category": category, "family": name, "access": "native",
-             "description": "Existing native collector", "homepage": homepage, "required": []}
+             "description": "TCP quick (top 1000), full (all ports), or service_version scans over explicit targets" if name == "nmap" else "Existing native collector",
+             "homepage": homepage, "required": ["Scan targets"] if name == "nmap" else []}
             for name, label, category, homepage in NATIVE]
     for module, _ in EXTENSIONS.values():
         rows.extend(importlib.import_module("." + module, __package__).SOURCE_DEFINITIONS)
