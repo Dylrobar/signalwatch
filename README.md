@@ -184,7 +184,7 @@ Version 0.7.0 adds one durable `raw_ingress` table for heterogeneous inputs. Eve
 | `opaque` | Any bytes | Generic evidence with a bounded preview and raw-record reference |
 | `auto` | Recognized MIME type, JSON shape, or `metadata.record_type` | A supported adapter above; unknown input becomes opaque evidence |
 
-Adapters do not infer company ownership, hidden technologies, device vendors, or vulnerable deployments from DNS, documents, or MAC addresses. Those records remain evidence until explicit attribution/inventory connects them. Up to 5,000 normalized records may be produced by one item. Existing native collectors and SBOM imports retain their current ingestion/checkpoint paths; this queue accepts new raw inputs and explicit normalized batches.
+Adapters do not infer company ownership, hidden technologies, device vendors, or vulnerable deployments from DNS, documents, or MAC addresses. Those records remain evidence until explicit attribution/inventory connects them. Adapters cap parsed input records at 5,000 per item; derived entities and relationships may increase the normalized row count. Existing native collectors and SBOM imports retain their current ingestion/checkpoint paths; this queue accepts new raw inputs and explicit normalized batches.
 
 `POST /api/staging` returns HTTP 202 after durable enqueue. For example:
 
