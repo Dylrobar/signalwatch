@@ -1,0 +1,72 @@
+{
+  "Event": {
+    "uuid": "9c2ec5f6-afa1-4753-891b-d130b4539648",
+    "info": "nginx patch research CVE-2026-12345",
+    "date": "2026-10-16",
+    "timestamp": "1792108800",
+    "published": true,
+    "Orgc": {
+      "name": "Public Researcher",
+      "uuid": "55f6ea5e-2c60-40e5-964f-47a8950d210f"
+    },
+    "Tag": [
+      {
+        "name": "tlp:clear"
+      },
+      {
+        "name": "type:OSINT"
+      }
+    ],
+    "EventReport": [
+      {
+        "name": "Research note",
+        "content": "Vendor issued nginx patch for CVE-2026-12345. Exploit status unverified.",
+        "deleted": "0"
+      }
+    ],
+    "Attribute": [
+      {
+        "type": "vulnerability",
+        "value": "CVE-2026-12345",
+        "to_ids": false
+      },
+      {
+        "type": "ip-dst",
+        "value": "8.8.8.8",
+        "to_ids": false,
+        "comment": "Public DNS context, not a malicious verdict"
+      },
+      {
+        "type": "url",
+        "value": "https://indicator.example/payload",
+        "to_ids": true
+      },
+      {
+        "type": "malware-sample",
+        "value": "sample.bin|00000000000000000000000000000000",
+        "data": "ATTACHMENT_BODY_MUST_NOT_PROJECT"
+      },
+      {
+        "type": "attachment",
+        "value": "analysis.zip",
+        "data": "ATTACHMENT_BODY_MUST_NOT_PROJECT"
+      }
+    ],
+    "Object": [
+      {
+        "Attribute": [
+          {
+            "type": "sha256",
+            "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to_ids": true
+          },
+          {
+            "type": "domain",
+            "value": "EXAMPLE.NET.",
+            "to_ids": false
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -12,7 +12,7 @@ from email.parser import Parser
 from email.utils import parsedate_to_datetime
 from urllib.robotparser import RobotFileParser
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urljoin, urlsplit
 
 import feedparser
@@ -23,6 +23,8 @@ from .signal_filter import qualify_signal
 
 
 SOURCE_DEFINITIONS = [
+    {"id": "circl_misp", "name": "CIRCL Public MISP OSINT", "category": "threat", "family": "threat", "access": "public", "description": "Public MISP feed; at most two changed event documents per run from a seven-day modified window (four MiB each). Graph evidence excludes attachments; raw feed JSON retains original encoded fields.", "homepage": "https://www.circl.lu/doc/misp/feed-osint/", "required": []},
+    {"id": "greynoise_public", "name": "GreyNoise Public IP Context", "category": "threat", "family": "threat", "access": "public", "description": "No-key context for existing public IPv4 inventory only; at most eight requests per UTC day, spaced three hours apart. A missing observation is not a benign verdict.", "homepage": "https://docs.greynoise.io/docs/using-the-greynoise-community-api", "required": []},
     {"id": "fulldisclosure", "name": "Full Disclosure", "category": "threat", "family": "threat", "access": "public", "description": "Public disclosure mailing-list RSS; claims remain attributed news evidence.", "homepage": "https://seclists.org/fulldisclosure/", "required": []},
     {"id": "oss_security", "name": "OSS-Security", "category": "threat", "family": "threat", "access": "public", "description": "Public open-source security mailing-list RSS.", "homepage": "https://seclists.org/oss-sec/", "required": []},
     {"id": "zdi_upcoming", "name": "ZDI Upcoming Advisories", "category": "threat", "family": "threat", "access": "public", "description": "Upcoming vendor-notified disclosures; no CVE or exploitability is invented.", "homepage": "https://www.zerodayinitiative.com/rss/", "required": []},
@@ -68,6 +70,144 @@ ARCHIVES = {
     "oss_security": ("https://www.openwall.com/lists/oss-security/", "oss-security"),
     "fulldisclosure": ("https://lists.openwall.net/full-disclosure/", "full-disclosure"),
 }
+MISP_ROOT = "https://www.circl.lu/doc/misp/feed-osint/"
+MISP_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _misp_manifest(payload):
+    from .normalization import NormalizationError
+    value = _json(payload)
+    if not isinstance(value, dict) or len(value) > 20000:
+        raise NormalizationError("MISP manifest requires a bounded event map")
+    for key, row in value.items():
+        if (not MISP_UUID.fullmatch(key) or not isinstance(row, dict)
+                or isinstance(row.get("timestamp"), bool)
+                or not str(row.get("timestamp", "")).isdigit()):
+            raise NormalizationError("MISP manifest contains an invalid event identifier or timestamp")
+    return value
+
+
+def _misp_event(payload, expected=None):
+    from .normalization import NormalizationError
+    value = _json(payload)
+    event = value.get("Event") if isinstance(value, dict) else None
+    if (not isinstance(event, dict) or not isinstance(event.get("uuid"), str)
+            or not MISP_UUID.fullmatch(event["uuid"]) or not isinstance(event.get("info"), str)
+            or not event["info"].strip() or event.get("published") not in (True, 1, "1")):
+        raise NormalizationError("MISP feed lacks a published event with UUID and title")
+    if expected and event["uuid"] != expected:
+        raise NormalizationError("MISP event UUID does not match the manifest request")
+    for key in ("Attribute", "Object", "EventReport", "Tag"):
+        if key in event and (not isinstance(event[key], list) or any(not isinstance(row, dict) for row in event[key])):
+            raise NormalizationError("MISP event contains an invalid " + key + " array")
+    return event
+
+
+def _misp_indicator(row):
+    if row.get("deleted") in (True, 1, "1") or not isinstance(row.get("value"), str) or not isinstance(row.get("type"), str):
+        return None
+    kind, value = row.get("type"), row["value"].strip()
+    if not value or len(value) > 4096:
+        return None
+    if kind in {"ip-src", "ip-dst"}:
+        try:
+            value = str(ipaddress.ip_address(value))
+        except ValueError:
+            return None
+    elif kind in {"domain", "hostname"}:
+        try:
+            value = value.rstrip(".").encode("idna").decode().lower()
+        except UnicodeError:
+            return None
+        if len(value) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in value.split(".")):
+            return None
+    elif kind == "url":
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return None
+    elif kind in {"md5", "sha1", "sha256", "sha512"}:
+        if not re.fullmatch(r"[0-9a-fA-F]{" + str({"md5": 32, "sha1": 40, "sha256": 64, "sha512": 128}[kind]) + "}", value):
+            return None
+        value = value.lower()
+    else:
+        return None
+    return kind, value
+
+
+def _normalize_misp(item, maximum):
+    from .normalization import _annotate
+    metadata = item.get("metadata") or {}
+    if metadata.get("format") == "misp_manifest":
+        _misp_manifest(item["payload"])
+        return {"entities": [], "edges": [], "articles": []}
+    event = _misp_event(item["payload"], metadata.get("event_uuid"))
+    source_url = MISP_ROOT + event["uuid"] + ".json"
+    reports = [{"name": _clean(row.get("name"), 500), "content": _clean(row.get("content"), 8000)}
+               for row in event.get("EventReport", [])[:8] if row.get("deleted") not in (True, 1, "1")]
+    tags = [_clean(row.get("name"), 300) for row in event.get("Tag", [])[:100] if row.get("name")]
+    organization = event.get("Orgc") if isinstance(event.get("Orgc"), dict) else {}
+    summary = _clean(" ".join(row["content"] for row in reports))
+    text = event["info"] + " " + summary
+    signal = qualify_signal(text, metadata.get("watch_products") or [], metadata.get("exploit_keywords") or [])
+    event_id = "source_record:misp:" + event["uuid"]
+    entities = [{"id": event_id, "kind": "source_record", "name": _clean(event["info"], 1000), "value": event["uuid"],
+                 "source_url": source_url, "confidence": 1.0, "metadata": {
+                     "provider": "circl_misp", "record_type": "public_misp_event", "claim_type": "attributed_public_threat_report",
+                     "published": _published(event.get("date")), "modified": _published(int(event["timestamp"])) if str(event.get("timestamp", "")).isdigit() else None,
+                     "organization": {key: _clean(organization.get(key), 300) for key in ("name", "uuid")}, "tags": tags,
+                     "tlp": [tag for tag in tags if tag.lower().startswith("tlp:")], "reports": reports,
+                     "qualification": signal, "ownership_verified": False, "exploit_verified": False,
+                     "attachments_projected": False, "raw_feed_may_contain_encoded_attachments": True}}]
+    edges, articles = [], []
+    attributes = list(event.get("Attribute", []))
+    for obj in event.get("Object", [])[:1000]:
+        if obj.get("deleted") in (True, 1, "1"):
+            continue
+        rows = obj.get("Attribute", [])
+        if isinstance(rows, list):
+            attributes.extend(row for row in rows if isinstance(row, dict))
+    attributes_clipped = len(attributes) > 10000
+    attributes = attributes[:10000]
+    cves = set(value.upper() for value in CVE_RE.findall(text))
+    for row in attributes:
+        if row.get("type") == "vulnerability" and row.get("deleted") not in (True, 1, "1") and isinstance(row.get("value"), str):
+            cves.update(value.upper() for value in CVE_RE.findall(row["value"]))
+    cves = sorted(cves)[:20]
+    if maximum > 1:
+        articles.append({"url": source_url, "title": _clean(event["info"], 1000), "summary": summary,
+                         "published": _published(event.get("date")), "source": DEFINITIONS["circl_misp"]["name"],
+                         "feed_url": MISP_ROOT + "manifest.json", "guid": event["uuid"], "cves": cves, "_signal": signal})
+    def room():
+        return maximum - len(entities) - len(edges) - len(articles)
+    for cve in cves:
+        if room() < 2:
+            break
+        entities.append({"id": cve, "kind": "vulnerability", "name": cve, "value": cve, "_reference_only": True,
+                         "metadata": {"reference_only": True, "evidence_role": "community_cve_reference"}, "source_url": source_url})
+        edges.append({"from_id": event_id, "to_id": cve, "relation": "mentions", "source_url": source_url, "confidence": 1.0})
+    seen = set()
+    record_limit = min(200, max(1, int(metadata.get("record_limit") or 100)))
+    for row in attributes:
+        indicator = _misp_indicator(row)
+        if not indicator or indicator in seen:
+            continue
+        if room() < 2 or len(seen) >= record_limit:
+            break
+        seen.add(indicator)
+        kind, value = indicator
+        identifier = "threat_indicator:misp:" + hashlib.sha256((event["uuid"] + "\0" + kind + "\0" + value).encode()).hexdigest()
+        entities.append({"id": identifier, "kind": "threat_indicator", "name": value[:1000], "value": value, "source_url": source_url,
+                         "confidence": 1.0, "metadata": {"provider": "circl_misp", "record_type": "reported_observable", "indicator_type": kind,
+                         "to_ids": row.get("to_ids") in (True, 1, "1"), "comment": _clean(row.get("comment"), 1000),
+                         "event_uuid": event["uuid"], "ownership_verified": False, "exploit_verified": False}})
+        edges.append({"from_id": event_id, "to_id": identifier, "relation": "reports_observable", "source_url": source_url, "confidence": 1.0})
+    supported = {_misp_indicator(row) for row in attributes} - {None}
+    entities[0]["metadata"].update(attributes_seen=len(attributes), attributes_clipped=attributes_clipped, observables_projected=len(seen),
+                                    record_limit=record_limit, projection_clipped=attributes_clipped or len(seen) < len(supported))
+    return _annotate({"entities": entities, "edges": edges, "articles": articles}, item)
 
 
 def _archive_url(provider, url, *, message=False):
@@ -288,6 +428,12 @@ def _records(item, limit):
     if provider not in DEFINITIONS:
         raise NormalizationError("Unknown public threat-source provider")
     format_name = metadata.get("format", "")
+    if provider == "circl_misp":
+        if format_name == "misp_manifest":
+            _misp_manifest(payload)
+            return []
+        event = _misp_event(payload, metadata.get("event_uuid"))
+        return [{"title": event["info"], "summary": " ".join(_clean(row.get("content")) for row in event.get("EventReport", [])[:8])}]
     if format_name == "mail_archive_index":
         _archive_links(payload, provider, item["source_url"], min(limit, 8))
         return []
@@ -306,7 +452,7 @@ def _records(item, limit):
         raise NormalizationError("Credentialed threat API response lacks its data array")
     if provider == "mastodon" and not isinstance(value, list):
         raise NormalizationError("Mastodon response lacks a public status array")
-    if provider == "greynoise":
+    if provider in {"greynoise", "greynoise_public"}:
         if not isinstance(value, dict) or not isinstance(value.get("ip"), str) or not isinstance(value.get("noise"), bool):
             raise NormalizationError("GreyNoise response lacks IP context")
         try:
@@ -394,6 +540,8 @@ def normalize_threat(item, max_records=5000):
     limit = min(max_records, int(metadata.get("record_limit") or 100))
     if limit < 1:
         raise ValueError("Threat normalization record limit must be positive")
+    if provider == "circl_misp":
+        return _normalize_misp(item, max_records)
     records = _records(item, limit)
     articles, entities, edges = [], [], []
     for record in records:
@@ -483,6 +631,137 @@ def _request(provider, settings, credential, limit):
     return request_url, source_url, headers, params, format_name
 
 
+async def _collect_misp(config, store, http, stamp, limit, max_bytes, metadata):
+    from .http import public_error
+    from .sourcehub import stage_payload
+    provider = "circl_misp"
+    source_url = MISP_ROOT + "manifest.json"
+    response = await http.get(source_url, headers={"Accept": "application/json"}, max_bytes=min(max_bytes, 2 * 1024 * 1024),
+                              allow_redirects=False, max_attempts=2)
+    payload = await asyncio.to_thread(response.path.read_bytes)
+    manifest = _misp_manifest(payload)
+    queued = await stage_payload(config, store, payload, provider=provider, source_url=source_url,
+                                 stream_key=provider + ":manifest", metadata={**metadata, "format": "misp_manifest"})
+    old = await asyncio.to_thread(store.source_state, "provider:" + provider)
+    versions = dict(old.get("event_versions") or {})
+    hashes = dict(old.get("event_hashes") or {})
+    retry = dict(old.get("event_retry_at") or {})
+    current = datetime.fromisoformat(stamp)
+    cutoff = (current - timedelta(days=7)).timestamp()
+    eligible = sorted(((key, row) for key, row in manifest.items() if cutoff <= int(row["timestamp"]) <= current.timestamp() + 300),
+                      key=lambda value: (int(value[1]["timestamp"]), value[0]), reverse=True)
+    unresolved = [(key, row) for key, row in eligible if versions.get(key) != str(row["timestamp"])]
+    deferred = [(key, row) for key, row in unresolved if retry.get(key, "") > stamp]
+    pending = [(key, row) for key, row in unresolved if retry.get(key, "") <= stamp]
+    selected = pending[:2]
+    staged, duplicates, records, qualified = int(not queued.get("duplicate")), int(bool(queued.get("duplicate"))), 0, 0
+    errors = []
+    for uuid, row in selected:
+        url = MISP_ROOT + uuid + ".json"
+        try:
+            response = await http.get(url, headers={"Accept": "application/json"}, max_bytes=min(max_bytes, 4 * 1024 * 1024),
+                                      allow_redirects=False, max_attempts=2)
+            event_payload = await asyncio.to_thread(response.path.read_bytes)
+            _misp_event(event_payload, uuid)
+            event_metadata = {**metadata, "format": "misp_event", "event_uuid": uuid, "manifest_timestamp": str(row["timestamp"]),
+                              "coverage_window_days": 7, "attachment_projection": "omitted; original raw JSON retained"}
+            queued = await stage_payload(config, store, event_payload, provider=provider, source_url=url,
+                                         stream_key=provider + ":" + uuid, metadata=event_metadata)
+            staged += int(not queued.get("duplicate"))
+            duplicates += int(bool(queued.get("duplicate")))
+            record = _records({"payload": event_payload, "source_url": url, "metadata": event_metadata}, limit)[0]
+            qualified += int(qualify_signal(_clean(record["title"]) + " " + _clean(record["summary"]),
+                                            metadata["watch_products"], metadata["exploit_keywords"])["qualified"])
+            records += 1
+            versions[uuid] = str(row["timestamp"])
+            hashes[uuid] = hashlib.sha256(event_payload).hexdigest()
+            retry.pop(uuid, None)
+        except Exception as error:
+            retry[uuid] = (current + timedelta(minutes=30)).isoformat()
+            errors.append(uuid + ": " + public_error(error))
+    allowed = {key for key, _ in eligible}
+    versions = {key: value for key, value in versions.items() if key in allowed}
+    hashes = {key: value for key, value in hashes.items() if key in allowed}
+    retry = {key: value for key, value in retry.items() if key in allowed}
+    error = "; ".join(errors)[:500]
+    if not error and deferred:
+        error = old.get("error") or "MISP event retrieval is awaiting retry after failure"
+    result = {"status": "partial" if errors or deferred else "ok" if records else "unchanged", "checked_at": stamp,
+              "last_success": stamp if records else old.get("last_success"), "deferred": bool(deferred) and not selected, "requirements": [],
+              "staged": staged, "duplicates": duplicates, "records": records, "qualified": qualified, "filtered": records - qualified,
+              "qualification_only": True, "error": error, "event_versions": versions, "event_hashes": hashes, "event_retry_at": retry,
+              "window_days": 7, "eligible_events": len(eligible), "pending_events": max(0, len(unresolved) - records), "deferred_events": len(deferred),
+              "event_document_limit": 2, "event_payload_limit_bytes": min(max_bytes, 4 * 1024 * 1024)}
+    await asyncio.to_thread(store.update_source, "provider:" + provider, **result)
+    return result
+
+
+def _reserve_public_greynoise(store, stamp):
+    current = datetime.fromisoformat(stamp)
+    key = "provider:greynoise_public"
+    def routable(value):
+        try:
+            address = ipaddress.ip_address(value)
+            return address.version == 4 and address.is_global
+        except ValueError:
+            return False
+    with store.connection(write=True) as conn:
+        row = conn.execute("SELECT state FROM sources WHERE name=?", (key,)).fetchone()
+        previous = json.loads(row[0]) if row else {}
+        day = current.date().isoformat()
+        count = int(previous.get("daily_requests") or 0) if previous.get("request_day") == day else 0
+        if count >= 8 or previous.get("retry_at", "") > stamp:
+            return None, {"status": "unchanged", "checked_at": stamp, "requirements": [], "deferred": True,
+                          "reason": "Public API daily/request interval budget", "staged": 0, "records": 0,
+                          "qualified": 0, "filtered": 0, "error": ""}
+        conn.create_function("public_ipv4", 1, routable, deterministic=True)
+        cursor = str(previous.get("ip_cursor") or "")
+        query = "SELECT value FROM entities WHERE kind='ip' AND public_ipv4(value)=1 AND value>? GROUP BY value ORDER BY value LIMIT 1"
+        target = conn.execute(query, (cursor,)).fetchone() or conn.execute(query, ("",)).fetchone()
+        if not target:
+            return None, {"status": "unchanged", "checked_at": stamp, "requirements": [], "deferred": False,
+                          "reason": "No public IPv4 inventory to enrich", "staged": 0, "records": 0, "qualified": 0, "filtered": 0, "error": ""}
+        address = str(ipaddress.ip_address(target[0]))
+        previous.update(request_day=day, daily_requests=count + 1, ip_cursor=address,
+                        retry_at=(current + timedelta(hours=3)).isoformat())
+        conn.execute("INSERT INTO sources(name,state) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET state=excluded.state",
+                     (key, json.dumps(previous, separators=(",", ":"))))
+        return address, previous
+
+
+async def _collect_public_greynoise(config, store, http, stamp, metadata, max_bytes):
+    from .http import HTTPError
+    from .sourcehub import stage_payload
+    address, reserved = await asyncio.to_thread(_reserve_public_greynoise, store, stamp)
+    if address is None:
+        await asyncio.to_thread(store.update_source, "provider:greynoise_public", **reserved)
+        return reserved
+    url = "https://api.greynoise.io/v3/community/" + address
+    try:
+        response = await http.get(url, headers={"Accept": "application/json"}, max_bytes=min(max_bytes, 64 * 1024),
+                                  allow_redirects=False, max_attempts=1, cache=False)
+    except HTTPError as error:
+        if error.status != 404:
+            if error.status == 429:
+                retry_at = (datetime.fromisoformat(stamp) + timedelta(seconds=max(86400, error.retry_after or 0))).isoformat()
+                await asyncio.to_thread(store.update_source, "provider:greynoise_public", retry_at=retry_at)
+            raise
+        outcome = {"status": "ok", "checked_at": stamp, "last_success": stamp, "deferred": False, "requirements": [],
+                   "staged": 0, "records": 0, "qualified": 0, "filtered": 0, "error": "", "last_ip": address,
+                   "lookup_status": "no_observation", "http_status": 404, "verdict": "unknown"}
+    else:
+        payload = await asyncio.to_thread(response.path.read_bytes)
+        item_metadata = {**metadata, "format": "json", "ip": address}
+        _records({"payload": payload, "source_url": url, "metadata": item_metadata}, 1)
+        queued = await stage_payload(config, store, payload, provider="greynoise_public", source_url=url,
+                                     stream_key="greynoise_public:" + address, metadata=item_metadata)
+        outcome = {"status": "unchanged" if queued.get("duplicate") else "ok", "checked_at": stamp, "last_success": stamp,
+                   "deferred": False, "requirements": [], "staged": int(not queued.get("duplicate")), "records": 1,
+                   "qualified": 0, "filtered": 1, "error": "", "last_ip": address, "lookup_status": "observed_context", "http_status": 200}
+    await asyncio.to_thread(store.update_source, "provider:greynoise_public", **outcome)
+    return outcome
+
+
 async def collect_threat_sources(config, store, http):
     from .sourcehub import stage_payload
     from .http import HTTPError, PublicRequestError, display_url, public_error
@@ -526,6 +805,11 @@ async def collect_threat_sources(config, store, http):
             staged = None
             try:
                 local = dict(settings)
+                metadata = {"provider": provider, "format": "json", "record_limit": limit, "watch_products": products, "exploit_keywords": indicators}
+                if provider == "circl_misp":
+                    return provider, await _collect_misp(config, store, http, stamp, limit, max_bytes, metadata)
+                if provider == "greynoise_public":
+                    return provider, await _collect_public_greynoise(config, store, http, stamp, metadata, max_bytes)
                 if provider == "greynoise":
                     old = await asyncio.to_thread(store.source_state, "provider:" + provider)
                     ips = list(settings.get("ips") or [])

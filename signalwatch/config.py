@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 
 DEFAULTS = {
@@ -68,7 +68,11 @@ DEFAULTS = {
                        {"name": "Microsoft", "domain": "microsoft.com", "github_org": "microsoft", "cik": "0000789019"}],
     "watch_products": [],
     "exploit_keywords": ["exploit", "zero-day", "zero day", "rce", "remote code execution", "security fix", "security patch", "actively exploited", "authentication bypass", "memory corruption"],
-    "provider_settings": {"crtsh": {"enabled": True}, "dns_txt": {"enabled": True},
+    "provider_settings": {"ctlogs": {"enabled": True}, "certspotter": {"enabled": False},
+                          "crtsh": {"enabled": True}, "dns_txt": {"enabled": True},
+                          "gleif": {"enabled": True}, "corporate_discovery": {"enabled": True},
+                          "importyeti_public": {"enabled": True},
+                          "circl_misp": {"enabled": True}, "greynoise_public": {"enabled": True},
                           "fulldisclosure": {"enabled": True}, "oss_security": {"enabled": True},
                           "zdi_published": {"enabled": True}, "zdi_upcoming": {"enabled": True},
                           "dark_reading": {"enabled": True}, "apple_security": {"enabled": True},

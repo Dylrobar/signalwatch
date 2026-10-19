@@ -8,7 +8,8 @@ import re
 import time
 import zipfile
 from datetime import datetime, timezone
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
 from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
@@ -18,12 +19,15 @@ SOURCE_DEFINITIONS = [
     {"id": provider, "name": name, "category": "corporate", "family": "corporate", "access": access,
      "description": description, "homepage": homepage, "required": required}
     for provider, name, access, description, homepage, required in [
-        ("greenhouse", "Greenhouse public job boards", "public", "Published jobs from explicitly configured board IDs; hiring text is evidence, not verified deployment.", "https://docs.greenhouse.io/job-board", ["source_targets.greenhouse_board"]),
-        ("lever", "Lever public postings", "public", "Published jobs from configured Lever sites, including the EU endpoint; no employment or deployment inference.", "https://github.com/lever/postings-api", ["source_targets.lever_site"]),
+        ("corporate_discovery", "Company public evidence discovery", "public", "Discover linked public job boards and document URLs from configured company domains, with bounded weekly rotation; links remain evidence rather than deployment claims.", "https://github.com/Dylrobar/signalwatch", ["source_targets.domain"]),
+        ("gleif", "GLEIF legal entities and reported parents", "public", "Keyless LEI legal-name search and reported direct/ultimate parent relationships; name matches remain identity candidates.", "https://www.gleif.org/en/lei-data/gleif-api/", ["source_targets.name"]),
+        ("importyeti_public", "ImportYeti public company tables", "public", "Visible public supplier, HTS, and recent shipment tables from company-name candidate pages; locked fields and search APIs are not requested and shipments do not establish installed infrastructure.", "https://www.importyeti.com/", ["source_targets.name"]),
+        ("greenhouse", "Greenhouse public job boards", "public", "Published jobs from configured or company-linked board IDs; hiring text is evidence, not verified deployment.", "https://docs.greenhouse.io/job-board", ["source_targets.domain or greenhouse_board"]),
+        ("lever", "Lever public postings", "public", "Published jobs from configured or company-linked Lever sites, including EU boards; no employment or deployment inference.", "https://github.com/lever/postings-api", ["source_targets.domain or lever_site"]),
         ("sec_edgar", "SEC EDGAR submissions", "public", "Current filer metadata and bounded recent filing metadata for configured CIKs; older filing archives are not automatically followed.", "https://www.sec.gov/search-filings/edgar-application-programming-interfaces", ["source_targets.cik", "provider_settings.sec_edgar.user_agent"]),
         ("opencorporates", "OpenCorporates", "api_key", "Credentialed company-name search results remain registry evidence requiring identity review.", "https://api.opencorporates.com/documentation/API-Reference", ["provider_credentials.opencorporates", "source_targets.name"]),
         ("sam_gov", "SAM.gov public entity registrations", "api_key", "Credentialed public entity-registration search; no sensitive or FOUO sections are requested.", "https://open.gsa.gov/api/entity-api/", ["provider_credentials.sam_gov", "source_targets.name"]),
-        ("company_documents", "Public company document metadata", "public", "Extract PDF and OOXML properties from explicitly configured document URLs; producer software does not establish deployed technology or OS.", "https://pypdf.readthedocs.io/en/stable/user/metadata.html", ["source_targets.document_urls"]),
+        ("company_documents", "Public company document metadata", "public", "Extract PDF and OOXML properties from configured or company-linked document URLs; producer software does not establish deployed technology or OS.", "https://pypdf.readthedocs.io/en/stable/user/metadata.html", ["source_targets.domain or document_urls"]),
         ("public_procurement", "Configured public procurement exports", "configured_url", "Fetch an explicitly configured public JSON, CSV, or text export as procurement evidence without inferring ownership or deployment.", "https://www.usaspending.gov/", ["provider_settings.public_procurement.url"]),
         ("freight_exports", "Configured public freight exports", "configured_url", "Fetch an explicitly configured public freight or trade export as evidence; supplier names do not assign infrastructure ownership.", "https://www.census.gov/foreign-trade/", ["provider_settings.freight_exports.url"]),
         ("indeed", "Indeed exports", "import", "Import an authorized export or supplied record; no unrestricted search API or working site scraper is claimed.", "https://docs.indeed.com/", ["import"]),
@@ -38,6 +42,7 @@ _DEFINITIONS = {definition["id"]: definition for definition in SOURCE_DEFINITION
 _IMPORTS = {definition["id"] for definition in SOURCE_DEFINITIONS if definition["access"] == "import"}
 _SLUG = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 _CIK = re.compile(r"\d{1,10}\Z")
+_LEI = re.compile(r"[A-Z0-9]{18}\d{2}\Z")
 _XML_MEMBERS = ("docProps/core.xml", "docProps/app.xml", "docProps/custom.xml")
 _MAX_XML = 1024 * 1024
 
@@ -88,6 +93,8 @@ def _record(item, provider, identity, name, fields, *, kind="corporate_record", 
                            "fields": compact_fields, "deployment_verified": False, "ownership_verified": False,
                            "coverage_truncated": bool(truncated), "staging": provenance},
               "source_url": source_url, "observed_at": provenance["observed_at"], "confidence": 1.0}
+    if metadata.get("discovered_from"):
+        entity["metadata"]["discovered_from"] = metadata["discovered_from"]
     edge = None
     if context.get("company_id"):
         edge = {"from_id": context["company_id"], "to_id": entity_id, "relation": "has_public_evidence",
@@ -170,6 +177,234 @@ def _registry(provider, payload, maximum):
             identity, title = str(value["ueiSAM"]), value["legalBusinessName"]
         records.append((identity, title, fields, "corporate_record", "registry_search_candidate"))
     return records, len(rows) > maximum or (isinstance(total, (int, float)) and total > len(rows))
+
+
+def _gleif(item, payload, maximum):
+    if not isinstance(payload, dict) or "data" not in payload:
+        raise ValueError("GLEIF response lacks JSON API data")
+    data = payload["data"]
+    rows = data if isinstance(data, list) else [] if data is None else [data]
+    meta, links = payload.get("meta") or {}, payload.get("links") or {}
+    if not isinstance(meta, dict) or not isinstance(links, dict):
+        raise ValueError("GLEIF response metadata and links must be objects")
+    pagination = meta.get("pagination", {})
+    truncated = bool(links.get("next")) or len(rows) > maximum
+    if isinstance(pagination, dict) and isinstance(pagination.get("total"), int):
+        truncated = truncated or pagination["total"] > len(rows)
+    entities, edges = [], []
+    metadata = item.get("metadata") or {}
+    child, relation = metadata.get("gleif_child_lei"), metadata.get("gleif_relation")
+    if child is not None and (not isinstance(child, str) or not _LEI.fullmatch(child) or relation not in {"direct-parent", "ultimate-parent"}):
+        raise ValueError("GLEIF parent context is invalid")
+    for row in rows[:maximum]:
+        if not isinstance(row, dict) or row.get("type") != "lei-records" or not _LEI.fullmatch(str(row.get("id", ""))):
+            raise ValueError("GLEIF result lacks a legal entity identifier")
+        attributes = row.get("attributes")
+        if not isinstance(attributes, dict) or not isinstance(attributes.get("entity"), dict):
+            raise ValueError("GLEIF result lacks legal entity attributes")
+        legal_name = attributes["entity"].get("legalName")
+        if not isinstance(legal_name, dict) or not isinstance(legal_name.get("name"), str) or not legal_name["name"].strip():
+            raise ValueError("GLEIF result lacks a legal name")
+        if attributes.get("lei") != row["id"]:
+            raise ValueError("GLEIF identifier differs from its attributes")
+        fields = {key: attributes[key] for key in ("lei", "entity", "registration", "bic", "ocid") if key in attributes}
+        entity, _ = _record(item, "gleif", row["id"], legal_name["name"], fields,
+                            kind="legal_entity", role="registry_parent_record" if child else "registry_search_candidate", truncated=truncated)
+        entity["id"] = "legal_entity:lei:" + row["id"]
+        entities.append(entity)
+        if child:
+            if child == row["id"]:
+                raise ValueError("GLEIF parent cannot be the child itself")
+            edges.append({"from_id": "legal_entity:lei:" + child, "to_id": entity["id"],
+                          "relation": "reported_" + relation.replace("-", "_"), "source_url": item.get("source_url") or "",
+                          "observed_at": entity["observed_at"], "confidence": 1.0})
+        elif entity["metadata"]["company_context"].get("company_id"):
+            edges.append({"from_id": entity["metadata"]["company_context"]["company_id"], "to_id": entity["id"],
+                          "relation": "registry_candidate", "source_url": item.get("source_url") or "",
+                          "observed_at": entity["observed_at"], "confidence": 1.0})
+    return {"entities": entities, "edges": edges}
+
+
+def _importyeti(payload, maximum, target):
+    soup = BeautifulSoup(payload.decode("utf-8", errors="replace"), "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if "Import Yeti" not in title and "ImportYeti" not in title:
+        raise ValueError("ImportYeti response lacks a public company report")
+    title = " ".join(title.split())
+    company_name = title.split(" - ", 1)[0].strip()
+    normalized = lambda value: re.sub(r"[^a-z0-9]", "", str(value).lower())
+    if not target.get("name") or normalized(company_name) != normalized(target["name"]):
+        return [], False
+    title_parts = title.split(" - ")
+    address = title_parts[1] if len(title_parts) >= 4 and "company report" in title_parts[-2].lower() else None
+    tables = []
+    for table in soup.find_all("table", limit=20):
+        headers = [_plain(cell.get_text(" ", strip=True), 200) for cell in table.find_all("th", limit=20)]
+        kind = "shipments" if "Bill of Lading" in headers else "hts_products" if "HTS Code" in headers else "suppliers" if any(header.startswith("Suppliers Country") for header in headers) else None
+        if not kind:
+            continue
+        rows = []
+        for row in table.find_all("tr", limit=maximum + 2):
+            values = [re.sub(r"[\u200b-\u200f\ufeff]", "", cell.get_text(" ", strip=True)).strip()[:2000] for cell in row.find_all("td", recursive=False)]
+            if values:
+                rows.append(values)
+        tables.append((kind, headers, rows))
+    if not tables:
+        raise ValueError("ImportYeti company report lacks visible trade tables")
+    records = []
+    total = sum(len(rows) for _, _, rows in tables)
+    for kind, headers, rows in tables:
+        for values in rows:
+            record_key = re.sub(r"\s*\(free\)\s*", " ", values[1]).strip() if kind == "shipments" and len(values) > 1 else values[0]
+            identity = hashlib.sha256(json.dumps([kind, normalized(company_name), record_key], ensure_ascii=False).encode()).hexdigest()
+            fields = {"company_report": title[:500], "company_name": company_name, "reported_address": address,
+                      "table": kind, "columns": headers, "values": values,
+                      "visible_public_fields_only": True, "identity_match": "name_candidate", "installed_infrastructure": False}
+            records.append((identity, kind.replace("_", " ") + " · " + values[0], fields, "freight_record", "freight_search_candidate"))
+            if len(records) >= maximum:
+                return records, total > maximum
+    return records, total > maximum
+
+
+def _discovered_links(payload, page_url, domain):
+    soup = BeautifulSoup(payload.decode("utf-8", errors="replace"), "html.parser")
+    found = {"boards": [], "document_urls": [], "pages": [], "ciks": []}
+    seen = set()
+    for link in soup.find_all(["a", "iframe"], limit=3000):
+        value = link.get("href") if link.name == "a" else link.get("src")
+        if not isinstance(value, str):
+            continue
+        try:
+            location = _public_url(urljoin(page_url, value))
+        except (TypeError, ValueError):
+            continue
+        if location in seen:
+            continue
+        seen.add(location)
+        parsed = urlsplit(location)
+        host, parts = (parsed.hostname or "").lower(), parsed.path.strip("/").split("/")
+        slug = None
+        provider, region = None, "global"
+        if host in {"boards.greenhouse.io", "job-boards.greenhouse.io", "boards.eu.greenhouse.io"}:
+            provider, slug = "greenhouse", parts[0]
+            if parts[0] == "embed":
+                slug = parse_qs(parsed.query).get("for", [None])[0]
+        elif host in {"jobs.lever.co", "jobs.eu.lever.co"}:
+            provider, slug = "lever", parts[0]
+            region = "eu" if host == "jobs.eu.lever.co" else "global"
+        if host in {"www.sec.gov", "sec.gov"}:
+            cik = parse_qs(parsed.query).get("CIK", parse_qs(parsed.query).get("cik", [None]))[0]
+            archive = re.match(r"/Archives/edgar/data/(\d{1,10})(?:/|$)", parsed.path)
+            cik = cik or (archive.group(1) if archive else None)
+            if isinstance(cik, str) and _CIK.fullmatch(cik) and int(cik) and str(int(cik)).zfill(10) not in found["ciks"]:
+                found["ciks"].append(str(int(cik)).zfill(10))
+        if provider and isinstance(slug, str) and _SLUG.fullmatch(slug):
+            board = {"provider": provider, "slug": slug, "region": region, "url": location, "linked_from": page_url}
+            if not any(row["provider"] == provider and row["slug"] == slug and row["region"] == region for row in found["boards"]):
+                found["boards"].append(board)
+        if host == domain or host.endswith("." + domain):
+            if parsed.path.lower().endswith((".pdf", ".docx", ".xlsx", ".pptx")) and len(found["document_urls"]) < 4:
+                found["document_urls"].append(location)
+            elif re.search(r"careers?|jobs|about|investor|reports?", parsed.path, re.I) and len(found["pages"]) < 8:
+                found["pages"].append(location)
+    found["boards"] = found["boards"][:4]
+    return found
+
+
+async def _discover(config, store, http, state):
+    from .http import HTTPError
+    from .sourcehub import stage_payload
+    options = (config.get("provider_settings") or {}).get("corporate_discovery") or {}
+    targets = config.get("source_targets") or []
+    if not isinstance(targets, list) or any(not isinstance(target, dict) for target in targets):
+        raise ValueError("source_targets must be a list of company target objects")
+    derived, errors, attempted, staged = [], [], 0, 0
+    cache = dict(state.get("discovery") or {})
+    candidates = []
+    for target in targets:
+        domain = target.get("domain")
+        if isinstance(domain, str) and re.fullmatch(r"(?=.{1,253}\Z)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", domain):
+            candidates.append((target, domain.lower().rstrip(".")))
+    if options.get("enabled") is False or not candidates:
+        return targets, state, None
+    now, maximum = time.time(), max(1, min(10, int(config.get("public_source_batch", 3))))
+    cursor = int(state.get("discovery_cursor", 0)) % len(candidates)
+    selected = (candidates[cursor:] + candidates[:cursor])[:maximum]
+    for target, domain in selected:
+        cached = cache.get(domain) or {}
+        if now - float(cached.get("checked_at", 0)) < 7 * 86400:
+            continue
+        attempted += 1
+        found = {"boards": [], "document_urls": [], "pages": [], "ciks": []}
+        pages, robots = ["https://" + domain + "/"], {}
+        try:
+            for index in range(2):
+                if index >= len(pages):
+                    break
+                url = pages[index]
+                origin = urlunsplit((*urlsplit(url)[:2], "", "", ""))
+                if origin not in robots:
+                    parser = RobotFileParser(origin + "/robots.txt")
+                    try:
+                        response = await http.get(origin + "/robots.txt", max_bytes=128 * 1024, max_attempts=1)
+                        parser.parse((await asyncio.to_thread(response.path.read_text, errors="replace")).splitlines())
+                    except HTTPError as error:
+                        if error.status == 404:
+                            parser.parse([])
+                        else:
+                            raise
+                    robots[origin] = parser
+                parser = robots[origin]
+                agent = config.get("user_agent", "SignalWatch").split("/", 1)[0]
+                if not parser.can_fetch(agent, url):
+                    raise ValueError("Company robots.txt disallows discovery")
+                if index:
+                    delay = min(30, parser.crawl_delay(agent) or 0)
+                    if delay:
+                        await asyncio.sleep(delay)
+                response = await http.get(url, max_bytes=2 * 1024 * 1024, max_attempts=1)
+                final_url = _public_url(getattr(response, "url", url))
+                final_host = (urlsplit(final_url).hostname or "").lower()
+                if final_host != domain and not final_host.endswith("." + domain):
+                    raise ValueError("Company page redirects outside its configured domain")
+                payload = await asyncio.to_thread(response.path.read_bytes)
+                content_type = next((value for key, value in response.headers.items() if key.lower() == "content-type"), "")
+                if "html" not in content_type.lower() and b"<html" not in payload[:1000].lower():
+                    raise ValueError("Company discovery response is not HTML")
+                links = _discovered_links(payload, final_url, domain)
+                for key in found:
+                    found[key].extend(value for value in links[key] if value not in found[key])
+                pages.extend(value for value in links["pages"] if value not in pages)
+                body = json.dumps({"records": [{"id": final_url, "name": "Company-linked public sources", "links": links}]}, sort_keys=True).encode()
+                queued = await stage_payload(config, store, body, provider="corporate_discovery", source_url=final_url,
+                                             metadata={"target": {key: target[key] for key in ("name", "domain", "company_id") if target.get(key)}})
+                staged += int(not queued.get("duplicate", False))
+            cache[domain] = {"checked_at": now, **found}
+        except Exception as error:
+            status = getattr(error, "status", None)
+            errors.append(domain + ": " + ("HTTP " + str(status) if isinstance(status, int) else type(error).__name__))
+            cache[domain] = {"checked_at": now - 6 * 86400, **found}
+    for target in targets:
+        cached = cache.get(str(target.get("domain", "")).lower()) or {}
+        merged = dict(target)
+        merged["document_urls"] = list(dict.fromkeys((target.get("document_urls") or []) + cached.get("document_urls", [])))[:20]
+        if not target.get("cik") and len(cached.get("ciks", [])) == 1:
+            merged["cik"] = cached["ciks"][0]
+        derived.append(merged)
+        for board in cached.get("boards", [])[:4]:
+            field = "greenhouse_board" if board["provider"] == "greenhouse" else "lever_site"
+            if target.get(field) == board["slug"]:
+                continue
+            derived.append({key: value for key, value in {**target, "document_urls": [], "greenhouse_board": None, "lever_site": None,
+                                                        field: board["slug"], "_lever_region": board["region"],
+                                                        "_discovered_from": board["linked_from"]}.items() if value is not None})
+    valid_domains = {domain for _, domain in candidates}
+    state = {**state, "discovery": {key: value for key, value in cache.items() if key in valid_domains},
+             "discovery_cursor": (cursor + len(selected)) % len(candidates)}
+    return derived, state, {"provider": "corporate_discovery", "name": "Company public evidence discovery",
+                           "status": "partial" if errors and staged else "error" if errors else "ok", "attempted": attempted,
+                           "staged": staged, "records": staged, "successful": attempted - len(errors), "errors": errors,
+                           "cached_targets": len(candidates) - attempted, "pending_targets": max(0, len(candidates) - len(selected))}
 
 
 def _document(payload):
@@ -258,7 +493,11 @@ def normalize_corporate(item, max_records=5000):
         raise ValueError("Corporate record limit must be positive")
     maximum = min(max_records, limit)
     payload = item["payload"]
-    if provider in {"greenhouse", "lever"}:
+    if provider == "gleif":
+        return _gleif(item, _json(payload), maximum)
+    if provider == "importyeti_public":
+        records, truncated = _importyeti(payload, maximum, target)
+    elif provider in {"greenhouse", "lever"}:
         records, truncated = _jobs(provider, _json(payload), maximum)
     elif provider == "sec_edgar":
         records, truncated = _sec(_json(payload), target, maximum)
@@ -282,6 +521,8 @@ def normalize_corporate(item, max_records=5000):
         entity, edge = _record(item, provider, identity, title, fields, kind=kind, role=role, truncated=truncated)
         entities.append(entity)
         if edge:
+            if provider == "importyeti_public":
+                edge["relation"] = "freight_candidate"
             edges.append(edge)
     return {"entities": entities, "edges": edges}
 
@@ -302,6 +543,9 @@ def _requests(config):
         if options.get("enabled") is False:
             row["status"] = "disabled"
             continue
+        if provider == "corporate_discovery":
+            row["reason"] = "No configured company domains to discover"
+            continue
         if provider in _IMPORTS:
             row["reason"] = "Requires a supplied authorized export; no unrestricted scraper is configured"
             continue
@@ -318,6 +562,8 @@ def _requests(config):
             continue
         candidates = [{}] if provider in {"public_procurement", "freight_exports"} else targets
         for target in candidates:
+            if target.get("_discovered_from") and provider not in {"greenhouse", "lever"}:
+                continue
             url, params, headers, private = None, {}, {}, False
             try:
                 if provider in {"greenhouse", "lever"}:
@@ -329,8 +575,20 @@ def _requests(config):
                     if provider == "greenhouse":
                         url, params = "https://boards-api.greenhouse.io/v1/boards/" + quote(slug, safe="") + "/jobs", {"content": "true"}
                     else:
-                        host = "api.eu.lever.co" if options.get("region") == "eu" else "api.lever.co"
+                        host = "api.eu.lever.co" if target.get("_lever_region", options.get("region")) == "eu" else "api.lever.co"
                         url, params = "https://" + host + "/v0/postings/" + quote(slug, safe=""), {"mode": "json", "limit": maximum}
+                elif provider == "gleif":
+                    if not isinstance(target.get("name"), str) or not target["name"].strip():
+                        continue
+                    url, params = "https://api.gleif.org/api/v1/lei-records", {"filter[entity.legalName]": target["name"].strip()[:300], "page[size]": min(10, maximum)}
+                elif provider == "importyeti_public":
+                    name = target.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:150]
+                    if not slug:
+                        continue
+                    url = "https://www.importyeti.com/company/" + slug
                 elif provider == "sec_edgar":
                     value = str(target.get("cik") or "").removeprefix("CIK")
                     if not value:
@@ -374,12 +632,19 @@ def _requests(config):
 
 async def collect_corporate_sources(config, store, http):
     from .sourcehub import stage_payload
-    requests, health = _requests(config)
+    state = await asyncio.to_thread(store.source_state, "corporate_sources")
+    targets, state, discovery = await _discover(config, store, http, state)
+    requests, health = _requests({**config, "source_targets": targets})
+    if discovery is not None:
+        health["corporate_discovery"] = discovery
     batch_limit = max(1, int(config.get("public_source_batch", 3)))
     record_limit = max(1, min(5000, int(config.get("public_source_records", 100))))
     concurrency = max(1, int(config.get("public_source_concurrency", 4)))
-    state = await asyncio.to_thread(store.source_state, "corporate_sources")
     cursors = dict(state.get("cursors") or {})
+    gleif_pages = dict(state.get("gleif_pages") or {})
+    for provider, url, params, headers, target, private in requests:
+        if provider == "gleif":
+            params["page[number]"] = max(1, int(gleif_pages.get(str(target.get("name")), 1)))
     selected = []
     for provider in health:
         candidates = [request for request in requests if request[0] == provider]
@@ -391,23 +656,37 @@ async def collect_corporate_sources(config, store, http):
         cursors[provider] = (cursor + len(chosen)) % len(candidates)
         health[provider]["pending_targets"] = len(candidates) - len(chosen)
     digests = dict(state.get("digests") or {})
-    semaphore, sec_lock = asyncio.Semaphore(concurrency), asyncio.Lock()
+    semaphore, sec_lock, trade_lock = asyncio.Semaphore(concurrency), asyncio.Lock(), asyncio.Lock()
+    trade_robots = None
     sec_last = 0.0
     maximum = int(float(config.get("staging_max_payload_mb", 8)) * 1024 * 1024)
 
     async def fetch(request):
-        nonlocal sec_last
+        nonlocal sec_last, trade_robots
         provider, url, params, headers, target, private = request
         row = health[provider]
         row["attempted"] += 1
         public_params = {key: value for key, value in params.items() if key != "api_key"}
         source_url = url + ("&" if "?" in url else "?") + urlencode(public_params) if public_params else url
         metadata = {"provider": provider, "target": {key: target[key] for key in ("name", "domain", "company_id", "cik") if target.get(key)}, "record_limit": record_limit}
+        if target.get("_discovered_from"):
+            metadata["discovered_from"] = target["_discovered_from"]
+        if target.get("_gleif_child_lei"):
+            metadata.update(gleif_child_lei=target["_gleif_child_lei"], gleif_relation=target["_gleif_relation"])
         identity = hashlib.sha256(json.dumps([provider, url, public_params, metadata], sort_keys=True).encode()).hexdigest()
         phase = "request"
         staged = 0
         try:
             async with semaphore:
+                if provider == "importyeti_public":
+                    async with trade_lock:
+                        if trade_robots is None:
+                            parser = RobotFileParser("https://www.importyeti.com/robots.txt")
+                            response = await http.get(parser.url, max_bytes=128 * 1024, max_attempts=1)
+                            parser.parse((await asyncio.to_thread(response.path.read_text, errors="replace")).splitlines())
+                            trade_robots = parser
+                    if not trade_robots.can_fetch(config.get("user_agent", "SignalWatch"), url):
+                        raise ValueError("ImportYeti robots.txt disallows company-page access")
                 if provider == "sec_edgar":
                     async with sec_lock:
                         delay = sec_last + 0.11 - time.monotonic()
@@ -418,7 +697,12 @@ async def collect_corporate_sources(config, store, http):
                                           cache=not private, allow_redirects=not private, max_attempts=1)
                 if response.status not in (200, 304):
                     raise ValueError("Provider returned a non-success HTTP status")
-                if getattr(response, "changed", True) is False and digests.get(identity) == response.digest:
+                if provider == "importyeti_public":
+                    source_url = _public_url(getattr(response, "url", source_url))
+                    final = urlsplit(source_url)
+                    if final.scheme != "https" or final.hostname != "www.importyeti.com" or not re.fullmatch(r"/company/[a-z0-9-]+/?", final.path):
+                        raise ValueError("ImportYeti response redirects outside a public company report")
+                if getattr(response, "changed", True) is False and digests.get(identity) == response.digest and (provider not in {"gleif", "importyeti_public"} or target.get("_gleif_child_lei")):
                     return provider, {"unchanged": 1, "successful": 1}
                 payload = await asyncio.to_thread(response.path.read_bytes)
                 content_type = next((value for key, value in response.headers.items() if key.lower() == "content-type"), "application/octet-stream")
@@ -431,18 +715,42 @@ async def collect_corporate_sources(config, store, http):
                                                "payload_hash": hashlib.sha256(payload).hexdigest(), "metadata": metadata,
                                                "observed_at": queued.get("observed_at") or datetime.now(timezone.utc).isoformat()}, max_records=record_limit)
                 digests[identity] = response.digest
+                followups = []
+                if provider == "gleif" and not target.get("_gleif_child_lei"):
+                    parsed = _json(payload)
+                    pagination = (parsed.get("meta") or {}).get("pagination", {})
+                    if isinstance(pagination, dict):
+                        current, last = pagination.get("currentPage", 1), pagination.get("lastPage", 1)
+                        if type(current) is int and type(last) is int:
+                            gleif_pages[str(target.get("name"))] = current + 1 if current < last else 1
+                    for candidate in parsed["data"] if isinstance(parsed["data"], list) else []:
+                        if len(followups) == 2:
+                            break
+                        for relation in ("direct-parent", "ultimate-parent"):
+                            links = candidate.get("relationships", {}).get(relation, {}).get("links", {})
+                            related = links.get("lei-record") or links.get("related")
+                            expected = "https://api.gleif.org/api/v1/lei-records/" + candidate["id"] + "/" + relation
+                            if related == expected and len(followups) < 2:
+                                followups.append((provider, expected, {}, {}, {**target, "_gleif_child_lei": candidate["id"], "_gleif_relation": relation}, False))
                 return provider, {"staged": staged, "records": len(preview["entities"]), "successful": 1,
-                                  "truncated": any(entity["metadata"]["coverage_truncated"] for entity in preview["entities"])}
+                                  "truncated": any(entity["metadata"]["coverage_truncated"] for entity in preview["entities"]), "followups": followups,
+                                  "unavailable_targets": int(provider == "importyeti_public" and not preview["entities"])}
         except Exception as error:
             status = getattr(error, "status", None)
+            if provider == "importyeti_public" and status == 404:
+                return provider, {"successful": 1, "unavailable_targets": 1}
             message = "HTTP " + str(status) if isinstance(status, int) else phase.capitalize() + " failed (" + type(error).__name__ + ")"
             return provider, {"error": message, "staged": staged}
 
     results = await asyncio.gather(*(fetch(request) for request in selected))
-    totals = {"requests": len(selected), "staged": 0, "records": 0, "unchanged": 0, "pending_targets": max(0, len(requests) - len(selected))}
+    followups = [request for _, result in results for request in result.get("followups", [])]
+    results.extend(await asyncio.gather(*(fetch(request) for request in followups)))
+    totals = {"requests": len(selected) + len(followups) + (discovery or {}).get("attempted", 0),
+              "staged": (discovery or {}).get("staged", 0), "records": (discovery or {}).get("records", 0),
+              "unchanged": 0, "pending_targets": max(0, len(requests) - len(selected))}
     for provider, result in results:
         row = health[provider]
-        for key in ("staged", "records", "unchanged", "successful"):
+        for key in ("staged", "records", "unchanged", "successful", "unavailable_targets"):
             row[key] = row.get(key, 0) + result.get(key, 0)
             if key in totals:
                 totals[key] += result.get(key, 0)
@@ -451,6 +759,7 @@ async def collect_corporate_sources(config, store, http):
         else:
             row["coverage_truncated"] = row.get("coverage_truncated", False) or result.get("truncated", False)
         row["status"] = "partial" if row["errors"] and row["successful"] else "error" if row["errors"] else "ok"
-    await asyncio.to_thread(store.update_source, "corporate_sources", cursors=cursors, digests=digests)
+    await asyncio.to_thread(store.update_source, "corporate_sources", cursors=cursors, digests=digests,
+                            gleif_pages=gleif_pages, discovery=state.get("discovery", {}), discovery_cursor=state.get("discovery_cursor", 0))
     errors = [provider + ": " + message for provider, row in health.items() for message in row["errors"]]
     return {**totals, "errors": errors, "provider_health": health}

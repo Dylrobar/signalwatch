@@ -1,0 +1,18 @@
+{
+  "9c2ec5f6-afa1-4753-891b-d130b4539648": {
+    "timestamp": 1792108800,
+    "info": "nginx patch research CVE-2026-12345",
+    "Orgc": {
+      "name": "Public Researcher",
+      "uuid": "55f6ea5e-2c60-40e5-964f-47a8950d210f"
+    },
+    "Tag": [
+      {
+        "name": "tlp:clear"
+      },
+      {
+        "name": "type:OSINT"
+      }
+    ]
+  }
+}

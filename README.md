@@ -145,6 +145,10 @@ Searches, filters, and pagination survive tab switches. The current view is enco
 
 Follow company/domain/product relationships, advisory IDs, and article references inside the evidence drawer; its Back control restores the previous record. Product catalog details show their published advisories even when no deployment has been observed. CVE aliases resolve to the actual stored source document. Package details retain both enumerated versions and affected ranges.
 
+### Sources without account setup
+
+Version 0.12.0 enables ctlogs hostnames with crt.sh fallback, GLEIF registry/parent evidence, company-linked job/document discovery, public ImportYeti freight tables, CIRCL public MISP reports/observables, and capped anonymous GreyNoise IP context. Public repository collection now parses more manifests/lock files, records redacted static secret candidates, and checks exact dependency versions through OSV. Everything uses the existing workers, queue, graph, and dashboard. Existing explicit operator settings remain intact. [Coverage, limits, and setup-dependent integrations omitted from this update](docs/zero-setup-sources.md).
+
 ### Beta and pre-release tracking
 
 Version 0.11.0 adds the enabled-by-default `prerelease` collector family with a 60-minute schedule. It uses three public official providers and the existing ingestion queue and SQLite graph. Vendor text supplies component/file changes and known-versus-resolved issue labels; notes with changed content retain immutable revisions. Apple's reused documentation URLs are checked against the announced beta version before ingestion. A pre-release note is unverified evidence, and does not by itself establish an installed version, affected company, vulnerability, or available fix. See [provider coverage, storage, and API details](docs/prerelease-tracking.md).

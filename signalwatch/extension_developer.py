@@ -3,16 +3,19 @@ import base64
 import hashlib
 import json
 import re
+import time
 import tomllib
 import xml.etree.ElementTree as ET
 from urllib.parse import parse_qsl, quote, urlsplit
 
 from bs4 import BeautifulSoup
+from packaging.requirements import InvalidRequirement, Requirement
 
 from .http import display_url, public_error
+from .matching import ecosystem_identity, package_identity
 
 SOURCE_DEFINITIONS = [
-    {"id": "github_public", "name": "GitHub public repositories", "category": "developer", "family": "developer", "access": "public", "description": "Explicit organization repositories and bounded dependency manifests; declared dependencies are evidence, not deployed inventory.", "homepage": "https://docs.github.com/en/rest/repos", "required": ["github_org or configured public URL"]},
+    {"id": "github_public", "name": "GitHub public repositories", "category": "developer", "family": "developer", "access": "public", "description": "Bounded public root manifests, lock files and configuration artifacts; redacted candidate-secret patterns and up to 20 exact-version OSV queries per run. Coverage is limited to fetched files and declarations do not establish deployment.", "homepage": "https://docs.github.com/en/rest/repos", "required": ["github_org or configured public URL"]},
     {"id": "gitlab_public", "name": "GitLab public projects", "category": "developer", "family": "developer", "access": "public", "description": "Explicit GitLab.com group public project metadata or configured public exports.", "homepage": "https://docs.gitlab.com/api/groups/", "required": ["gitlab_group or configured public URL"]},
     {"id": "bitbucket_public", "name": "Bitbucket public repositories", "category": "developer", "family": "developer", "access": "configured_url", "description": "Configured public repository metadata exports; authenticated API discovery is not assumed.", "homepage": "https://developer.atlassian.com/cloud/bitbucket/rest/api-group-repositories/", "required": ["url or urls"]},
     {"id": "wayback_cdx", "name": "Internet Archive CDX", "category": "developer", "family": "developer", "access": "public", "description": "Bounded historical URL index discovery; archive records do not establish current exposure.", "homepage": "https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server", "required": ["target domain"]},
@@ -29,7 +32,59 @@ SOURCE_DEFINITIONS = [
 ]
 
 PROVIDERS = {value["id"] for value in SOURCE_DEFINITIONS}
-MANIFESTS = frozenset({"package.json", "requirements.txt", "pom.xml", "go.mod", "Cargo.toml", "composer.json", "Dockerfile"})
+MANIFESTS = frozenset({"package.json", "package-lock.json", "npm-shrinkwrap.json", "requirements.txt", "pyproject.toml", "poetry.lock", "uv.lock", "pom.xml", "go.mod", "Cargo.toml", "Cargo.lock", "composer.json", "composer.lock", "packages.lock.json", "Dockerfile"})
+CONFIG_ARTIFACTS = frozenset({"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml", ".npmrc", ".env.example", ".env.sample"})
+SECRET_PATTERNS = (
+    ("github_token", re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36,255}(?![A-Za-z0-9_])")),
+    ("github_fine_grained_token", re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{60,255}(?![A-Za-z0-9_])")),
+    ("slack_token", re.compile(r"(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{20,255}(?![A-Za-z0-9_-])")),
+    ("private_key", re.compile(r"-----BEGIN ((?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY)-----[\r\n]+[A-Za-z0-9+/=\r\n]{64,12000}-----END \1-----")),
+)
+
+
+def _secret_matches(text, maximum=50):
+    findings = []
+    seen = set()
+    for rule, pattern in SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match[0]
+            tail = value.split("_", 1)[-1] if rule.startswith("github") else value
+            placeholder = re.search(r"example|placeholder|changeme|your[_-]?token|dummy|redacted", value, re.I)
+            if placeholder or len(set(tail)) < 8:
+                continue
+            fingerprint = hashlib.sha256(value.encode()).hexdigest()
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            findings.append({"rule": rule, "fingerprint_sha256": fingerprint, "line": text.count("\n", 0, match.start()) + 1, "redacted_value": "[REDACTED]", "validation": "not_performed", "status": "potential_public_secret", "coverage": "fetched_artifact_only"})
+            if len(findings) >= maximum:
+                return findings
+    return findings
+
+
+def _redact(value):
+    if isinstance(value, str):
+        for _, pattern in SECRET_PATTERNS:
+            value = pattern.sub("[REDACTED]", value)
+        return value
+    if isinstance(value, dict):
+        return {_redact(key): _redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _osv_results(data, expected):
+    results = data.get("results") if isinstance(data, dict) and "error" not in data else None
+    if not isinstance(results, list) or len(results) != expected:
+        raise ValueError("Invalid OSV batch response")
+    for result in results:
+        if not isinstance(result, dict) or "error" in result or not isinstance(result.get("vulns", []), list) or result.get("next_page_token") is not None and not isinstance(result["next_page_token"], str):
+            raise ValueError("Invalid OSV batch result")
+        for reference in result.get("vulns", []):
+            if not isinstance(reference, dict) or not isinstance(reference.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{1,199}", reference["id"]):
+                raise ValueError("OSV reference lacks a valid native advisory ID")
+    return results
 def _url(value):
     if not isinstance(value, str):
         raise ValueError("Public source URL must be text")
@@ -59,6 +114,7 @@ async def collect_developer_sources(config, store, http):
     targets = [target for target in config.get("source_targets", []) if isinstance(target, dict)]
     state = await asyncio.to_thread(store.source_state, "developer_sources") if store is not None else {}
     cursors = dict(state.get("cursors") or {})
+    lookup_cache = dict(state.get("osv_lookup_cache") or {})
 
     def rotate(values, key):
         if not values:
@@ -78,6 +134,8 @@ async def collect_developer_sources(config, store, http):
         if not isinstance(options, dict):
             options = {}
         health = {"status": "unconfigured", "staged": 0, "duplicates": 0, "fetched": 0, "errors": []}
+        if provider == "github_public":
+            health["artifact_coverage"] = {"scope": "bounded_public_repository_root_files", "whole_organization_scanned": False, "repositories_inspected": 0, "files_fetched": 0, "credential_validation": False}
         result["provider_health"][provider] = health
         if options.get("enabled") is False:
             health["status"] = "disabled"
@@ -96,6 +154,14 @@ async def collect_developer_sources(config, store, http):
             async with semaphore:
                 response = await http.get(url, params=params, headers=headers or {}, max_bytes=max_bytes, max_attempts=2, allow_redirects=not bool(headers and headers.get("Authorization")))
                 payload = await asyncio.to_thread(response.path.read_bytes)
+                if provider == "github_public" and kind in {"manifest", "repository_config"}:
+                    wrapper = json.loads(payload) if payload.lstrip().startswith(b"{") else None
+                    blob = base64.b64decode("".join(wrapper["content"].split()), validate=True) if isinstance(wrapper, dict) and wrapper.get("encoding") == "base64" else payload
+                    blob_sha = hashlib.sha1(b"blob " + str(len(blob)).encode() + b"\0" + blob).hexdigest()
+                    expected_sha = context.get("github_blob_sha")
+                    if isinstance(expected_sha, str) and re.fullmatch(r"[0-9a-f]{40}", expected_sha) and blob_sha != expected_sha:
+                        raise ValueError("GitHub artifact changed after directory listing")
+                    context = {**context, "github_blob_sha": blob_sha}
                 health["fetched"] += 1
                 result["fetched"] += 1
                 source_url = _url(response.url)
@@ -131,6 +197,7 @@ async def collect_developer_sources(config, store, http):
 
         if provider == "github_public":
             eligible = [target for target in targets if target.get("github_org")]
+            dependency_candidates = {}
             for target in rotate(eligible, "targets:" + provider):
                 org = str(target.get("github_org") or "")
                 if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", org):
@@ -164,13 +231,69 @@ async def collect_developer_sources(config, store, http):
                         listing = json.loads(raw_listing)
                         if not isinstance(listing, list):
                             raise ValueError("Expected directory array")
-                        files = [entry for entry in listing if isinstance(entry, dict) and entry.get("type") == "file" and entry.get("name") in MANIFESTS and entry.get("path") == entry.get("name") and isinstance(entry.get("size"), int) and 0 <= entry["size"] <= max_bytes]
+                        files = [entry for entry in listing if isinstance(entry, dict) and entry.get("type") == "file" and entry.get("name") in MANIFESTS | CONFIG_ARTIFACTS and entry.get("path") == entry.get("name") and isinstance(entry.get("size"), int) and 0 <= entry["size"] <= max_bytes]
                     except (ValueError, UnicodeDecodeError):
                         health["errors"].append("github_public: invalid directory JSON")
                         result["errors"].append(health["errors"][-1])
                         continue
+                    health["artifact_coverage"]["repositories_inspected"] += 1
                     for entry in rotate(files, "files:" + full_name.lower()):
-                        await attempt(f"https://api.github.com/repos/{full_name}/contents/{quote(entry['path'], safe='')}", {**repo_context, "manifest_path": entry["path"]}, kind="manifest", headers={**github_headers, "Accept": "application/vnd.github.raw+json"})
+                        is_manifest = entry["name"] in MANIFESTS
+                        artifact_context = {**repo_context, "artifact_path": entry["path"], "github_blob_sha": entry.get("sha"), "coverage": "fetched_artifact_only"}
+                        if is_manifest:
+                            artifact_context["manifest_path"] = entry["path"]
+                        raw = await attempt(f"https://api.github.com/repos/{full_name}/contents/{quote(entry['path'], safe='')}", artifact_context, kind="manifest" if is_manifest else "repository_config", headers={**github_headers, "Accept": "application/vnd.github.raw+json"})
+                        if raw is not None:
+                            health["artifact_coverage"]["files_fetched"] += 1
+                            if is_manifest:
+                                try:
+                                    wrapper = json.loads(raw) if raw.lstrip().startswith(b"{") else None
+                                    dependency_payload = base64.b64decode("".join(wrapper["content"].split()), validate=True) if isinstance(wrapper, dict) and wrapper.get("encoding") == "base64" else raw
+                                    artifact_context["github_blob_sha"] = hashlib.sha1(b"blob " + str(len(dependency_payload)).encode() + b"\0" + dependency_payload).hexdigest()
+                                    dependencies = _dependency_records(dependency_payload, entry["name"], maximum)
+                                    for dependency in dependencies:
+                                        ecosystem, name, version = dependency["ecosystem"], dependency["name"], dependency.get("version")
+                                        if not version or ecosystem not in {"npm", "PyPI", "Go", "crates.io", "Packagist", "Maven", "NuGet"} or dependency.get("source_type") not in {None, "package_registry", "public_registry"} or len(name) > 300 or _redact(name) != name:
+                                            continue
+                                        key = (ecosystem_identity(ecosystem), package_identity(ecosystem, name), version)
+                                        if key not in dependency_candidates and len(dependency_candidates) >= 200:
+                                            continue
+                                        candidate = dependency_candidates.setdefault(key, {"query": {"package": {"ecosystem": ecosystem, "name": name}, "version": version}, "occurrences": []})
+                                        if len(candidate["occurrences"]) < 20:
+                                            candidate["occurrences"].append({"source_url": f"https://api.github.com/repos/{full_name}/contents/{quote(entry['path'], safe='')}", "context": {**artifact_context, "manifest_path": entry["path"]}, "dependency": dependency})
+                                except (ValueError, TypeError, AttributeError, UnicodeDecodeError, ET.ParseError):
+                                    health["errors"].append("github_public: invalid dependency manifest for OSV lookup")
+                                    result["errors"].append(health["errors"][-1])
+            if dependency_candidates and options.get("dependency_lookup", True):
+                candidates = list(dependency_candidates.values())
+                cursor = int(cursors.get("github_osv_package", 0)) % len(candidates)
+                selected = (candidates[cursor:] + candidates[:cursor])[:20]
+                cursors["github_osv_package"] = (cursor + len(selected)) % len(candidates)
+                url = "https://api.osv.dev/v1/querybatch"
+                request_body = {"queries": [candidate["query"] for candidate in selected]}
+                health["dependency_lookup"] = {"status": "error", "provider": "osv", "packages_queried": len(selected), "requests": 1, "installed_inventory": False}
+                cache_key = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
+                if store is not None and time.time() - float(lookup_cache.get(cache_key, 0)) < 6 * 3600:
+                    health["dependency_lookup"].update({"status": "cached", "packages_queried": 0, "cached_packages": len(selected), "requests": 0})
+                    health["status"] = "partial" if health["errors"] else "healthy"
+                    return
+                try:
+                    response = await http.post(url, json=request_body, max_bytes=max_bytes, max_attempts=1, allow_redirects=False)
+                    payload = await asyncio.to_thread(response.path.read_bytes)
+                    lookup = json.loads(payload)
+                    results = _osv_results(lookup, len(selected))
+                    staged = await stage_payload(config, store, payload, provider=provider, source_url=url, content_type="application/json", stream_key="github-osv:" + hashlib.sha256(json.dumps(request_body, sort_keys=True).encode()).hexdigest(), metadata={"artifact_kind": "dependency_vulnerability_lookup", "lookup_provider": "osv", "queries": selected, "record_limit": maximum, "coverage": "bounded_declared_exact_versions"})
+                    key = "duplicates" if isinstance(staged, dict) and staged.get("duplicate") else "staged"
+                    health[key] += 1
+                    result[key] += 1
+                    health["fetched"] += 1
+                    result["fetched"] += 1
+                    health["dependency_lookup"]["status"] = "partial" if any(value.get("next_page_token") for value in results) else "completed"
+                    lookup_cache[cache_key] = time.time()
+                except Exception as error:
+                    message = "github_public OSV dependency lookup: " + public_error(error)
+                    health["errors"].append(message)
+                    result["errors"].append(message)
         elif provider == "gitlab_public":
             for target in rotate([target for target in targets if target.get("gitlab_group")], "targets:" + provider):
                 group = str(target.get("gitlab_group") or "")
@@ -228,7 +351,7 @@ async def collect_developer_sources(config, store, http):
 
     await asyncio.gather(*(provider_run(definition["id"]) for definition in SOURCE_DEFINITIONS))
     if store is not None:
-        await asyncio.to_thread(store.update_source, "developer_sources", cursors=cursors)
+        await asyncio.to_thread(store.update_source, "developer_sources", cursors=cursors, osv_lookup_cache=dict(sorted(lookup_cache.items(), key=lambda value: value[1])[-30:]))
     return result
 
 
@@ -261,12 +384,69 @@ def _dependency_records(payload, path, maximum):
             for name, version in (data.get(scope) or {}).items():
                 if isinstance(version, str):
                     values.append({"ecosystem": "npm", "name": name, "constraint": version, "scope": scope})
+    elif path in {"package-lock.json", "npm-shrinkwrap.json"}:
+        data = json.loads(text)
+        packages = data.get("packages")
+        if isinstance(packages, dict):
+            for location, value in packages.items():
+                if not location or not isinstance(value, dict) or value.get("link") or "node_modules/" not in location:
+                    continue
+                name = value.get("name") or location.rsplit("node_modules/", 1)[-1]
+                if isinstance(name, str) and isinstance(value.get("version"), str):
+                    source_host = urlsplit(str(value.get("resolved") or "")).hostname
+                    values.append({"ecosystem": "npm", "name": name, "constraint": value["version"], "version": value["version"], "scope": "locked", "dev": bool(value.get("dev")), "package_path": location, "source_type": "non_public_or_git_source" if value.get("resolved") and source_host not in {"registry.npmjs.org", "registry.yarnpkg.com"} else "public_registry", "source_host": source_host})
+                if len(values) >= maximum:
+                    break
+        else:
+            pending = list((data.get("dependencies") or {}).items())
+            while pending and len(values) < maximum:
+                name, value = pending.pop(0)
+                if not isinstance(value, dict):
+                    continue
+                version = value.get("version")
+                if isinstance(version, str):
+                    source_host = urlsplit(str(value.get("resolved") or "")).hostname
+                    values.append({"ecosystem": "npm", "name": name, "constraint": version, "version": version, "scope": "locked", "dev": bool(value.get("dev")), "source_type": "non_public_or_git_source" if value.get("resolved") and source_host not in {"registry.npmjs.org", "registry.yarnpkg.com"} else "public_registry", "source_host": source_host})
+                nested = value.get("dependencies")
+                if isinstance(nested, dict):
+                    pending.extend(list(nested.items())[:maximum])
     elif path == "requirements.txt":
+        source_override = bool(re.search(r"^\s*(?:--(?:extra-)?index-url|--no-index|--find-links|-i|-f)(?:\s|=)", text, re.M))
         for line in text.splitlines():
             line = line.split(" #", 1)[0].strip()
             match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[^\]]+\])?\s*((?:===|==|~=|!=|<=|>=|<|>).+)?$", line.split(";", 1)[0].strip())
             if match:
-                values.append({"ecosystem": "PyPI", "name": match[1], "constraint": match[2] or "", "scope": "requirements"})
+                values.append({"ecosystem": "PyPI", "name": match[1], "constraint": match[2] or "", "scope": "requirements", "source_type": "registry_override" if source_override else "package_registry"})
+    elif path == "pyproject.toml":
+        data = tomllib.loads(text)
+        project = data.get("project") or {}
+        scopes = [("project", project.get("dependencies") or []), ("build-system", (data.get("build-system") or {}).get("requires") or [])]
+        scopes.extend(("optional:" + str(name), requirements) for name, requirements in (project.get("optional-dependencies") or {}).items())
+        for scope, requirements in scopes:
+            for requirement in requirements:
+                try:
+                    value = Requirement(requirement)
+                except (InvalidRequirement, TypeError) as error:
+                    raise ValueError("Invalid declared Python requirement") from error
+                values.append({"ecosystem": "PyPI", "name": value.name, "constraint": str(value.specifier), "scope": scope, "marker": str(value.marker) if value.marker else "", "source_type": "url_reference" if value.url else "package_registry"})
+        poetry = (data.get("tool") or {}).get("poetry") or {}
+        groups = [("poetry", poetry.get("dependencies") or {})]
+        groups.extend(("poetry:" + str(name), group.get("dependencies") or {}) for name, group in (poetry.get("group") or {}).items() if isinstance(group, dict))
+        for scope, dependencies in groups:
+            for name, value in dependencies.items():
+                if name.lower() != "python" and isinstance(value, (str, dict)):
+                    values.append({"ecosystem": "PyPI", "name": name, "constraint": value if isinstance(value, str) else str(value.get("version") or ""), "scope": scope, "source_type": "non_public_or_git_source" if isinstance(value, dict) and any(key in value for key in ("git", "path", "url", "source")) else "package_registry"})
+    elif path in {"poetry.lock", "uv.lock"}:
+        data = tomllib.loads(text)
+        for package in data.get("package") or []:
+            if not isinstance(package, dict) or not package.get("name") or not isinstance(package.get("version"), str):
+                continue
+            source = package.get("source") or {}
+            if path == "uv.lock" and not source.get("registry") or path == "poetry.lock" and source.get("type") in {"git", "directory", "file", "url"}:
+                continue
+            registry = source.get("registry") if path == "uv.lock" else source.get("url")
+            source_host = urlsplit(str(registry or "")).hostname
+            values.append({"ecosystem": "PyPI", "name": package["name"], "constraint": "==" + package["version"], "version": package["version"], "scope": "locked", "source_type": "non_public_registry" if registry and source_host not in {"pypi.org", "pypi.python.org"} else "public_registry", "source_host": source_host})
     elif path == "pom.xml":
         root = ET.fromstring(text)
         for dependency in root.findall(".//{*}dependencies/{*}dependency"):
@@ -276,17 +456,51 @@ def _dependency_records(payload, path, maximum):
                 values.append({"ecosystem": "Maven", "name": group + ":" + artifact, "constraint": dependency.findtext("{*}version") or "", "scope": dependency.findtext("{*}scope") or "compile"})
     elif path == "Cargo.toml":
         data = tomllib.loads(text)
-        for scope in ("dependencies", "dev-dependencies", "build-dependencies"):
-            for name, value in (data.get(scope) or {}).items():
-                values.append({"ecosystem": "crates.io", "name": name, "constraint": value if isinstance(value, str) else str(value.get("version") or "") if isinstance(value, dict) else "", "scope": scope})
+        groups = [(scope, data.get(scope) or {}) for scope in ("dependencies", "dev-dependencies", "build-dependencies")]
+        groups.append(("workspace.dependencies", (data.get("workspace") or {}).get("dependencies") or {}))
+        for target, settings in (data.get("target") or {}).items():
+            groups.extend((str(target) + ":" + scope, settings.get(scope) or {}) for scope in ("dependencies", "dev-dependencies", "build-dependencies"))
+        for scope, dependencies in groups:
+            for name, value in dependencies.items():
+                if isinstance(value, dict) and (value.get("git") or value.get("path") or value.get("workspace") or value.get("registry") and value["registry"] != "crates-io"):
+                    continue
+                values.append({"ecosystem": "crates.io", "name": value.get("package") or name if isinstance(value, dict) else name, "constraint": value if isinstance(value, str) else str(value.get("version") or "") if isinstance(value, dict) else "", "scope": scope})
+    elif path == "Cargo.lock":
+        for package in tomllib.loads(text).get("package") or []:
+            if isinstance(package, dict) and package.get("name") and package.get("version") and package.get("source") in {"registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"}:
+                values.append({"ecosystem": "crates.io", "name": package["name"], "constraint": "=" + package["version"], "version": package["version"], "scope": "locked"})
     elif path == "composer.json":
         data = json.loads(text)
         for scope in ("require", "require-dev"):
             for name, version in (data.get(scope) or {}).items():
-                if isinstance(version, str):
+                if isinstance(version, str) and "/" in name:
                     values.append({"ecosystem": "Packagist", "name": name, "constraint": version, "scope": scope})
+    elif path == "composer.lock":
+        data = json.loads(text)
+        for scope in ("packages", "packages-dev"):
+            for package in data.get(scope) or []:
+                if isinstance(package, dict) and package.get("name") and isinstance(package.get("version"), str):
+                    values.append({"ecosystem": "Packagist", "name": package["name"], "constraint": package["version"], "version": package["version"], "scope": "locked:" + scope})
+    elif path == "packages.lock.json":
+        for framework, packages in (json.loads(text).get("dependencies") or {}).items():
+            for name, package in packages.items():
+                if isinstance(package, dict) and package.get("type", "").lower() != "project" and isinstance(package.get("resolved"), str):
+                    values.append({"ecosystem": "NuGet", "name": name, "constraint": package.get("requested") or package["resolved"], "version": package["resolved"], "scope": "locked:" + framework})
     elif path == "go.mod":
         block = False
+        replacement_block = False
+        replacements = set()
+        for line in text.splitlines():
+            line = line.split("//", 1)[0].strip()
+            if line == "replace (":
+                replacement_block = True
+                continue
+            if line == ")":
+                replacement_block = False
+            if "=>" in line and (replacement_block or line.startswith("replace ")):
+                original = line.removeprefix("replace ").split("=>", 1)[0].strip().split()
+                if original:
+                    replacements.add(original[0])
         for line in text.splitlines():
             line = line.split("//", 1)[0].strip()
             if line == "require (":
@@ -296,11 +510,27 @@ def _dependency_records(payload, path, maximum):
                 block = False
             match = re.fullmatch(r"(?:require\s+)?([\w.~-]+(?:/[\w.~-]+)+)\s+(v[^\s]+)", line) if block or line.startswith("require ") else None
             if match:
-                values.append({"ecosystem": "Go", "name": match[1], "constraint": match[2], "scope": "require"})
+                values.append({"ecosystem": "Go", "name": match[1], "constraint": match[2], "scope": "require", "source_type": "module_replacement" if match[1] in replacements else "package_registry"})
     elif path == "Dockerfile":
         for image in re.findall(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)", text, re.I | re.M):
             values.append({"ecosystem": "container", "name": image, "constraint": "", "scope": "build_base_image"})
+    for value in values[:maximum]:
+        constraint = value.get("constraint") or ""
+        if not value.get("version") and value["ecosystem"] in {"PyPI", "npm", "Go", "Maven", "Packagist"}:
+            exact = re.fullmatch(r"(?:==)?(v?\d+\.\d+[^\s,;<>~=!*]*)", constraint)
+            if value["ecosystem"] in {"npm", "Packagist"} and not re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", constraint):
+                exact = None
+            if exact and (value["ecosystem"] != "PyPI" or constraint.startswith("==")):
+                value["version"] = exact[1]
+        if value.get("version") and not re.fullmatch(r"v?\d+(?:\.\d+)+[A-Za-z0-9.+-]*", value["version"]):
+            value.pop("version")
+        value["version_status"] = "locked_or_exact_declaration" if value.get("version") else "range_or_unspecified"
+        value["deployment_verified"] = False
     return values[:maximum]
+
+
+def _dependency_identity(dependency):
+    return ":".join(str(dependency.get(key) or "") for key in ("ecosystem", "name", "scope", "constraint", "package_path"))
 
 
 def normalize_developer(item, max_records=5000):
@@ -315,6 +545,7 @@ def normalize_developer(item, max_records=5000):
     kind = metadata.get("artifact_kind", "generic")
     entities = []
     edges = []
+    scanned_payload = None
 
     def add(record):
         if len(entities) + len(edges) < maximum:
@@ -322,7 +553,43 @@ def normalize_developer(item, max_records=5000):
             return True
         return False
 
-    if kind == "manifest" or metadata.get("manifest_path"):
+    if kind == "dependency_vulnerability_lookup":
+        queries = metadata.get("queries")
+        if not isinstance(queries, list) or not 1 <= len(queries) <= 20:
+            raise NormalizationError("OSV lookup response must match bounded input queries")
+        try:
+            results = _osv_results(data, len(queries))
+        except ValueError as error:
+            raise NormalizationError("Invalid OSV dependency lookup response") from error
+        for candidate, result in zip(queries, results):
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("query"), dict) or not isinstance(candidate.get("occurrences"), list) or not isinstance(result, dict) or not isinstance(result.get("vulns", []), list):
+                raise NormalizationError("Malformed OSV dependency lookup")
+            query = candidate["query"]
+            references = result.get("vulns", [])
+            query_hash = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
+            report = _record(item, "dependency_lookup", query_hash, str((query.get("package") or {}).get("name") or "Package") + " OSV query", {"query": query, "provider": "osv", "query_endpoint": "https://api.osv.dev/v1/querybatch", "vulnerability_reference_count": len(references), "status": "partial_page" if result.get("next_page_token") else "query_completed", "installed_inventory": False, "advisory_details_fetched": False, "coverage": "bounded_declared_exact_versions"})
+            add(report)
+            for occurrence in candidate["occurrences"][:maximum]:
+                if not isinstance(occurrence, dict) or not isinstance(occurrence.get("dependency"), dict) or not isinstance(occurrence.get("context"), dict):
+                    raise NormalizationError("Malformed dependency artifact provenance")
+                dependency = occurrence["dependency"]
+                original = {**item, "source_url": occurrence.get("source_url"), "metadata": {**metadata, **occurrence["context"]}}
+                evidence = _record(original, "software_evidence", _dependency_identity(dependency), dependency["name"], dependency)
+                evidence["_reference_only"] = True
+                evidence["metadata"]["evidence_role"] = "declared_dependency"
+                evidence["metadata"]["staging"]["source_url"] = item.get("source_url")
+                if not add(evidence):
+                    break
+                for reference in references[:maximum]:
+                    native_id = reference.get("id") if isinstance(reference, dict) else None
+                    if not isinstance(native_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{1,199}", native_id):
+                        raise NormalizationError("OSV reference lacks a valid native advisory ID")
+                    if len(entities) + len(edges) + 2 > maximum:
+                        break
+                    advisory = {"id": "OSV:" + native_id, "kind": "vulnerability", "name": native_id, "value": native_id, "source_url": "https://osv.dev/vulnerability/" + quote(native_id, safe=""), "confidence": 0.6, "_reference_only": True, "metadata": {"evidence_role": "osv_query_reference", "native_osv_id": native_id, "advisory_details_fetched": False, "query_endpoint": item.get("source_url"), "query_hash": query_hash, "installed_inventory": False, "reference_only": True, "modified": reference.get("modified")}}
+                    add(advisory)
+                    edges.append({"from_id": evidence["id"], "to_id": advisory["id"], "relation": "osv_reports_for_declared_version", "source_url": item.get("source_url"), "observed_at": item.get("observed_at") or item.get("received_at"), "confidence": 0.6})
+    elif kind == "manifest" or metadata.get("manifest_path"):
         path = str(metadata.get("manifest_path") or "").rsplit("/", 1)[-1]
         if path not in MANIFESTS:
             raise NormalizationError("Unsupported dependency manifest")
@@ -332,14 +599,19 @@ def normalize_developer(item, max_records=5000):
                 payload = base64.b64decode("".join(data["content"].split()), validate=True)
             except ValueError as error:
                 raise NormalizationError("Invalid GitHub manifest encoding") from error
+        scanned_payload = payload
         artifact = _record(item, "developer_artifact", item.get("source_url") or path, path, {"manifest_path": path, "repository": metadata.get("repository"), "evidence_role": "declared_dependencies"})
         add(artifact)
         try:
             dependencies = _dependency_records(payload, path, maximum)
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError, ET.ParseError) as error:
             raise NormalizationError("Invalid dependency manifest") from error
+        reserve = min(2 * len(_secret_matches(payload[:2 * 1024 * 1024].decode("utf-8", errors="replace"))), max(0, maximum - 1))
         for dependency in dependencies:
-            record = _record(item, "software_evidence", dependency["ecosystem"] + ":" + dependency["name"] + ":" + dependency["scope"], dependency["name"], dependency)
+            if len(entities) + len(edges) + 2 + reserve > maximum:
+                break
+            identity = _dependency_identity(dependency)
+            record = _record(item, "software_evidence", identity, dependency["name"], dependency)
             record["metadata"]["evidence_role"] = "declared_dependency"
             if add(record) and len(entities) + len(edges) < maximum:
                 edges.append({"from_id": artifact["id"], "to_id": record["id"], "relation": "declares_dependency", "source_url": item.get("source_url") or "", "observed_at": item.get("observed_at") or item.get("received_at"), "confidence": 0.6})
@@ -424,6 +696,30 @@ def normalize_developer(item, max_records=5000):
                     if isinstance(url, str):
                         method = str(request.get("method") or "GET").upper()
                         add(_record(item, "api_route", method + " " + url, record.get("name") or method + " " + url, {"method": method, "declared_url": url, "specification": item.get("source_url"), "exposure_verified": False}))
+    elif provider in {"appstore_public", "googleplay_public", "chrome_webstore_public", "slack_apps_public"} and data is None:
+        soup = BeautifulSoup(item["payload"].decode("utf-8", errors="replace"), "html.parser")
+        applications = []
+        for script in soup.find_all("script", type="application/ld+json", limit=20):
+            try:
+                application = json.loads(script.string or script.get_text())
+            except ValueError:
+                continue
+            pending = application if isinstance(application, list) else [application]
+            for record in pending[:50]:
+                if not isinstance(record, dict):
+                    continue
+                candidates = [record] + (record.get("@graph") or [] if isinstance(record.get("@graph"), list) else [])
+                for candidate in candidates[:50]:
+                    if isinstance(candidate, dict) and any(value in {"SoftwareApplication", "MobileApplication", "WebApplication"} for value in _strings(candidate.get("@type"))):
+                        applications.append(candidate)
+        if applications:
+            for application in applications[:maximum]:
+                fields = {key: application[key] for key in ("name", "softwareVersion", "operatingSystem", "applicationCategory", "applicationSubCategory", "publisher", "author", "datePublished", "dateModified", "identifier", "url") if key in application}
+                fields.update({"binary_inspected": False, "sdks_verified": False, "evidence_role": "publisher_listing_metadata"})
+                add(_record(item, "developer_artifact", item.get("source_url") or item.get("payload_hash"), application.get("name") or provider + " public listing", fields))
+        else:
+            title = soup.title.get_text(" ", strip=True) if soup.title else provider + " public listing"
+            add(_record(item, "developer_artifact", item.get("source_url") or item.get("payload_hash"), title, {"text": soup.get_text(" ", strip=True)[:10000], "binary_inspected": False, "sdks_verified": False}))
     else:
         if data is not None:
             fields = {"data": _short(data)}
@@ -444,4 +740,17 @@ def normalize_developer(item, max_records=5000):
                 except ValueError:
                     continue
                 add(_record(item, "source_reference", url, url, {"declared_url": url, "exposure_verified": False}))
-    return {"entities": entities, "edges": edges}
+    if scanned_payload is not None or kind == "repository_config" or provider == "javascript_artifacts" and data is None:
+        payload = scanned_payload if scanned_payload is not None else item["payload"]
+        text = payload[:2 * 1024 * 1024].decode("utf-8", errors="replace")
+        findings = _secret_matches(text)
+        artifact = next((record for record in entities if record["kind"] == "developer_artifact"), None)
+        if artifact:
+            artifact["metadata"]["secret_scan"] = {"engine": "bounded_pattern_detection", "coverage": "fetched_artifact_only", "bytes_inspected": min(len(payload), 2 * 1024 * 1024), "truncated": len(payload) > 2 * 1024 * 1024, "credential_validation": False, "candidate_count": len(findings), "reported_finding_limit": 50}
+        for finding in findings:
+            record = _record(item, "secret_finding", finding["rule"] + ":" + finding["fingerprint_sha256"], finding["rule"] + " candidate", {**finding, "artifact_path": metadata.get("artifact_path") or metadata.get("manifest_path"), "repository": metadata.get("repository"), "github_blob_sha": metadata.get("github_blob_sha")})
+            record["confidence"] = 0.4
+            record["metadata"]["evidence_role"] = "unverified_secret_pattern"
+            if add(record) and artifact and len(entities) + len(edges) < maximum:
+                edges.append({"from_id": artifact["id"], "to_id": record["id"], "relation": "contains_potential_secret", "source_url": item.get("source_url") or "", "observed_at": item.get("observed_at") or item.get("received_at"), "confidence": 0.4})
+    return _redact({"entities": entities, "edges": edges})

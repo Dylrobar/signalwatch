@@ -6,13 +6,16 @@ import io
 import ipaddress
 import json
 import re
+import time
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .normalization import NormalizationError
-from .http import public_error
+from .http import HTTPError, public_error, retry_delay
 
 
 SOURCE_DEFINITIONS = [
+    {"id": "certspotter", "name": "Cert Spotter certificate transparency", "access": "public", "homepage": "https://sslmate.com/help/reference/ct_search_api_v1", "required": [], "description": "Incremental unexpired certificate issuances; limited keyless personal/evaluation access (10 queries/hour observed). Production access requires an account. Names remain provider evidence."},
+    {"id": "ctlogs", "name": "ctlogs.dev certificate hostnames", "access": "public", "homepage": "https://api.ctlogs.dev/", "required": [], "description": "Public no-key hostname index, one request at a time and 100 requests/hour shared pool. Certificates valid now or expired within 90 days; anonymous pagination stops at 10 pages."},
     {"id": "crtsh", "name": "crt.sh certificate transparency", "access": "public", "homepage": "https://crt.sh/", "required": [], "description": "Certificate names from the public CT index; certificate presence does not establish a live host or corporate ownership."},
     {"id": "passive_dns", "name": "HackerTarget passive host search", "access": "public", "homepage": "https://hackertarget.com/find-dns-host-records/", "required": [], "description": "Indexed hostname/IP pairs; free endpoint is limited to 20 queries/day and 50 results/request."},
     {"id": "dns_txt", "name": "Public DNS TXT / SPF / DMARC / DKIM", "access": "public", "homepage": "https://developers.google.com/speed/public-dns/docs/doh/json", "required": [], "description": "Google DNS JSON TXT answers; DKIM selectors must be explicitly configured per target."},
@@ -34,8 +37,9 @@ for _provider, _name, _homepage, _description in [
 for _definition in SOURCE_DEFINITIONS:
     _definition.update(category="network", family="exposure")
 
-ENDPOINTS = {"crtsh": "https://crt.sh/", "passive_dns": "https://api.hackertarget.com/hostsearch/", "dns_txt": "https://dns.google/resolve", "shodan": "https://api.shodan.io/shodan/host/search", "censys": "https://api.platform.censys.io/v3/global/search/query", "fofa": "https://fofa.info/api/v1/search/all", "zoomeye": "https://api.zoomeye.ai/v2/search", "netlas": "https://app.netlas.io/api/responses/"}
+ENDPOINTS = {"certspotter": "https://api.certspotter.com/v1/issuances", "ctlogs": "https://api.ctlogs.dev/v1/hosts/", "crtsh": "https://crt.sh/", "passive_dns": "https://api.hackertarget.com/hostsearch/", "dns_txt": "https://dns.google/resolve", "shodan": "https://api.shodan.io/shodan/host/search", "censys": "https://api.platform.censys.io/v3/global/search/query", "fofa": "https://fofa.info/api/v1/search/all", "zoomeye": "https://api.zoomeye.ai/v2/search", "netlas": "https://app.netlas.io/api/responses/"}
 FOFA_FIELDS = ("ip", "port", "host", "protocol", "title", "domain", "server", "os")
+CT_PROVIDERS = ("certspotter", "ctlogs", "crtsh")
 
 
 def _domain(value):
@@ -84,7 +88,17 @@ def _records(item, provider):
             rows.append({"domain": _domain(name), "ip": str(ipaddress.ip_address(address.strip()))})
         return rows
     value = _json(item)
-    if provider == "crtsh":
+    if provider == "certspotter":
+        rows = value
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] or not isinstance(row.get("dns_names"), list) or any(not isinstance(name, str) for name in row["dns_names"]) for row in rows):
+            raise NormalizationError("Cert Spotter response lacks issuance IDs and DNS names")
+    elif provider == "ctlogs":
+        if not isinstance(value, dict) or type(value.get("has_next")) is not bool or not isinstance(value.get("next_cursor"), str) or value["has_next"] and not value["next_cursor"]:
+            raise NormalizationError("ctlogs.dev response lacks pagination metadata")
+        rows = value.get("hosts")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("host"), str) for row in rows):
+            raise NormalizationError("ctlogs.dev response lacks hostname records")
+    elif provider == "crtsh":
         rows = value
     elif provider == "dns_txt":
         if not isinstance(value, dict) or type(value.get("Status")) is not int or value["Status"] not in (0, 3):
@@ -153,9 +167,9 @@ def normalize_network(item, max_records=5000):
             raise NormalizationError("Network provider record must be an object")
         names, addresses = [], []
         record_type = "indexed_service"
-        if provider == "crtsh":
+        if provider in CT_PROVIDERS:
             record_type = "certificate_name"
-            raw_names = str(record.get("name_value") or record.get("common_name") or "").splitlines()
+            raw_names = record["dns_names"] if provider == "certspotter" else [record["host"]] if provider == "ctlogs" else str(record.get("name_value") or record.get("common_name") or "").splitlines()
             for name in raw_names[:100]:
                 try:
                     domain = _domain(name.removeprefix("*."))
@@ -225,7 +239,7 @@ def normalize_network(item, max_records=5000):
             remaining -= cost
         fields = record if len(raw.encode("utf-8")) <= 12000 else {"truncated": True, "preview": raw[:6000]}
         label = (names or addresses or [provider])[0]
-        entities.append({"id": record_id, "kind": "source_record", "name": provider + ": " + label, "value": label, "source_url": item.get("source_url", ""), "observed_at": stamp, "confidence": 1.0, "metadata": {"provider": provider, "record_type": record_type, "target_domain": target, "provider_fields": fields, "staging": provenance, "attribution": "provider_report_only"}})
+        entities.append({"id": record_id, "kind": "source_record", "name": provider + ": " + label, "value": label, "source_url": item.get("source_url", ""), "observed_at": stamp, "confidence": 1.0, "metadata": {"provider": provider, "record_type": record_type, "target_domain": target, "provider_fields": fields, "staging": provenance, "attribution": "provider_report_only", **({"coverage": metadata["coverage"]} if metadata.get("coverage") else {})}})
         for kind, value in selected:
             anchor(kind, value, record_id)
     return {"entities": entities, "edges": edges}
@@ -252,6 +266,8 @@ async def collect_network_sources(config, store, http):
     semaphore = asyncio.Semaphore(max(1, min(32, int(config.get("public_source_concurrency", 4)))))
     health, errors = {}, []
     payload_limit = int(float(config.get("staging_max_payload_mb", 8)) * 1024 * 1024)
+    ct_state = await asyncio.to_thread(store.source_state, "exposure_ct") if store is not None else {}
+    ct_covered = set()
 
     async def collect_provider(definition):
         provider = definition["id"]
@@ -271,14 +287,35 @@ async def collect_network_sources(config, store, http):
             return
         status["requirements"] = []
         failures, successful = [], 0
+        incremental = provider in {"certspotter", "ctlogs"}
+        progress = ct_state.get(provider, {}) if incremental else {}
+        domain_states = dict(progress.get("targets") or {})
+        request_times = [stamp for stamp in progress.get("request_times", []) if isinstance(stamp, (int, float)) and stamp > time.time() - 3600]
+        status.update({"skipped_targets": 0, "deferred_targets": 0})
+        if incremental:
+            status["coverage"] = "unexpired_issuances" if provider == "certspotter" else "valid_or_expired_within_90_days;maximum_10_pages"
+            status["page_limit"] = 1
         provider_targets = targets[:1] if settings.get("query") and "{domain}" not in str(settings["query"]) or provider not in ENDPOINTS else targets
         state = await asyncio.to_thread(store.source_state, "exposure_cursors") if store is not None else {}
         cursor = int(state.get(provider, 0)) % len(provider_targets)
         selected = (provider_targets[cursor:] + provider_targets[:cursor])[:batch_size]
+        if incremental:
+            available = max(0, (6 if provider == "certspotter" else 30) - len(request_times))
+            status["deferred_targets"] = max(0, len(selected) - available)
+            selected = selected[:available]
         status["pending_targets"] = max(0, len(provider_targets) - len(selected))
         for target in selected:
             try:
                 domain = _domain(target["domain"])
+                if provider in CT_PROVIDERS and domain in ct_covered:
+                    status["skipped_targets"] += 1
+                    continue
+                domain_state = dict(domain_states.get(domain) or {}) if incremental else {}
+                if incremental and (float(progress.get("retry_at", 0)) > time.time() or float(domain_state.get("retry_at", 0)) > time.time() or len(request_times) >= (6 if provider == "certspotter" else 30)):
+                    status["deferred_targets"] += 1
+                    if domain_state.get("last_success") and float(domain_state.get("retry_at", 0)) > time.time():
+                        ct_covered.add(domain)
+                    continue
                 names = [domain, "_dmarc." + domain] if provider == "dns_txt" else [domain]
                 if provider == "dns_txt":
                     selectors = target.get("dkim_selectors", settings.get("dkim_selectors", []))
@@ -291,7 +328,18 @@ async def collect_network_sources(config, store, http):
                     safe_url = _public_url(url)
                     query = str(settings.get("query") or "").replace("{domain}", domain)
                     metadata = {"provider": provider, "target_domain": domain, "record_limit": record_limit}
-                    if provider == "crtsh":
+                    if provider == "certspotter":
+                        params = {"domain": domain, "include_subdomains": "true", "expand": "dns_names"}
+                        if domain_state.get("after"):
+                            params["after"] = domain_state["after"]
+                        metadata["coverage"] = "unexpired_issuances"
+                    elif provider == "ctlogs":
+                        url += domain
+                        safe_url = _public_url(url)
+                        if domain_state.get("after"):
+                            params["after"] = domain_state["after"]
+                        metadata["coverage"] = "valid_or_expired_within_90_days;maximum_10_pages"
+                    elif provider == "crtsh":
                         params = {"q": "%." + domain, "output": "json"}
                     elif provider == "passive_dns":
                         params = {"q": domain}
@@ -318,20 +366,50 @@ async def collect_network_sources(config, store, http):
                     provenance_url = safe_url + ("?" + urlencode(public_params) if public_params else "")
                     async with semaphore:
                         status["requests"] += 1
+                        if incremental:
+                            request_times.append(time.time())
                         if body is not None:
                             fetched = await http.post(url, json=body, headers=headers, max_bytes=payload_limit, max_attempts=1, allow_redirects=False)
                         else:
                             fetched = await http.get(url, params=params, headers=headers, max_bytes=payload_limit, cache=provider not in {"shodan", "fofa", "censys", "netlas"}, max_attempts=2 if provider == "crtsh" else 1, allow_redirects=not bool(credentials))
                         payload = await asyncio.to_thread(fetched.path.read_bytes)
+                        rows = _records({"payload": payload, "metadata": metadata}, provider)
+                        if incremental:
+                            if len(rows) > 1000:
+                                raise NormalizationError("Certificate page exceeds the bounded record limit")
+                            metadata["record_limit"] = max(record_limit, len(rows))
+                            if provider == "ctlogs":
+                                page = _json({"payload": payload})
+                                if page["has_next"] and page["next_cursor"] == domain_state.get("after"):
+                                    raise NormalizationError("ctlogs.dev pagination did not advance")
+                            elif rows and rows[-1]["id"] == domain_state.get("after"):
+                                raise NormalizationError("Cert Spotter pagination did not advance")
                         content_type = fetched.headers.get("Content-Type", "text/plain" if provider == "passive_dns" else "application/json").split(";", 1)[0]
                         queued = await stage_payload(config, store, payload, provider=provider, source_url=provenance_url, content_type=content_type, stream_key=provider + ":" + name, metadata=metadata)
                     duplicate = isinstance(queued, dict) and queued.get("duplicate", False)
                     status["staged"] += int(not duplicate)
                     status["unchanged"] += int(bool(duplicate))
-                    rows = _records({"payload": payload, "metadata": metadata}, provider)
-                    status["records"] += min(len(rows), record_limit)
+                    status["records"] += min(len(rows), metadata["record_limit"])
+                    if incremental:
+                        current = time.time()
+                        retry_after = next((value for key, value in fetched.headers.items() if key.lower() == "retry-after"), None)
+                        domain_state.update(last_success=current, retry_at=current + max(3600, retry_delay(retry_after, 0) if retry_after else 0))
+                        if provider == "certspotter":
+                            if rows:
+                                domain_state["after"] = rows[-1]["id"]
+                        else:
+                            pages = int(domain_state.get("pages", 0)) + 1
+                            more = page["has_next"] and pages < 10
+                            domain_state.update(after=page["next_cursor"] if more else "", pages=pages if more else 0)
+                            status["history_truncated"] = status.get("history_truncated", False) or bool(page["has_next"] and not more)
+                        domain_states[domain] = domain_state
+                    if provider in CT_PROVIDERS:
+                        ct_covered.add(domain)
                     successful += 1
             except Exception as exc:
+                if incremental:
+                    delay = max(3600, exc.retry_after or 0) if isinstance(exc, HTTPError) and exc.status in {429, 503} else 900
+                    progress["retry_at"] = time.time() + delay
                 reason = public_error(exc)
                 for value in credentials.values():
                     if isinstance(value, str) and value:
@@ -339,9 +417,15 @@ async def collect_network_sources(config, store, http):
                 failures.append(provider + ": " + reason)
         if store is not None:
             await asyncio.to_thread(store.update_source, "exposure_cursors", **{provider: (cursor + len(selected)) % len(provider_targets)})
-        status["status"] = "partial" if failures and successful else "error" if failures else "healthy"
+            if incremental:
+                await asyncio.to_thread(store.update_source, "exposure_ct", **{provider: {**progress, "targets": domain_states, "request_times": request_times}})
+        if provider == "ctlogs":
+            status["pending_pages"] = sum(bool(value.get("after")) for value in domain_states.values())
+        status["status"] = "partial" if failures and successful else "error" if failures else "deferred" if status["deferred_targets"] and not successful else "healthy"
         status["error"] = "; ".join(failures)[:1000]
         errors.extend(failures)
 
-    await asyncio.gather(*(collect_provider(definition) for definition in SOURCE_DEFINITIONS))
+    for provider in CT_PROVIDERS:
+        await collect_provider(next(row for row in SOURCE_DEFINITIONS if row["id"] == provider))
+    await asyncio.gather(*(collect_provider(definition) for definition in SOURCE_DEFINITIONS if definition["id"] not in CT_PROVIDERS))
     return {key: sum(row[key] for row in health.values()) for key in ("staged", "unchanged", "records", "requests", "pending_targets")} | {"provider_health": health, "errors": errors}
