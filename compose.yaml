@@ -11,6 +11,7 @@ services:
       - SIGNALWATCH_PROXY_USERNAME
       - SIGNALWATCH_PROXY_PASSWORD
       - SIGNALWATCH_PROXY_DIRECT_HOSTS
+      - SIGNALWATCH_STARTUP_SOURCES
     volumes:
       - ./data:/data
     restart: unless-stopped

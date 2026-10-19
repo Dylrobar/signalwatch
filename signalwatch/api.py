@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .config import VERSION
-from .engine import Engine, now
+from .engine import Engine, now, parse_startup_sources
 from .ingestion import StagingWorker, staging_queue
 from .staging import QueueFull
 from .store import Store
@@ -155,6 +155,7 @@ def compact_records(result):
 
 
 def create_app(config, auto_collect=True):
+    startup_sources = parse_startup_sources(os.environ.get("SIGNALWATCH_STARTUP_SOURCES"), config["sources"]) if auto_collect else []
     store = Store(config["db"])
     engine = Engine(config, store)
     ingress = staging_queue(store, config)
@@ -176,7 +177,7 @@ def create_app(config, auto_collect=True):
             tasks.add(asyncio.create_task(ingress_worker.run(), name="staging-worker"))
             await wireless_imports.resume()
             if auto_collect:
-                task = asyncio.create_task(engine.schedule())
+                task = asyncio.create_task(engine.schedule(startup_sources=startup_sources))
                 tasks.add(task)
             yield
             await wireless_imports.stop()

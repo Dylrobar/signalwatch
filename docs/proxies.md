@@ -131,3 +131,24 @@ browser traffic, incoming API connections, native DNS queries, or other network
 tools. HTTPS certificate verification remains enabled. Proxy credentials are
 passed separately as HTTP proxy authentication and are omitted from endpoint
 representations and configuration diagnostics.
+
+## Run feeds after a connection repair
+
+An administrator can request selected collectors on the next server startup:
+
+```sh
+SIGNALWATCH_STARTUP_SOURCES='kev,nvd'
+```
+
+Set this in the worker's server environment and restart it. The value is a
+comma-separated list of exact collector names. The startup run uses the existing
+collection guard and runs before normal automatic scheduling. It can run before
+the usual collection interval is due, but preserves collector retry deadlines
+and HTTP cooldowns. If another run holds the guard, it waits for a bounded period
+before returning to the normal schedule.
+
+This setting applies only when automatic collection is enabled; `--no-collect`
+suppresses it. It does not change normal source intervals or clear rate limits.
+After confirming recovery in the collector logs, remove the variable or set it to
+an empty string. Leaving it set requests the same startup run on every restart.
+Keep this operational control in server configuration, outside the frontend.
