@@ -47,25 +47,68 @@ Oxylabs ISP usernames require the `user-` prefix; include it in
 `SIGNALWATCH_PROXY_USERNAME` (for example, `user-<provider-username>`).
 SignalWatch sends this value unchanged.
 
-Docker Compose passes these four variables into the service. Export them before
-starting Compose; a file path must refer to a file inside the container, such as
+Docker Compose passes these four variables and `SIGNALWATCH_PROXY_DIRECT_HOSTS`
+into the service. Export them before starting Compose; a file path must refer to
+a file inside the container, such as
 `/data/proxies.json` on the existing persistent data mount. On Render, add the
 JSON list and both credential variables to the service environment.
 
-Restart the worker after changing its environment. With all four variables unset,
-the existing HTTP connection behavior is unchanged. An invalid or incomplete
-configuration fails closed with a sanitized error. A configured pool never
-silently falls back to a direct connection.
+Restart the worker after changing its environment. With the proxy list and
+credential variables unset, the existing HTTP connection behavior is unchanged.
+An invalid or incomplete configuration fails closed with a sanitized error.
 
-New public HTTP requests select proxies in round-robin order. Transient transport
-failures may try another available endpoint within the request's existing retry
+## Direct routes for official government feeds
+
+When a proxy pool is configured, SignalWatch connects directly to these exact
+hosts by default:
+
+- `www.cisa.gov`
+- `nvd.nist.gov`
+- `services.nvd.nist.gov`
+
+These public publisher routes are selected before sending a request. They retain
+HTTPS certificate verification, origin concurrency limits, caching, and cooldowns,
+and never send the pool's proxy credentials. This prevents public CISA and NVD
+feeds from being sent through a provider that restricts government destinations.
+Oxylabs documents [government sites as restricted ISP proxy targets](https://developers.oxylabs.io/products/proxies/isp-proxies/restricted-targets)
+and [gateway `403` as a restricted-target denial](https://developers.oxylabs.io/products/proxies/isp-proxies/response-codes).
+Using the proxy for these targets requires the provider's approval; rotating
+ports does not resolve that restriction.
+
+To replace the default direct routes, supply comma-separated exact hostnames:
+
+```sh
+SIGNALWATCH_PROXY_DIRECT_HOSTS='www.cisa.gov,nvd.nist.gov,services.nvd.nist.gov'
+```
+
+Names are normalized for case, IDNA, and a trailing dot. The setting accepts IP
+literals, but no URLs, ports, credentials, paths, or wildcards. Empty comma entries
+are ignored. A hostname applies to that host's requests; it does not match parent
+domains, subdomains, or names that merely end with the same text. An override
+replaces the entire default set. To require the configured proxy for every host,
+explicitly set `SIGNALWATCH_PROXY_DIRECT_HOSTS=''`.
+
+The route is checked again at every redirect. A direct request that redirects to
+another host uses that host's configured route. Direct requests remain available
+while the proxy pool is cooling down or has rejected authentication. Direct
+failures do not rotate or disable proxy endpoints.
+
+These are chosen routes, not automatic fallbacks. A request assigned to the proxy
+never switches to direct access after a proxy error. A direct request also never
+switches to a proxy after an origin denies access. Unknown hosts continue to use
+the configured proxy, and neither route bypasses source access or rate limits.
+
+## Rotation, failures, and rate limits
+
+New requests assigned to the proxy select endpoints in round-robin order.
+Transient transport failures may try another available endpoint within the request's existing retry
 budget; failed endpoints cool down for 60 seconds. If all usable endpoints are
 cooling down, the request reports unavailability and the earliest remaining
 cooldown. Proxy authentication rejection disables that client's pool until it is
 recreated with corrected credentials. Proxy denials fail without rotation.
-When a proxy gateway reports a `429` throttle or a transient gateway failure with
-`Retry-After`, its cooldown applies to the entire pool, so another port cannot
-bypass the provider's limit. Requests already waiting to retry recheck pool
+When a proxy gateway reports a `429` throttle, a `403` with `Retry-After`, or a
+transient gateway failure with `Retry-After`, its cooldown applies to the entire
+pool, so another port cannot bypass the provider's limit. Requests already waiting to retry recheck pool
 availability before making another attempt. Gateway deadlines persist in the
 shared cache across new client instances and worker restarts. Their cache markers
 contain only a deadline and HTTP status, keyed by a hash of normalized endpoints.

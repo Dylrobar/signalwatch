@@ -57,6 +57,7 @@ class ProxyHTTPTests(unittest.IsolatedAsyncioTestCase):
             "SIGNALWATCH_PROXY_LIST_FILE": "",
             "SIGNALWATCH_PROXY_USERNAME": "fixture-user",
             "SIGNALWATCH_PROXY_PASSWORD": "fixture-password",
+            "SIGNALWATCH_PROXY_DIRECT_HOSTS": "www.cisa.gov,nvd.nist.gov,services.nvd.nist.gov",
         }
 
         async def sleep(delay):
@@ -186,6 +187,187 @@ class ProxyHTTPTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PublicRequestError, "Proxy HTTP 403"):
             await self.http.get("https://example.test/feed")
         self.assertEqual(self.http.session.get.call_count, 1)
+
+    async def test_proxy_connect_403_retry_after_preserves_provider_cooldown(self):
+        self.http.session.get.side_effect = self.proxy_error(403, CIMultiDict({"retry-after": "120"}))
+        with self.assertRaises(PublicRequestError) as raised:
+            await self.http.get("https://example.test/feed")
+        self.assertEqual(raised.exception.retry_after, 120)
+        self.assertIn("Proxy HTTP 403", str(raised.exception))
+        with self.assertRaises(PublicRequestError) as raised:
+            await self.http.get("https://another.test/feed")
+        self.assertEqual(raised.exception.retry_after, 120)
+        self.assertEqual(self.http.session.get.call_count, 1)
+
+    async def test_official_feed_hosts_connect_directly_without_proxy_credentials(self):
+        for host in ("www.cisa.gov", "nvd.nist.gov", "services.nvd.nist.gov"):
+            url = f"https://{host}/feed"
+            self.http.session.get.return_value = Response(url=url)
+            await self.http.get(url)
+        self.assertEqual(self.used_proxies(), [None, None, None])
+        for call in self.http.session.get.call_args_list:
+            self.assertIsNone(call.kwargs.get("proxy_auth"))
+            self.assertNotIn("Proxy-Authorization", call.kwargs["headers"])
+        self.http.session.get.return_value = Response()
+        await self.http.get("https://example.test/feed")
+        self.assertEqual(self.used_proxies()[-1], "http://first.example.test:8080")
+
+    async def test_direct_host_matching_is_exact_and_canonicalized(self):
+        urls = ["https://WWW.CISA.GOV./feed", "https://nvd.nist.gov.attacker.test/feed",
+                "https://www.cisa.gov.attacker.test/feed", "https://subdomain.nvd.nist.gov/feed",
+                "https://cisa.gov/feed", "https://notnvd.nist.gov/feed"]
+        for url in urls:
+            self.http.session.get.return_value = Response(url=url)
+            await self.http.get(url)
+        self.assertEqual(self.used_proxies()[0], None)
+        self.assertTrue(all(self.used_proxies()[1:]))
+
+    async def test_empty_direct_host_override_keeps_all_requests_on_proxy(self):
+        with patch.dict(os.environ, {"SIGNALWATCH_PROXY_DIRECT_HOSTS": ""}):
+            http = self.client()
+        http.session.get.return_value = Response(url="https://www.cisa.gov/feed")
+        await http.get("https://www.cisa.gov/feed")
+        self.assertEqual(self.used_proxies(http), ["http://first.example.test:8080"])
+
+    async def test_custom_direct_host_override_replaces_default_routes(self):
+        with patch.dict(os.environ, {"SIGNALWATCH_PROXY_DIRECT_HOSTS": "BÜCHER.example.,[2001:db8::1]"}):
+            http = self.client()
+        for url in ("https://bücher.example/feed", "https://xn--bcher-kva.example/feed2",
+                    "https://[2001:0db8:0:0:0:0:0:1]/feed", "https://www.cisa.gov/feed"):
+            http.session.get.return_value = Response(url=url)
+            await http.get(url)
+        self.assertEqual(self.used_proxies(http), [None, None, None, "http://first.example.test:8080"])
+
+    async def test_direct_post_never_sends_proxy_credentials(self):
+        self.http.session.post.return_value = Response(url="https://services.nvd.nist.gov/feed")
+        await self.http.post("https://services.nvd.nist.gov/feed", json={"fixture": True})
+        call = self.http.session.post.call_args
+        self.assertIsNone(call.kwargs.get("proxy"))
+        self.assertIsNone(call.kwargs.get("proxy_auth"))
+        self.assertNotIn("Proxy-Authorization", call.kwargs["headers"])
+
+    async def test_direct_routes_remain_available_when_proxy_pool_is_unavailable(self):
+        for failure in ("authentication", "provider_cooldown", "endpoint_cooldowns"):
+            with self.subTest(failure=failure):
+                http = self.client()
+                if failure == "authentication":
+                    http.proxy_pool.reject_auth()
+                elif failure == "provider_cooldown":
+                    http.proxy_pool.defer(120)
+                else:
+                    for _ in range(3):
+                        http.proxy_pool.fail(http.proxy_pool.choose())
+                http.session.get.return_value = Response(url="https://nvd.nist.gov/feed")
+                await http.get("https://nvd.nist.gov/feed")
+                self.assertEqual(self.used_proxies(http), [None])
+                with self.assertRaises(PublicRequestError):
+                    await http.get("https://example.test/feed")
+                self.assertEqual(http.session.get.call_count, 1)
+
+    async def test_direct_transport_retries_do_not_rotate_or_disable_proxy_endpoints(self):
+        self.http.session.get.side_effect = asyncio.TimeoutError("private direct transport detail")
+        with self.assertRaisesRegex(PublicRequestError, "Connection timed out"):
+            await self.http.get("https://www.cisa.gov/feed", max_attempts=2)
+        self.assertEqual(self.used_proxies(), [None, None])
+        self.http.session.get.side_effect = None
+        self.http.session.get.return_value = Response()
+        for index in range(3):
+            await self.http.get(f"https://example.test/{index}")
+        self.assertEqual(self.used_proxies()[2:], ["http://first.example.test:8080",
+                                                "http://second.example.test:8080",
+                                                "http://third.example.test:8080"])
+
+    async def test_direct_auth_and_missing_responses_never_fallback_to_proxy(self):
+        for status in (401, 403, 404, 407):
+            with self.subTest(status=status):
+                http = self.client()
+                http.session.get.return_value = Response(status, url="https://www.cisa.gov/feed")
+                with self.assertRaises(HTTPError) as raised:
+                    await http.get("https://www.cisa.gov/feed")
+                self.assertEqual(raised.exception.status, status)
+                self.assertEqual(self.used_proxies(http), [None])
+                http.session.get.return_value = Response()
+                await http.get("https://example.test/feed")
+                self.assertEqual(self.used_proxies(http)[-1], "http://first.example.test:8080")
+
+    async def test_direct_origin_throttle_does_not_defer_proxy_pool(self):
+        self.http.session.get.return_value = Response(429, url="https://nvd.nist.gov/feed",
+                                                       headers={"Retry-After": "120"})
+        with self.assertRaises(HTTPError) as raised:
+            await self.http.get("https://nvd.nist.gov/feed")
+        self.assertEqual(raised.exception.retry_after, 120)
+        with self.assertRaises(HTTPError):
+            await self.http.get("https://nvd.nist.gov/other")
+        self.assertEqual(self.http.session.get.call_count, 1)
+        self.http.session.get.return_value = Response()
+        await self.http.get("https://example.test/feed")
+        self.assertEqual(self.used_proxies(), [None, "http://first.example.test:8080"])
+
+    async def test_redirects_reselect_direct_or_proxy_route_for_every_hop(self):
+        start = "https://example.test/start"
+        direct = "https://www.cisa.gov/feed"
+        final = "https://another.test/feed"
+        self.http.session.get.side_effect = [
+            Response(302, url=start, headers={"Location": direct}),
+            Response(302, url=direct, headers={"Location": final}),
+            Response(url=final),
+        ]
+        await self.http.get(start, headers={"Authorization": "Bearer origin-fixture"})
+        self.assertEqual(self.used_proxies(), ["http://first.example.test:8080", None,
+                                             "http://first.example.test:8080"])
+        calls = self.http.session.get.call_args_list
+        self.assertIsNone(calls[1].kwargs.get("proxy_auth"))
+        self.assertNotIn("Authorization", calls[1].kwargs["headers"])
+        self.assertNotIn("Authorization", calls[2].kwargs["headers"])
+        self.assertEqual(calls[2].kwargs["proxy_auth"].login, "fixture-user")
+
+    async def test_direct_redirect_to_proxy_destination_honors_unavailable_pool(self):
+        self.http.proxy_pool.reject_auth()
+        self.http.session.get.return_value = Response(302, url="https://www.cisa.gov/feed",
+                                                     headers={"Location": "https://example.test/feed"})
+        with self.assertRaisesRegex(PublicRequestError, "authentication was rejected"):
+            await self.http.get("https://www.cisa.gov/feed")
+        self.assertEqual(self.used_proxies(), [None])
+
+    async def test_failure_after_redirect_to_direct_host_does_not_poison_retained_proxy(self):
+        start = "https://example.test/start"
+        direct = "https://nvd.nist.gov/feed"
+        self.http.session.get.side_effect = [
+            Response(302, url=start, headers={"Location": direct}),
+            asyncio.TimeoutError("direct timeout"),
+            Response(302, url=start, headers={"Location": direct}),
+            Response(url=direct),
+        ]
+        await self.http.get(start, max_attempts=2)
+        self.assertEqual(self.used_proxies(), ["http://first.example.test:8080", None,
+                                             "http://first.example.test:8080", None])
+
+    async def test_transport_failure_after_direct_redirect_rotates_only_failed_proxy(self):
+        start = "https://www.cisa.gov/start"
+        proxied = "https://example.test/feed"
+        self.http.session.get.side_effect = [
+            Response(302, url=start, headers={"Location": proxied}),
+            asyncio.TimeoutError("proxy transport timeout"),
+            Response(302, url=start, headers={"Location": proxied}),
+            Response(url=proxied),
+        ]
+        await self.http.get(start, max_attempts=2)
+        self.assertEqual(self.used_proxies(), [None, "http://first.example.test:8080",
+                                             None, "http://second.example.test:8080"])
+
+    async def test_origin_retry_after_direct_redirect_retains_same_proxy(self):
+        start = "https://www.cisa.gov/start"
+        proxied = "https://example.test/feed"
+        self.http.session.get.side_effect = [
+            Response(302, url=start, headers={"Location": proxied}),
+            Response(503, url=proxied, headers={"Retry-After": "2"}),
+            Response(302, url=start, headers={"Location": proxied}),
+            Response(url=proxied),
+        ]
+        await self.http.get(start, max_attempts=2)
+        self.assertEqual(self.used_proxies(), [None, "http://first.example.test:8080",
+                                             None, "http://first.example.test:8080"])
+        self.assertEqual(self.waits, [2])
 
     async def test_proxy_429_defers_entire_pool_across_destination_hosts(self):
         self.http.session.get.side_effect = self.proxy_error(429, CIMultiDict({"retry-after": "120"}))

@@ -17,11 +17,12 @@ from bs4 import BeautifulSoup
 
 from .async_utils import gather, to_thread
 from .extract import canonical_url, fingerprint_page, open_payload, parse_feed, parse_nvd, product_entities, read_json, utcnow
-from .http import HTTPError, PublicHTTP, display_url
+from .http import HTTPError, PublicHTTP, PublicRequestError, display_url
 
 
 NVD_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0/nvdcve-2.0-"
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_MIRROR_URL = "https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json"
 EPSS_URL = "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
 GITHUB_URL = "https://api.github.com/advisories"
 WIKIDATA_URL = "https://query.wikidata.org/sparql"
@@ -216,7 +217,8 @@ class Collector:
             try:
                 counts, digest = await self._nvd_feed(feed, hashes.get(feed))
             except HTTPError as error:
-                if error.status not in (403, 404):
+                if (error.status not in (403, 404)
+                        or error.retry_after is not None and error.retry_after > 0):
                     raise
                 return await self._nvd_api(state)
             hashes[feed] = digest
@@ -269,8 +271,13 @@ class Collector:
         state = await self.state("kev")
         try:
             result = await self.http.get(KEV_URL)
-        except HTTPError:
-            result = await self.http.get("https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json")
+        except (HTTPError, PublicRequestError) as error:
+            # CISA maintains the same catalog on GitHub. Transport failures
+            # (including a proxy's CONNECT denial) can use that official copy,
+            # but an active server or gateway cooldown must still be observed.
+            if error.retry_after is not None and error.retry_after > 0:
+                raise
+            result = await self.http.get(KEV_MIRROR_URL)
         if state.get("digest") == result.digest:
             return {"kev": 0}
         payload = await asyncio.to_thread(read_json, result.path)

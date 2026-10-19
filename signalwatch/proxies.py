@@ -16,6 +16,7 @@ import aiohttp
 
 MAX_PROXY_BYTES = 256 * 1024
 MAX_PROXIES = 256
+DEFAULT_DIRECT_HOSTS = "www.cisa.gov,nvd.nist.gov,services.nvd.nist.gov"
 
 
 class ProxyConfigurationError(ValueError):
@@ -67,6 +68,23 @@ def _port(value):
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         raise ProxyConfigurationError("Invalid proxy port")
     return value
+
+
+def direct_hosts_from_env(environ=None):
+    """Exact public destinations intentionally collected without a proxy.
+
+    Government feeds are unavailable through providers that restrict government
+    targets. This is a routing policy, never a fallback after a proxy denial.
+    An explicitly empty value sends every destination through the configured pool.
+    """
+    env = os.environ if environ is None else environ
+    value = env.get("SIGNALWATCH_PROXY_DIRECT_HOSTS", DEFAULT_DIRECT_HOSTS)
+    if not isinstance(value, str) or len(value) > 16384:
+        raise ProxyConfigurationError("Invalid direct proxy host list")
+    try:
+        return frozenset(_host(host.strip()).strip("[]") for host in value.split(",") if host.strip())
+    except ProxyConfigurationError:
+        raise ProxyConfigurationError("Direct proxy hosts must be exact hostnames without URLs, ports or wildcards") from None
 
 
 def _endpoint_url(entry):
