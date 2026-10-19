@@ -19,6 +19,8 @@ import {
 } from "@/lib/companies";
 import { confidence, fmtDate, humanize, num, type R } from "@/lib/format";
 import { Badge, ExtLink } from "./bits";
+import { CompanyWireless } from "./CompanyWireless";
+import type { CompanyWirelessSummary } from "@/lib/wireless";
 
 type Saved = (detail: R) => void;
 type Go = (id: unknown) => void;
@@ -480,10 +482,12 @@ export function CompanyProfile({
   profile,
   onSaved,
   go,
+  wirelessSummary,
 }: {
   profile: Profile;
   onSaved: Saved;
   go: Go;
+  wirelessSummary?: CompanyWirelessSummary | undefined;
 }) {
   const [editing, setEditing] = useState(false);
   const [review, setReview] = useState<CompanyAsset | "new" | null>(null);
@@ -619,6 +623,7 @@ export function CompanyProfile({
           onCancel={() => setReview(null)}
         />
       )}
+      <CompanyWireless companyId={profile.company_id} onCompany={go} summary={wirelessSummary} />
     </section>
   );
 }

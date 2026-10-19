@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 
 DEFAULTS = {
@@ -54,6 +54,8 @@ DEFAULTS = {
     "staging_poll_seconds": 2,
     "staging_retention_days": 7,
     "staging_max_completed": 10000,
+    "wireless_import_max_mb": 32,
+    "wireless_chunk_rows": 5000,
     "source_intervals": {"news": 15, "threat": 15, "nvd": 360, "kev": 360, "epss": 360,
                          "github": 360, "osv": 360, "cve_program": 360, "csaf": 360,
                          "exposure": 10080, "corporate": 10080, "developer": 10080, "hardware": 43200},
@@ -173,9 +175,13 @@ def load_config(path="config.json"):
         if int(config[name]) < 1:
             raise ValueError(f"{name} must be positive")
     for name in ("dns_timeout", "dns_concurrency", "sbom_max_mb", "events_max_rows", "events_retention_days",
-                 "staging_max_payload_mb", "staging_max_mb", "staging_poll_seconds", "staging_retention_days"):
+                 "staging_max_payload_mb", "staging_max_mb", "staging_poll_seconds", "staging_retention_days", "wireless_import_max_mb"):
         if not math.isfinite(float(config[name])) or float(config[name]) <= 0:
             raise ValueError(f"{name} must be positive")
+    chunk_rows = float(config["wireless_chunk_rows"])
+    if isinstance(config["wireless_chunk_rows"], bool) or not math.isfinite(chunk_rows) or not chunk_rows.is_integer() or not 1 <= chunk_rows <= 5000:
+        raise ValueError("wireless_chunk_rows must be an integer between 1 and 5000")
+    config["wireless_chunk_rows"] = int(chunk_rows)
     if config["dns_mode"] not in {"system", "fallback", "doh"}:
         raise ValueError("dns_mode must be system, fallback, or doh")
     if int(config["staging_batch"]) > 500:

@@ -22,6 +22,7 @@ export type View = {
   version_state: string;
   sort: "rank" | "newest";
   offset: number;
+  infra?: "wireless";
 };
 
 export const VIEWS: Record<DataTab, { title: string; endpoint: string; exportKind: string; placeholder: string; noun: string }> = {
@@ -48,6 +49,7 @@ export function parseView(raw: Record<string, unknown>): View {
     version_state: (VERSION_STATES as readonly string[]).includes(vs) ? vs : "",
     sort: raw["sort"] === "newest" ? "newest" : "rank",
     offset: Number.isSafeInteger(offset) && offset > 0 ? Math.floor(offset / PAGE) * PAGE : 0,
+    ...(raw["infra"] === "wireless" ? { infra: "wireless" as const } : {}),
   };
 }
 
@@ -55,6 +57,7 @@ export function compactView(v: View): Record<string, string | number | boolean> 
   const out: Record<string, string | number | boolean> = { tab: v.tab };
   if (v.q) out["q"] = v.q;
   if (v.tab === "infrastructure" && v.kind) out["kind"] = v.kind;
+  if (v.tab === "infrastructure" && v.infra === "wireless") out["infra"] = "wireless";
   if (v.tab === "changes" && v.event_kind) out["event_kind"] = v.event_kind;
   if (v.tab === "intelligence" || v.tab === "warnings") {
     if (v.kev) out["kev"] = true;

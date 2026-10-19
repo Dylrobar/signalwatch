@@ -11,6 +11,8 @@ from pathlib import Path
 from .companies import COMPANY_SCHEMA, asset_identity, company, company_assets, company_profile, labels, validate_parent
 from .matching import cpe_fields, ecosystem_identity, identifier, normalize, osv_version_match, package_identity, rank, version_match
 from .staging import STAGING_SCHEMA
+from .wireless import WIRELESS_SCHEMA, ingest_wireless
+from .wireless_attribution import ATTRIBUTION_SCHEMA, company_wireless_summary
 
 
 SCHEMA = """
@@ -262,6 +264,8 @@ class Store:
             conn.executescript(SCHEMA)
             conn.executescript(COMPANY_SCHEMA)
             conn.executescript(STAGING_SCHEMA)
+            conn.executescript(WIRELESS_SCHEMA)
+            conn.executescript(ATTRIBUTION_SCHEMA)
             if "superseded_by" not in {row[1] for row in conn.execute("PRAGMA table_info(raw_ingress)")}:
                 conn.execute("ALTER TABLE raw_ingress ADD COLUMN superseded_by INTEGER")
             if not had_advisory_seen:
@@ -391,6 +395,8 @@ class Store:
             batch = {**batch, "advisories": list(batch.get("advisories") or []) + stubs}
         counts = {key: len(batch.get(key) or []) for key in ("advisories", "articles", "entities", "edges", "observations", "kev", "epss")}
         with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
+            if "wireless_batch" in batch:
+                counts.update(ingest_wireless(self, conn, batch["wireless_batch"], timestamp))
             if snapshot is not None:
                 conn.execute("CREATE TEMP TABLE kev_current(cve TEXT PRIMARY KEY)")
                 conn.executemany("INSERT OR IGNORE INTO kev_current(cve) VALUES(?)", ((identifier(item["cveID"]),) for item in snapshot))
@@ -757,6 +763,7 @@ class Store:
             asset_ids = {entity_id}
             if entity and entity.get("kind") == "company":
                 result["company_profile"] = company_profile(conn, entity)
+                result["wireless_summary"] = company_wireless_summary(conn, entity_id)
                 result["name"] = result["company_profile"]["name"]
                 profile = result["company_profile"]
                 profile["assets"], profile["assets_truncated"] = company_assets(conn, entity_id)

@@ -9,6 +9,7 @@ import { ConnectionDialog } from "@/components/sw/ConnectionDialog";
 import { Drawer } from "@/components/sw/Drawer";
 import { ListView } from "@/components/sw/ListView";
 import { SourceIssues } from "@/components/sw/SourceIssues";
+import { WirelessView } from "@/components/sw/WirelessView";
 import { phaseOf, useStatus, type ConnPhase } from "@/hooks/use-signalwatch";
 import { connection } from "@/lib/api";
 import { describe, num, type R } from "@/lib/format";
@@ -136,6 +137,8 @@ function App() {
 
         {d?.["error"] && <Notice tone="danger" title="Collection failed"><SourceIssues errors={[describe(d["error"])]} /></Notice>}
 
+        {phase === "connected" && view.tab === "infrastructure" && <div className="flex flex-wrap gap-2" aria-label="Infrastructure view"><button type="button" className={view.infra === "wireless" ? "sw-btn" : "sw-btn-primary"} aria-pressed={view.infra !== "wireless"} onClick={() => { const next = { ...view }; delete next.infra; navigate({ search: compactView(next) }); }}>Inventory</button><button type="button" className={view.infra === "wireless" ? "sw-btn-primary" : "sw-btn"} aria-pressed={view.infra === "wireless"} onClick={() => change({ infra: "wireless" })}>Wireless</button></div>}
+
         {phase === "disconnected" ? (
           <Notice title="No backend connected">
             This dashboard reads a separately hosted SignalWatch Python API. No data is shown until you connect one.
@@ -153,6 +156,8 @@ function App() {
           </Notice>
         ) : view.tab === "collectors" ? (
           <Collectors key={conn.gen} status={d!} refresh={() => status.refetch()} />
+        ) : view.tab === "infrastructure" && view.infra === "wireless" ? (
+          <WirelessView key={conn.gen} gen={conn.gen} onCompany={(id) => setDrawer({ row: { id, kind: "company" }, tab: "infrastructure" })} />
         ) : (
           <ListView key={`${conn.gen}:${view.tab}`} view={view} gen={conn.gen} stats={stats} onChange={change} onOpen={(row, tab) => setDrawer({ row, tab })} onCollectors={() => goTab("collectors")} onCreateCompany={() => setDrawer({ row: { kind: "company", new_company: true }, tab: "infrastructure" })} />
         )}

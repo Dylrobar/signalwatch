@@ -159,6 +159,8 @@ def create_app(config, auto_collect=True):
     engine = Engine(config, store)
     ingress = staging_queue(store, config)
     ingress_worker = StagingWorker(store, config, ingress)
+    from .wireless_import import WirelessImports
+    wireless_imports = WirelessImports(store, config)
     tasks = set()
     config_lock = threading.Lock()
 
@@ -172,10 +174,17 @@ def create_app(config, auto_collect=True):
     async def lifespan(app):
         async with engine:
             tasks.add(asyncio.create_task(ingress_worker.run(), name="staging-worker"))
+            await wireless_imports.resume()
             if auto_collect:
                 task = asyncio.create_task(engine.schedule())
                 tasks.add(task)
             yield
+            await wireless_imports.stop()
+            enrichment = getattr(app.state, "wireless_enrichment", {}).get("task")
+            if enrichment is not None and not enrichment.done():
+                enrichment.cancel()
+                with suppress(asyncio.CancelledError):
+                    await enrichment
             for task in list(tasks):
                 task.cancel()
             for task in list(tasks):
@@ -202,7 +211,9 @@ def create_app(config, auto_collect=True):
         except Exception:
             logging.getLogger("signalwatch").exception("HTTP request failed")
             return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
-    app.add_middleware(CORSMiddleware, allow_origins=config.get("cors_origins", []), allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type"], allow_credentials=False)
+    app.add_middleware(CORSMiddleware, allow_origins=config.get("cors_origins", []), allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Filename", "X-Source-Url"], allow_credentials=False)
+    from .wireless_api import register_wireless_routes
+    register_wireless_routes(app, config, store, wireless_imports)
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 

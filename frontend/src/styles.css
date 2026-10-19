@@ -148,3 +148,32 @@
     @apply mt-1 max-h-64 overflow-auto rounded border border-border bg-background p-2 text-xs;
   }
 }
+
+.sw-wireless-map.leaflet-container {
+  z-index: 0;
+  font-family: var(--font-sans);
+  background-color: var(--background);
+  background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 64px 64px;
+}
+.sw-wireless-map .leaflet-control-zoom a {
+  background: var(--card);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+.sw-wireless-map .leaflet-control-attribution {
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 10px;
+}
+.sw-wireless-map .leaflet-control-attribution a {
+  color: var(--primary);
+}
+.sw-wireless-map .leaflet-tooltip {
+  background: var(--card);
+  color: var(--foreground);
+  border-color: var(--border);
+  max-width: 260px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}

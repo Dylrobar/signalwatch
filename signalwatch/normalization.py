@@ -385,7 +385,12 @@ def public_source(item, maximum):
     return normalize_public_source(item, max_records=maximum)
 
 
-ADAPTERS = {"auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source}
+def wigle_csv(item, maximum):
+    from .wireless import normalize_wigle
+    return normalize_wigle(item, max_records=maximum)
+
+
+ADAPTERS = {"auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source, "wigle_csv": wigle_csv}
 
 
 def normalize(item, max_records=5000):

@@ -8,6 +8,7 @@ import { Badge, EventBadge, ExtLink, Severity, Signals } from "./bits";
 import { Modal } from "./Modal";
 import { CompanyIdentityForm, CompanyProfile } from "./CompanyProfile";
 import type { CompanyProfile as Profile } from "@/lib/companies";
+import type { CompanyWirelessSummary } from "@/lib/wireless";
 
 type Kind = "intelligence" | "news" | "infrastructure" | "warnings" | "changes" | "unavailable";
 type Frame = { kind: Kind; row: R; detail?: R; loading: boolean; error?: string; id?: string; originalUrl?: string; request?: { path: string; id: string } };
@@ -444,6 +445,7 @@ function EntityBody({
           profile={d["company_profile"] as Profile}
           onSaved={onSaved}
           go={go}
+          wirelessSummary={d["wireless_summary"] as CompanyWirelessSummary | undefined}
         />
       )}
       <Fields

@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.8.0 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.9.0 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,
@@ -44,6 +44,8 @@
   "staging_poll_seconds": 2,
   "staging_retention_days": 7,
   "staging_max_completed": 10000,
+  "wireless_import_max_mb": 32,
+  "wireless_chunk_rows": 5000,
   "source_intervals": {
     "news": 15,
     "threat": 15,

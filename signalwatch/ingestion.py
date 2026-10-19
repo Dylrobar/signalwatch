@@ -40,7 +40,8 @@ class StagingWorker:
                 batch = normalize(item)
                 self.queue.complete(item["id"], item["lease_token"], batch)
                 result["processed"] += 1
-                self.needs_matching = True
+                if set(batch) != {"wireless_batch"}:
+                    self.needs_matching = True
             except LeaseLost:
                 result["lease_lost"] += 1
             except Exception as error:

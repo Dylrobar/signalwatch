@@ -237,6 +237,39 @@ Arrival order is preserved per `(source, stream_key)`, across adapters. A delaye
 
 Defaults allow 8 MiB per payload and 512 MiB/10,000 raw records total. Processed raw records expire after seven days and may be evicted sooner to admit new data; normalized records remain. Pending, processing, and dead records are never evicted automatically. When they fill capacity, admission returns HTTP 503 with `Retry-After: 30`. Raw references can outlive raw retention, so payload retrieval may later return 404. These bounds cover raw payload bytes, not total SQLite/index/WAL disk usage.
 
+## Wireless datasets and company evidence
+
+The Wireless view imports WiGLE CSV or CSV.gz exports, displays observation clusters on a map, and opens device histories and company evidence. Uploads enter the existing staging queue in bounded chunks; canonical `wireless_datasets`, `wireless_devices`, and `wireless_observations` tables preserve every source row, including identical repeated observations. Dataset identity is the original file SHA-256; `(dataset_id, source_row)` prevents reimports from duplicating observations. Interrupted imports resume from the retained archive.
+
+The original uploaded bytes remain under the database directory's `wireless-imports` directory and are available through the authenticated source-download endpoint. Staging retention does not delete that archive or canonical wireless observations. Keep the database and its adjacent import directory on persistent storage.
+
+| Field | Interpretation |
+| --- | --- |
+| Coordinates / GPS accuracy | Scanner positions and reported location uncertainty; map points represent observations. A device's representative point records its source dataset, row, and timestamp. Older chunks do not replace a newer representative observation. |
+| `FirstSeen` | Per-observation time. Native WiGLE exports use UTC despite omitting a suffix; original text is preserved. Epoch-1970 sentinels become unknown timestamps. Generic CSV without native provenance retains an unspecified timezone. |
+| `Frequency` | Wi-Fi MHz; Bluetooth device-class code; cellular channel-number field. It is not universally MHz. |
+| Identifier / type | Stable identity uses radio type plus identifier. Cellular identifiers retain their full source value; Wi-Fi and Bluetooth MAC addresses normalize separately. |
+| Raw row / validation | Unknown columns and original field text remain available. Invalid coordinates remain in the observation with validation reasons and no map point. |
+| Company links | Registry manufacturer assignments, advertised providers, and nearby business candidates retain separate roles and evidence. A manufacturer or nearby facility does not establish the device operator. Manual confirmation or rejection is explicit; rejection suppresses automatic links for that company. |
+
+Official IEEE/Bluetooth registry imports enrich manufacturer/provider evidence; existing device classifications can be imported with provenance. Business matching uses imported public OpenStreetMap facility records and observation coordinates with uncertainty. External business lookups require `lookup_businesses: true`; ordinary enrichment does not send observation areas to another service. The map works locally, with optional OpenStreetMap tiles enabled explicitly in the interface. Company profiles include a distinct-device wireless summary. Wireless observations alone create no software deployments or vulnerability warnings.
+
+All endpoints use the existing API authentication:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /api/import/wigle` | Raw CSV/CSV.gz request body; optional `X-Filename` and `X-Source-Url`; returns `202` and dataset/job ID. |
+| `GET /api/wireless/datasets` / `GET /api/wireless/datasets/{id}` | Counts, bounds, import state, and progress. |
+| `GET /api/wireless/datasets/{id}/source` | Original uploaded bytes. |
+| `GET /api/wireless/stats?dataset_id=...` | Global or dataset-scoped distinct-device and observation counts. |
+| `GET /api/wireless/devices` / `GET /api/wireless/devices/{id}` | Search, type/dataset/company filters, observation history, and attribution evidence. |
+| `GET /api/wireless/map?bbox=west,south,east,north&zoom=...` | Bounded GeoJSON clusters with matched observation totals; supports dataset, type, query, and company filters. |
+| `POST /api/wireless/devices/{id}/company` | Evidence-backed manual operator confirmation or rejection. |
+| `GET/POST /api/wireless/facilities` | Inspect or add sourced business locations. |
+| `POST /api/wireless/registries` / `POST /api/wireless/device-enrichment` | Import manufacturer registries or prior device classifications with source provenance. |
+| `POST /api/wireless/business-import` | Import an existing Overpass JSON export with source provenance. |
+| `GET/POST /api/wireless/enrichment` | Inspect or request manufacturer/existing-business matching; external bounded queries require `lookup_businesses: true`. |
+
 ## Configuration and performance
 
 Edit the generated `config.json`. Restart after editing it externally. RSS additions made through the UI persist immediately.
@@ -272,6 +305,7 @@ Existing configurations gain the new collector switches from defaults. An existi
 | `staging_max_records` / `staging_max_completed` | 10000 / 10000 | Raw admission cap and processed-record retention cap |
 | `staging_batch` / `staging_poll_seconds` | 25 / 2 | Items per worker drain and idle polling interval |
 | `staging_retention_days` | 7 | Processed raw-record retention; pending/dead records remain |
+| `wireless_import_max_mb` / `wireless_chunk_rows` | 32 / 5000 | Uploaded file MiB limit and rows per staging chunk; chunk size must be 1–5000 |
 | `timeout` | 30 | HTTP request timeout in seconds |
 | `headers` / `user_agent` | Application user agent | Request header configuration |
 | `sources` | All enabled | Individual collector switches |

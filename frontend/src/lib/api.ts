@@ -119,13 +119,14 @@ function linkSignals(signals: (AbortSignal | undefined)[]) {
   return AbortSignal.any(signals.filter((signal): signal is AbortSignal => signal !== undefined));
 }
 
-type Options = { method?: string; body?: unknown; rawBody?: string; params?: Record<string, string>; signal?: AbortSignal };
+type Options = { method?: string; body?: unknown; rawBody?: BodyInit; contentType?: string; filename?: string; params?: Record<string, string>; signal?: AbortSignal };
 
 async function send(base: string, token: string, path: string, opts: Options, global?: AbortSignal) {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const body = opts.rawBody ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined);
-  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (body !== undefined) headers["Content-Type"] = opts.contentType ?? "application/json";
+  if (opts.filename) headers["X-Filename"] = encodeURIComponent(opts.filename);
   const signal = linkSignals([opts.signal, global]);
   let response: Response;
   try {
