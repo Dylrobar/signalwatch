@@ -262,7 +262,11 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             had_advisory_seen = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='advisory_seen'").fetchone() is not None
             conn.executescript(SCHEMA)
+            from .text_signals import SCHEMA as SIGNAL_SCHEMA
+            conn.executescript(SIGNAL_SCHEMA)
             conn.executescript(COMPANY_SCHEMA)
+            conn.execute("CREATE INDEX IF NOT EXISTS company_parent_order_graph ON company_profiles(parent_company_id,company_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS company_decision_asset_graph ON company_asset_decisions(asset_id,company_id)")
             conn.executescript(STAGING_SCHEMA)
             conn.executescript(WIRELESS_SCHEMA)
             conn.executescript(ATTRIBUTION_SCHEMA)
@@ -512,6 +516,8 @@ class Store:
                 for value in aliases:
                     target = conn.execute("SELECT canonical_id FROM advisory_aliases WHERE alias=?", (value,)).fetchone()
                     self._edge(conn, {"from_id": article_id, "to_id": target[0] if target else value, "relation": "mentions", "source_url": item["url"], "observed_at": item.get("published") or timestamp}, timestamp)
+                from .text_signals import project
+                project(self, conn, item, article_id, timestamp)
             if batch.get("kev"):
                 conn.execute("CREATE TEMP TABLE kev_incoming(cve TEXT PRIMARY KEY,raw TEXT NOT NULL)")
                 conn.executemany("INSERT OR REPLACE INTO kev_incoming(cve,raw) VALUES(?,?)", ((identifier(item["cveID"]), encode(item)) for item in batch["kev"]))
@@ -755,6 +761,9 @@ class Store:
                  LEFT JOIN advisory_aliases x ON x.alias=l.advisory_id WHERE coalesce(x.canonical_id,l.advisory_id)=? ORDER BY articles.published DESC LIMIT 200""", (advisory["canonical_id"],))]
             if article:
                 result["article"] = article
+                signal = conn.execute("SELECT extraction FROM text_signals WHERE article_id=?",(entity_id,)).fetchone()
+                if signal:
+                    result["article"]["extraction"] = json.loads(signal[0])
             relationship_ids = sorted(relationship_ids)
             relationship_slots = ",".join("?" for _ in relationship_ids)
             result["relationships"] = [decoded(row) for row in conn.execute("""SELECT e.*,f.name AS from_name,t.name AS to_name FROM edges e

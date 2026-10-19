@@ -390,7 +390,34 @@ def wigle_csv(item, maximum):
     return normalize_wigle(item, max_records=maximum)
 
 
-ADAPTERS = {"auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source, "wigle_csv": wigle_csv}
+def public_signals(item, maximum):
+    value = _json(item)
+    records = value.get("items", value.get("records")) if isinstance(value, dict) else value
+    if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
+        raise NormalizationError("Public signals require an items/records array")
+    _limit(len(records), maximum)
+    articles = []
+    contribution = "public_signals:" + hashlib.sha256(_json_bytes([item["source"], item.get("source_url") or "", item.get("stream_key") or ""])).hexdigest()
+    for record in records:
+        if record.get("public") is False or record.get("visibility") in {"private", "restricted"}:
+            raise NormalizationError("Only lawful public signal exports are supported")
+        url = canonical_url(record.get("url") or record.get("source_url") or "")
+        text = record.get("text") or record.get("summary") or record.get("content")
+        if not url or not isinstance(text, str) or not text.strip():
+            raise NormalizationError("Public signals need an HTTP(S) source URL and text")
+        title = str(record.get("title") or text.splitlines()[0])[:1000]
+        summary = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)[:12000]
+        cves = sorted(set(v.upper() for v in CVE_RE.findall(title + " " + text)))
+        articles.append({"url": url, "title": title,
+                         "summary": summary,
+                         "published": record.get("published"), "source": item["source"],
+                         "claim_type": "attributed_public_signal", "raw_record": _bounded(record),
+                         "cves": cves, "feed_records": {contribution: {"source": item["source"], "title": title,
+                             "summary": summary, "published": record.get("published"), "cves": cves}}})
+    return _annotate({"articles": articles}, item)
+
+
+ADAPTERS = {"public_signals": public_signals, "auto": auto, "normalized_batch": normalized_batch, "vulnerability_json": vulnerability_json, "news": news, "dns": dns, "pdf_metadata": pdf_metadata, "wireless": wireless, "opaque": opaque, "public_source": public_source, "wigle_csv": wigle_csv}
 
 
 def normalize(item, max_records=5000):

@@ -137,10 +137,34 @@ CVE Program collection prioritizes recent updates; it is not a full CVE archive.
 - **News:** security articles and CVE references. Entity details also show exact product mentions as candidate signals before a CVE exists.
 - **Changes:** local advisory additions/changes, KEV additions/removals, and warning openings/clearances, with before/after evidence and filtered export.
 - **Collectors:** run sources, add public URLs/RSS, and record a technology observation from existing inventory evidence.
+- **Knowledge Graph:** open the separate `/graph` dashboard route to search companies, products, CVEs, reports, and matched warnings; explore a bounded neighborhood and inspect each connection's evidence. Graph and list views share the same records.
 
 Searches, filters, and pagination survive tab switches. The current view is encoded in the URL for reloads, sharing, and browser Back/Forward. Intelligence and Warnings support priority/newest sorting; Warnings also filter known exploitation and version-match state. Exports apply the same active filters and retain full records.
 
 Follow company/domain/product relationships, advisory IDs, and article references inside the evidence drawer; its Back control restores the previous record. Product catalog details show their published advisories even when no deployment has been observed. CVE aliases resolve to the actual stored source document. Package details retain both enumerated versions and affected ranges.
+
+### Knowledge graph and public signals
+
+Version 0.10.0 exposes the existing SQLite entities and relationships as an indexed property graph. It adds traversal, federated intelligence search, evidence paths, and company risk without another database service. The connected Lovable frontend is maintained in `Dylrobar/signalwatch-early-warning`; the backend repository's older `frontend/` directory is not that application's current source.
+
+| Endpoint | Purpose and bounds |
+|---|---|
+| `GET /api/graph?root_id=...` | Cycle-safe incoming/outgoing traversal; depth 1–5, maximum 300 nodes and 800 edges. Defaults are depth 2, 120 nodes, 300 edges. |
+| `GET /api/company-risk?id=...` | Potential warnings on accepted company assets, with exact attribution paths, score drivers and excluded context. Subsidiary rollup is explicit via `include_subsidiaries=true`, capped at 50 companies and five hierarchy levels. |
+| `GET /api/intelligence?q=...` | Typed company, infrastructure, advisory, reporting and warning results; query at most 300 characters, page size 1–100. Coverage identifies bounded candidate selection. |
+| `POST /api/intelligence/extract?after=0&limit=25` | Resumable extraction from existing articles; limit 1–100, returns `next_cursor` and `has_more`. New and updated articles are projected during normal ingestion. |
+
+All routes use existing API authentication. Large neighborhoods report truncation. Wireless graph expansion is opt-in and returns company summaries, rather than expanding the observation dataset. Wireless search accepts exact identifiers/IDs; signal locations remain scan observations and do not establish device ownership or software exposure.
+
+Article extraction uses deterministic catalog and alias matching, explicit version/CVE identifiers, and quoted exploit/patch claims. Ambiguous names remain candidates. Each extraction retains its source, date, method and coverage; claims do not create installed software, confirmed incidents or KEV entries. Historical articles require the bounded extraction endpoint; there is no unbounded startup backfill or external language-model dependency.
+
+The `public_signals` staging adapter accepts operator-supplied public JSON exports: `{"items":[{"url":"https://public.example/report","title":"Report","text":"Public report text","published":"2026-10-19T00:00:00Z","public":true}]}`. `summary` or `content` can replace `text`. Submit through the existing unified staging API with `adapter: "public_signals"`; original bytes and provenance remain in the same queue. Entries marked private or restricted are rejected. This adapter does not provision forum accounts, private channels, proxies, or additional live collectors. Provider-specific access and schedules remain in source settings.
+
+Priority is a transparent heuristic from reconciled warning severity, KEV, EPSS and recent distinct linked reporting. KEV warnings have a floor of 85. It is not an exploitation probability. Product catalog edges, shared networks, candidate assets and public claims remain contextual; they do not automatically propagate company risk. The risk response discloses its bounded per-company shortlist and incomplete coverage.
+
+For development tests, install `pip install '.[test]'` and run `python -m unittest discover -s tests`.
+
+Version 0.10.0 validation includes canonical identifiers and historical report aliases, corrected public exports, clause-scoped claim negation, five-hop cyclic graphs, strict caps, accepted-asset risk isolation and explicit group rollup. Independent connected API checks passed 22 scenarios. A synthetic 100,000-incoming-edge graph query returned its capped 120-node neighborhood in 17.4 ms; this measures isolated reads, not production collector throughput.
 
 ### Company profiles
 
@@ -186,6 +210,7 @@ Version 0.7.0 adds one durable `raw_ingress` table for heterogeneous inputs. Eve
 | --- | --- | --- |
 | `vulnerability_json` | NVD, GHSA, OSV, or canonical advisory JSON | Existing advisory/product records |
 | `news` | RSS/Atom or plain article text with `metadata.article_url` | Articles and CVE references; text without an article URL remains evidence |
+| `public_signals` | Public report JSON exports with `items` | Source-scoped articles, extracted entities and attributed claims |
 | `dns` | DNS text records or structured DNS JSON | Domain anchors, DNS record evidence, and relationships |
 | `pdf_metadata` | Already extracted PDF metadata as JSON/text | Document evidence; binary PDF extraction is a separate producer step |
 | `wireless` | MAC/BSSID CSV, text, or JSON logs | Wireless evidence with normalized MAC addresses and explicit log fields |

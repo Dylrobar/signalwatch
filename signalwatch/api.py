@@ -214,6 +214,8 @@ def create_app(config, auto_collect=True):
     app.add_middleware(CORSMiddleware, allow_origins=config.get("cors_origins", []), allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Filename", "X-Source-Url"], allow_credentials=False)
     from .wireless_api import register_wireless_routes
     register_wireless_routes(app, config, store, wireless_imports)
+    from .knowledge_graph import register_graph_routes
+    register_graph_routes(app, store)
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 
