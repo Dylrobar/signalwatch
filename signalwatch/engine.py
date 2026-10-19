@@ -47,6 +47,18 @@ def parsed_time(value):
         return None
 
 
+def parse_startup_sources(value, known_sources):
+    """Validate the server operator's optional one-run source selection."""
+    if value is None or value == "":
+        return []
+    if not isinstance(value, str) or len(value) > 4096:
+        raise ValueError("SIGNALWATCH_STARTUP_SOURCES must contain comma-separated known source names")
+    names = [name.strip() for name in value.split(",")]
+    if any(not name or name not in known_sources for name in names):
+        raise ValueError("SIGNALWATCH_STARTUP_SOURCES must contain comma-separated known source names")
+    return list(dict.fromkeys(names))
+
+
 def source_outcome(result):
     errors = result.get("errors") or []
     if not isinstance(errors, (list, tuple)):
@@ -318,7 +330,29 @@ class Engine:
                     self.running = False
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    async def schedule(self):
+    async def schedule(self, startup_sources=None):
+        if startup_sources:
+            names = list(dict.fromkeys(startup_sources))
+            log.info("Startup collection requested for: %s", ", ".join(names))
+            try:
+                # Another process may still be finishing its previous run during
+                # a deployment. Keep the normal process guard and bound the wait.
+                for attempt in range(60):
+                    result = await self.run(sources=names)
+                    if not result.get("busy"):
+                        outcomes = ", ".join(
+                            f"{row['source']}={'ok' if row.get('ok') else 'skipped' if row.get('skipped') else 'failed'}"
+                            for row in result.get("sources", []))
+                        log.info("Startup collection completed for %s: %s", ", ".join(names), outcomes)
+                        break
+                    if attempt < 59:
+                        await asyncio.sleep(5)
+                else:
+                    log.warning("Startup collection deferred; collection lock remained busy for: %s", ", ".join(names))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Startup collection failed for: %s", ", ".join(names))
         while True:
             delay = 60.0
             try:
