@@ -42,6 +42,11 @@ SIGNALWATCH_PROXY_USERNAME='<provider-username>'
 SIGNALWATCH_PROXY_PASSWORD='<provider-password>'
 ```
 
+Use the complete proxy authentication username required by your provider.
+Oxylabs ISP usernames require the `user-` prefix; include it in
+`SIGNALWATCH_PROXY_USERNAME` (for example, `user-<provider-username>`).
+SignalWatch sends this value unchanged.
+
 Docker Compose passes these four variables into the service. Export them before
 starting Compose; a file path must refer to a file inside the container, such as
 `/data/proxies.json` on the existing persistent data mount. On Render, add the

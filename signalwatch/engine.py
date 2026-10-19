@@ -214,8 +214,8 @@ class Engine:
                     "error": state.get("error") or "Source is waiting for its retry time"}
         start = time.monotonic()
         self.current_sources.add(name)
-        await self._schedule_fields(name, status="running", started_at=now(), error=None)
         try:
+            await self._schedule_fields(name, status="running", started_at=now(), error=None)
             result = await self._collect_source(name)
             status, errors, succeeded = source_outcome(result)
             fields = {"last_success": None} if status == "unconfigured" else {"last_success": now()} if succeeded else {}
@@ -233,7 +233,10 @@ class Engine:
             return {"source": name, "ok": succeeded, "counts": result,
                     **({"skipped": True} if status == "unconfigured" or status == "partial" and not succeeded else {})}
         except asyncio.CancelledError:
-            await self._schedule_fields(name, status="interrupted", finished_at=now())
+            try:
+                await self._schedule_fields(name, status="interrupted", finished_at=now())
+            except Exception:
+                log.exception("%s interrupted status could not be saved", name)
             raise
         except Exception as exc:
             message = str(exc) or type(exc).__name__
@@ -284,8 +287,8 @@ class Engine:
                         for year in years:
                             name = f"nvd-{year}"
                             self.current_sources.add(name)
-                            await asyncio.to_thread(self.store.update_source, name, status="running", started_at=now())
                             try:
+                                await asyncio.to_thread(self.store.update_source, name, status="running", started_at=now())
                                 result = await self.collector.bootstrap_year(year)
                                 results.append({"source": name, "ok": True, "counts": result})
                                 await asyncio.to_thread(self.store.update_source, name, status="ok", last_success=now(), counts=result, error=None)
@@ -295,7 +298,12 @@ class Engine:
                             finally:
                                 self.current_sources.discard(name)
                     else:
-                        results = await asyncio.gather(*(self._source(name) for name in names))
+                        # A failed status write must not release the process/file
+                        # guards while sibling collectors still use the database.
+                        results = await asyncio.gather(*(self._source(name) for name in names), return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, BaseException):
+                                raise result
                     staging = await self._drain_staging()
                     matched = await asyncio.to_thread(self.store.reconcile)
                     await asyncio.to_thread(self.store.prune_events, int(self.config.get("events_max_rows", 50000)), float(self.config.get("events_retention_days", 90)))
