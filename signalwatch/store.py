@@ -3,6 +3,7 @@ import ipaddress
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -250,6 +251,7 @@ def decoded(row):
 
 class Store:
     def __init__(self, path):
+        self._writer_lock = threading.RLock()
         self.path = str(path)
         self.uri = self.path == ":memory:"
         self._keeper = None
@@ -292,20 +294,25 @@ class Store:
 
     @contextmanager
     def connection(self, write=False):
-        conn = sqlite3.connect(self.path, uri=self.uri, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        try:
-            if write:
-                conn.execute("BEGIN IMMEDIATE")
-            yield conn
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        # The API's collectors, staging worker and imports share this Store.
+        # Queue their writers before opening SQLite connections, so a lengthy
+        # reconciliation cannot exhaust another local writer's busy timeout.
+        # Readers remain independent; other processes retain SQLite's timeout.
+        with self._writer_lock if write else nullcontext():
+            conn = sqlite3.connect(self.path, uri=self.uri, timeout=30)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                if write:
+                    conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def _event(self, conn, kind, title, subject_id, canonical_id, source, url, timestamp, before=None, after=None):
         conn.execute("INSERT INTO events(kind,title,subject_id,canonical_id,source,url,observed_at,before_json,after_json) VALUES(?,?,?,?,?,?,?,?,?)",
