@@ -168,6 +168,8 @@ Version 0.10.0 validation includes canonical identifiers and historical report a
 
 Version 0.10.1 puts an exact identifier's canonical record first in intelligence results, ahead of newer linked reporting and companies.
 
+Version 0.10.2 bounds catalog candidate reads in each full-text index before sorting or hydrating metadata. Common words cannot trigger a full catalog scan during article extraction. Truncated candidate sets remain explicit and retain low-confidence mention status.
+
 ### Company profiles
 
 In Infrastructure, add a company or open an existing company to edit its display name, legal name, aliases, brands, parent company, identity source, and notes. Names, aliases, brands, and legal names are searchable. Parent/subsidiary links describe the saved corporate structure; they do not automatically transfer assets or warnings between companies. Profile edits and asset decisions are stored separately from collector records and survive later collector refreshes.

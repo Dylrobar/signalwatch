@@ -251,6 +251,38 @@ class GraphTests(unittest.TestCase):
             self.assertTrue(coverage['truncated'])
             self.assertLess(steps[0],10000)
 
+    def test_common_term_catalog_lookup_is_bounded_before_hydration(self):
+        from signalwatch.text_signals import extract
+        def grow(company_start,company_end,technology_start,technology_end):
+            with self.store.connection(write=True) as conn:
+                conn.executemany("INSERT INTO entities(id,kind,name,value,updated_at) VALUES(?,'company',?,'','2026-01-01')",
+                                 ((f'company:{n:06}',f'Company {n}') for n in range(company_start,company_end)))
+                conn.executemany("INSERT INTO company_profiles(company_id,name,aliases,updated_at) VALUES(?,?,'[\"CommonProduct\"]','2026-01-01')",
+                                 ((f'company:{n:06}',f'Company {n}') for n in range(company_start,company_end)))
+                conn.executemany("INSERT INTO entities(id,kind,name,value,updated_at) VALUES(?,'technology','CommonProduct','','2026-01-01')",
+                                 ((f'technology:{n:06}',) for n in range(technology_start,technology_end)))
+        def measure():
+            with self.store.connection() as conn:
+                steps=[0]
+                def tick():
+                    steps[0]+=100
+                    return 0
+                conn.set_progress_handler(tick,100)
+                result=extract(conn,{'url':'https://research.test/common','summary':'CommonProduct exploit claimed.'})
+                conn.set_progress_handler(None,0)
+                return steps[0],result
+        grow(0,1000,0,9000)
+        small_steps,small=measure()
+        grow(1000,10000,9000,90000)
+        large_steps,large=measure()
+        self.assertLess(large_steps,30000)
+        self.assertLess(large_steps,small_steps*2+1000)
+        self.assertEqual(large,small)
+        self.assertIn('catalog',large['coverage']['truncation_reasons'])
+        self.assertTrue(large['mentions'])
+        self.assertTrue(all(m['entity_id'].startswith('company:') and m['status']=='candidate' and m['confidence']==0.35
+                            for m in large['mentions']))
+
     def test_backfill_refreshes_new_aliases_and_removes_replaced_feed_mentions(self):
         article={'url':'https://research.test/update','feed_url':'https://research.test/rss','title':'New Alias report','summary':'CVE-2026-12345'}
         self.store.ingest({'entities':[self.entity('company:new','company','Original company')],'articles':[article]})

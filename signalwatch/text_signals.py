@@ -37,16 +37,26 @@ def extract(conn, article):
         truncation.append('tokens')
     truncated = False
     if expression:
-        rows = conn.execute('''SELECT e.id,e.kind,e.name,e.value,e.metadata,p.name AS profile_name,p.legal_name,p.aliases,p.brands
-         FROM entities e LEFT JOIN company_profiles p ON p.company_id=e.id
-         WHERE e.kind IN ('company','technology','device','package','os') AND
-         (e.rowid IN (SELECT rowid FROM entity_fts WHERE entity_fts MATCH ?) OR
-          p.rowid IN (SELECT rowid FROM company_profile_fts WHERE company_profile_fts MATCH ?))
-         ORDER BY e.id LIMIT 201''', (expression, expression)).fetchall()
-        truncated = len(rows) > 200
+        entity_expression = '('+expression+') AND kind:(company OR technology OR device OR package OR os)'
+        entity_ids = [row[0] for row in conn.execute('''SELECT e.id FROM entity_fts
+         CROSS JOIN entities e ON e.rowid=entity_fts.rowid
+         WHERE entity_fts MATCH ? AND e.kind IN ('company','technology','device','package','os')
+         ORDER BY entity_fts.rowid LIMIT 201''', (entity_expression,))]
+        profile_ids = [row[0] for row in conn.execute('''SELECT p.company_id FROM company_profile_fts
+         CROSS JOIN company_profiles p ON p.rowid=company_profile_fts.rowid
+         CROSS JOIN entities e ON e.id=p.company_id
+         WHERE company_profile_fts MATCH ? AND e.kind='company'
+         ORDER BY company_profile_fts.rowid LIMIT 201''', (expression,))]
+        candidates = sorted(set(entity_ids)|set(profile_ids))
+        truncated = len(entity_ids)>200 or len(profile_ids)>200 or len(candidates)>200
         if truncated:
             truncation.append('catalog')
-        for row in rows[:200]:
+        identities = candidates[:200]
+        slots = ','.join('?' for _ in identities)
+        rows = conn.execute('''SELECT e.id,e.kind,e.name,e.value,e.metadata,p.name AS profile_name,p.legal_name,p.aliases,p.brands
+         FROM entities e LEFT JOIN company_profiles p ON p.company_id=e.id
+         WHERE e.id IN ('''+slots+') ORDER BY e.id', identities) if identities else []
+        for row in rows:
             labels = [row['name'], row['profile_name'], row['legal_name']]
             if row['kind'] == 'company':
                 labels += json.loads(row['aliases'] or '[]') + json.loads(row['brands'] or '[]')
