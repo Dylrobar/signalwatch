@@ -17,7 +17,7 @@ from .osv import collect_osv
 log = logging.getLogger("signalwatch")
 
 SOURCE_INTERVALS = {
-    "news": 15, "threat": 15,
+    "news": 15, "threat": 15, "prerelease": 60,
     **{name: 360 for name in ("nvd", "kev", "epss", "github", "osv", "cve_program", "csaf")},
     "exposure": 10080, "developer": 10080, "corporate": 10080, "hardware": 43200,
 }
@@ -27,6 +27,7 @@ EXTENSION_ADAPTERS = {
     "developer": ("extension_developer", "collect_developer_sources"),
     "threat": ("extension_threat", "collect_threat_sources"),
     "hardware": ("extension_hardware", "collect_hardware_sources"),
+    "prerelease": ("extension_prerelease", "collect_prerelease_sources"),
 }
 
 

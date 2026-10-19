@@ -108,6 +108,7 @@ The bundled interface at `/` has no token entry; use `frontend/` for a protected
 | Corporate | Public job APIs, registry/procurement evidence, PDF/OOXML metadata, configured exports | Weekly per-provider budgets and continuation |
 | Developer | Public repository manifests, archive indexes, registry tags, configured JS/API/app metadata | Weekly bounded discovery and manifest rotation |
 | Threat | Disclosure lists, ZDI, Apple release index, news, credentialed telemetry, configured social/bug exports | 15-minute family schedule and product/indicator qualification |
+| Pre-release | Windows Insider build notes, Apple developer beta/RC notes, RouterOS testing/development changelogs | Hourly bounded collection, quoted component/file statements, immutable note revisions |
 | Hardware | Scoped WiGLE queries, FCC exports, credentialed industrial device indexes | Monthly bounded query rotation |
 
 Version 0.8.0 adds a searchable 83-entry provider/collector catalog with public, credentialed, configured URL, and import-only access modes. The catalog distinguishes available capabilities from successful collection. [Source setup, schedules, evidence rules, and the complete provider matrix](docs/sources.md) document all additions. The initial target selection uses Apache, Cisco, and Microsoft from existing website seeds; it can be changed through authenticated source settings.
@@ -138,10 +139,15 @@ CVE Program collection prioritizes recent updates; it is not a full CVE archive.
 - **Changes:** local advisory additions/changes, KEV additions/removals, and warning openings/clearances, with before/after evidence and filtered export.
 - **Collectors:** run sources, add public URLs/RSS, and record a technology observation from existing inventory evidence.
 - **Knowledge Graph:** open the separate `/graph` dashboard route to search companies, products, CVEs, reports, and matched warnings; explore a bounded neighborhood and inspect each connection's evidence. Graph and list views share the same records.
+- **Beta & RC Patches:** open `/prereleases` in the connected Lovable dashboard to search preview notes by vendor, release stage, component, file, or CVE; inspect quoted evidence and release revisions in the graph.
 
 Searches, filters, and pagination survive tab switches. The current view is encoded in the URL for reloads, sharing, and browser Back/Forward. Intelligence and Warnings support priority/newest sorting; Warnings also filter known exploitation and version-match state. Exports apply the same active filters and retain full records.
 
 Follow company/domain/product relationships, advisory IDs, and article references inside the evidence drawer; its Back control restores the previous record. Product catalog details show their published advisories even when no deployment has been observed. CVE aliases resolve to the actual stored source document. Package details retain both enumerated versions and affected ranges.
+
+### Beta and pre-release tracking
+
+Version 0.11.0 adds the enabled-by-default `prerelease` collector family with a 60-minute schedule. It uses three public official providers and the existing ingestion queue and SQLite graph. Vendor text supplies component/file changes and known-versus-resolved issue labels; notes with changed content retain immutable revisions. Apple's reused documentation URLs are checked against the announced beta version before ingestion. A pre-release note is unverified evidence, and does not by itself establish an installed version, affected company, vulnerability, or available fix. See [provider coverage, storage, and API details](docs/prerelease-tracking.md).
 
 ### Knowledge graph and public signals
 

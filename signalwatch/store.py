@@ -311,6 +311,16 @@ class Store:
 
     def _entity(self, conn, item, timestamp):
         key = str(item["id"])
+        if item.get("_reference_only") and conn.execute("SELECT 1 FROM entities WHERE id=?", (key,)).fetchone():
+            return
+        if item.get("kind") in {"prerelease", "prerelease_revision"}:
+            previous = conn.execute("SELECT metadata FROM entities WHERE id=?", (key,)).fetchone()
+            if previous:
+                if item.get("kind") == "prerelease_revision":
+                    return
+                first_seen = json.loads(previous[0]).get("first_seen")
+                if first_seen:
+                    item = {**item, "metadata": {**item.get("metadata", {}), "first_seen": first_seen}}
         conn.execute("""INSERT INTO entities(id,kind,name,value,metadata,observed_at,source_url,confidence,updated_at)
          VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
          kind=excluded.kind,name=excluded.name,value=excluded.value,

@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.10.2"
+VERSION = "0.11.0"
 
 
 DEFAULTS = {
@@ -56,7 +56,7 @@ DEFAULTS = {
     "staging_max_completed": 10000,
     "wireless_import_max_mb": 32,
     "wireless_chunk_rows": 5000,
-    "source_intervals": {"news": 15, "threat": 15, "nvd": 360, "kev": 360, "epss": 360,
+    "source_intervals": {"news": 15, "threat": 15, "prerelease": 60, "nvd": 360, "kev": 360, "epss": 360,
                          "github": 360, "osv": 360, "cve_program": 360, "csaf": 360,
                          "exposure": 10080, "corporate": 10080, "developer": 10080, "hardware": 43200},
     "public_source_batch": 3,
@@ -71,7 +71,8 @@ DEFAULTS = {
     "provider_settings": {"crtsh": {"enabled": True}, "dns_txt": {"enabled": True},
                           "fulldisclosure": {"enabled": True}, "oss_security": {"enabled": True},
                           "zdi_published": {"enabled": True}, "zdi_upcoming": {"enabled": True},
-                          "dark_reading": {"enabled": True}, "apple_security": {"enabled": True}},
+                          "dark_reading": {"enabled": True}, "apple_security": {"enabled": True},
+                          "windows_insider": {"enabled": True}, "apple_developer": {"enabled": True}, "mikrotik_testing": {"enabled": True}},
     "provider_credentials": {},
     "sources": {
         "nvd": True,
@@ -89,7 +90,8 @@ DEFAULTS = {
         "corporate": True,
         "developer": True,
         "threat": True,
-        "hardware": True
+        "hardware": True,
+        "prerelease": True
     },
     "feeds": [
         {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},

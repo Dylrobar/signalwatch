@@ -1,0 +1,12 @@
+<rss xmlns:ns0="http://purl.org/rss/1.0/modules/content/" version="2.0">
+  <channel>
+    <item>
+      <title>RouterOS 7.25rc2 [testing]</title>
+      <link>https://mikrotik.com/download?v=7.25rc2</link>
+      <description />
+      <ns0:encoded>What's new in 7.25rc2 (2026-10-09):&lt;br&gt;&lt;br&gt;*) bridge - fix DHCP snooping dropping DHCP messages on trusted ports when the source MAC differs from chaddr (introduced in v7.25beta3);&lt;br&gt;*) container - fix veth interfaces not getting an address from the correct DHCP server when a PVID is configured (introduced in v7.25beta3);&lt;br&gt;*) defconf - fix button script policies;&lt;br&gt;*) defconf - fix default configuration generation when CRS8xx series switch ports initialize late;&lt;br&gt;*) dude - fix the server not starting at boot when data-directory is on a USB disk;&lt;br&gt;*) ipsec - fix IPsec tunnels failing after migration from the old QKD settings;&lt;br&gt;*) ipv6 - fix cases when address is lost after reboot if prefix was taken from pool (additional fixes);</ns0:encoded>
+      <guid isPermaLink="false">RouterOS 7.25rc2 [testing]</guid>
+      <pubDate>Tue, 13 Oct 2026 09:27:27 +0000</pubDate>
+    </item>
+  </channel>
+</rss>

@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.9.2 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.11.0 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,
@@ -49,6 +49,7 @@
   "source_intervals": {
     "news": 15,
     "threat": 15,
+    "prerelease": 60,
     "nvd": 360,
     "kev": 360,
     "epss": 360,
@@ -120,6 +121,15 @@
     },
     "apple_security": {
       "enabled": true
+    },
+    "windows_insider": {
+      "enabled": true
+    },
+    "apple_developer": {
+      "enabled": true
+    },
+    "mikrotik_testing": {
+      "enabled": true
     }
   },
   "provider_credentials": {},
@@ -139,7 +149,8 @@
     "corporate": true,
     "developer": true,
     "threat": true,
-    "hardware": true
+    "hardware": true,
+    "prerelease": true
   },
   "feeds": [
     {

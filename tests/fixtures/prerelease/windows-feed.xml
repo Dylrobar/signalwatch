@@ -1,0 +1,69 @@
+<rss xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:ns1="http://purl.org/rss/1.0/modules/content/" version="2.0">
+
+<channel>
+	<item>
+		<title>Announcing new builds for 16 October 2026</title>
+		<link>https://blogs.windows.com/windows-insider/2026/10/16/announcing-new-builds-for-16-october-2026/</link>
+		
+		<dc:creator>Stephen Lines</dc:creator>
+		<pubDate>Fri, 16 Oct 2026 17:04:32 +0000</pubDate>
+				<category>PC</category>
+		<guid isPermaLink="false">https://blogs.windows.com/windows-insider/?p=179230</guid>
+
+					<description>&lt;p&gt;Hello Windows Insiders,&lt;/p&gt;
+&lt;p&gt;Today, we’re releasing new Windows 11 Insider Preview builds to the Beta, Experimental, and Release Preview channels.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;New builds this week&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;Select your channel below to view its release notes:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;B&lt;br /&gt;
+&lt;p&gt;The post &lt;a href="https://blogs.windows.com/windows-insider/2026/10/16/announcing-new-builds-for-16-october-2026/"&gt;Announcing new builds for 16 October 2026&lt;/a&gt; appeared first on &lt;a href="https://blogs.windows.com/windows-insider"&gt;Windows Insider Blog&lt;/a&gt;.&lt;/p&gt;
+</description>
+										<ns1:encoded>Hello Windows Insiders,
+
+Today, we’re releasing new Windows 11 Insider Preview builds to the Beta, Experimental, and Release Preview channels.
+
+&lt;strong&gt;New builds this week&lt;/strong&gt;
+
+Select your channel below to view its release notes:
+&lt;ul&gt;
+ 	&lt;li&gt;Beta: &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/beta/preview-build-26220-9739"&gt;Build 26220.9739&lt;/a&gt;&lt;/li&gt;
+ 	&lt;li&gt;Experimental: &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/experimental/preview-build-26340-9750"&gt;Build 26340.9750&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+For those on other specific Windows build versions, here are today’s new builds and release notes:
+&lt;ul&gt;
+ 	&lt;li&gt;Beta (26H1): &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/beta-26h1/preview-build-28020-3262"&gt;Build 28020.3262&lt;/a&gt;&lt;/li&gt;
+ 	&lt;li&gt;Experimental (26H1): &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/experimental-26-h1/preview-build-28120-3272"&gt;Build 28120.3272&lt;/a&gt;&lt;/li&gt;
+ 	&lt;li&gt;Experimental (Future Platforms): We do not have an Experimental (Future Platforms) build today&lt;/li&gt;
+&lt;/ul&gt;
+We also have Release Preview for Windows 11, version 26H1 and Windows 11, version 25H2/26H2 going out today:
+&lt;ul&gt;
+ 	&lt;li&gt;Release Preview (25H2/26H2): &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/release-preview-24h2-25h2/build-26200-9807-26300-9807"&gt;Build 26200.9807/Build 26300.9807&lt;/a&gt;&lt;/li&gt;
+ 	&lt;li&gt;Release Preview (26H1): &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/release-preview-26h1/build-28000-3351"&gt;Build 28000.3351&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;strong&gt;NVIDIA RTX Spark launch&lt;/strong&gt;
+
+Today we also see the launch of the new range of Windows 11 devices powered by the &lt;a href="https://www.microsoft.com/en-us/windows/rtx-spark-laptops"&gt;NVIDIA RTX Spark chip&lt;/a&gt;. There's never been a better time to join the Windows Insider Program, and we look forward to welcoming a new group of Insiders and devices into the program to provide feedback and continue help shape the future of Windows.
+&lt;h2&gt;Notable new features:&lt;/h2&gt;
+&lt;h4&gt;[Gaming]&lt;/h4&gt;
+Release channel: &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/beta/preview-build-26220-9739#gaming"&gt;Beta&lt;/a&gt;, &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/experimental/preview-build-26340-9750#gaming"&gt;Experimental&lt;/a&gt;
+&lt;ul&gt;
+ 	&lt;li&gt;We're introducing a refreshed Gaming Task View experience in XBOX mode, featuring a new navigation bar that provides quick access to &lt;strong&gt;Exit to Desktop&lt;/strong&gt; and &lt;strong&gt;Power Options&lt;/strong&gt;. This update makes key system actions easier to access while gaming.&lt;/li&gt;
+&lt;/ul&gt;
+[caption id="attachment_179233" align="aligncenter" width="1920"]&lt;a href="https://winblogs.thesourcemediaassets.com/sites/44/2026/10/10b-xbox.png"&gt;&lt;img class="size-full wp-image-179233" src="https://winblogs.thesourcemediaassets.com/sites/44/2026/10/10b-xbox.png" alt="Gaming Task View showing the new navigation bar with Exit to Desktop and Power options." width="1920" height="1080" /&gt;&lt;/a&gt; Gaming Task View showing the new navigation bar with Exit to Desktop and Power options.[/caption]
+&lt;h4&gt;[Windows Hello]&lt;/h4&gt;
+Release channel: &lt;a href="https://learn.microsoft.com/en-us/windows-insider/release-notes/experimental/preview-build-26340-9750#windows-hello"&gt;Experimental&lt;/a&gt;
+&lt;ul&gt;
+ 	&lt;li&gt;Windows Hello facial recognition can temporarily brighten your screen to help you sign in when you're in a dark or dimly lit room.&lt;/li&gt;
+ 	&lt;li&gt;To turn on this feature, go to &lt;strong&gt;Settings &gt; Accounts &gt; Sign-in options &gt; Facial recognition (Windows Hello)&lt;/strong&gt; and turn on &lt;strong&gt;Automatically adjust screen brightness during face recognition&lt;/strong&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+[caption id="attachment_179234" align="aligncenter" width="1171"]&lt;a href="https://winblogs.thesourcemediaassets.com/sites/44/2026/10/10b-windowshello-brightness.png"&gt;&lt;img class="size-full wp-image-179234" src="https://winblogs.thesourcemediaassets.com/sites/44/2026/10/10b-windowshello-brightness.png" alt="The setting to automatically adjust screen brightness during Windows Hello facial recognition." width="1171" height="745" /&gt;&lt;/a&gt; The setting to automatically adjust screen brightness during Windows Hello facial recognition.[/caption]
+
+Thanks,
+
+Stephen and the Windows Insider Program team</ns1:encoded>
+					
+		
+		
+			</item>
+		</channel>
+</rss>

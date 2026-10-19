@@ -216,6 +216,8 @@ def create_app(config, auto_collect=True):
     register_wireless_routes(app, config, store, wireless_imports)
     from .knowledge_graph import register_graph_routes
     register_graph_routes(app, store)
+    from .extension_prerelease import register_prerelease_routes
+    register_prerelease_routes(app, store)
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 

@@ -14,6 +14,7 @@ EXTENSIONS = {
     "developer": ("extension_developer", "normalize_developer"),
     "threat": ("extension_threat", "normalize_threat"),
     "hardware": ("extension_hardware", "normalize_hardware"),
+    "prerelease": ("extension_prerelease", "normalize_prerelease"),
 }
 NATIVE = [
     ("nvd", "NVD", "vulnerability", "https://nvd.nist.gov/"),

@@ -1,0 +1,28 @@
+<rss xmlns:ns0="http://purl.org/rss/1.0/modules/content/" version="2.0">
+<channel>
+<item>
+<title>Xcode 27.2 beta 3 (27B5038j)</title>
+<link>https://developer.apple.com/news/releases/?id=10142026b</link>
+<guid>https://developer.apple.com/news/releases/?id=10142026b</guid>
+<description>View downloadsView release notes</description>
+<pubDate>Wed, 14 Oct 2026 10:00:00 PDT</pubDate>
+<ns0:encoded>&lt;ul class=links-stacked&gt;&lt;li&gt;&lt;a href=/download/applications class=more&gt;View downloads&lt;/a&gt;&lt;/li&gt;&lt;li&gt;&lt;a href=/go/?id=xcode-27_2-sdk-rn class=more&gt;View release notes&lt;/a&gt;&lt;/li&gt;&lt;/ul&gt;</ns0:encoded>
+</item>
+<item>
+<title>iOS 27.2 beta 4 (24B5110a)</title>
+<link>https://developer.apple.com/news/releases/?id=10132026a</link>
+<guid>https://developer.apple.com/news/releases/?id=10132026a</guid>
+<description>View downloadsView release notes</description>
+<pubDate>Tue, 13 Oct 2026 10:00:00 PDT</pubDate>
+<ns0:encoded>&lt;ul class=links-stacked&gt;&lt;li&gt;&lt;a href=/download/os class=more&gt;View downloads&lt;/a&gt;&lt;/li&gt;&lt;li&gt;&lt;a href=/go/?id=ios-27_2-rn class=more&gt;View release notes&lt;/a&gt;&lt;/li&gt;&lt;/ul&gt;</ns0:encoded>
+</item>
+<item>
+<title>iPadOS 27.2 beta 4 (24B5110a)</title>
+<link>https://developer.apple.com/news/releases/?id=10132026b</link>
+<guid>https://developer.apple.com/news/releases/?id=10132026b</guid>
+<description>View downloadsView release notes</description>
+<pubDate>Tue, 13 Oct 2026 10:00:00 PDT</pubDate>
+<ns0:encoded>&lt;ul class=links-stacked&gt;&lt;li&gt;&lt;a href=/download/os class=more&gt;View downloads&lt;/a&gt;&lt;/li&gt;&lt;li&gt;&lt;a href=/go/?id=ipados-27_2-rn class=more&gt;View release notes&lt;/a&gt;&lt;/li&gt;&lt;/ul&gt;</ns0:encoded>
+</item>
+</channel>
+</rss>

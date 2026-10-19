@@ -1,0 +1,12 @@
+<rss xmlns:ns0="http://purl.org/rss/1.0/modules/content/" version="2.0">
+  <channel>
+    <item>
+      <title>RouterOS 7.26beta1 [development]</title>
+      <link>https://mikrotik.com/download?v=7.26beta1</link>
+      <description />
+      <ns0:encoded>What's new in 7.26beta1 (2026-10-01):&lt;br&gt;&lt;br&gt;*) bridge - add a per-VLAN DHCP snooping option;&lt;br&gt;*) bridge - fix loop-protect not working when a VLAN interface is added to the bridge;&lt;br&gt;*) bridge - show if bridge port is blocked by dot1x;&lt;br&gt;*) bridge - store hw option for disabled bridge ports;&lt;br&gt;*) cmr - add initial implementation of centralised platform for RouterOS devices, allowing updates, monitoring, alerts and other options;&lt;br&gt;*) console - improve stability;&lt;br&gt;*) container - add /app menu to ARM32 devices;</ns0:encoded>
+      <guid isPermaLink="false">RouterOS 7.26beta1 [development]</guid>
+      <pubDate>Mon, 05 Oct 2026 11:10:05 +0000</pubDate>
+    </item>
+  </channel>
+</rss>
