@@ -2,15 +2,17 @@ import asyncio
 import csv
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from signalwatch.store import Store
 from signalwatch.wireless import device_id, normalize_wigle
+from signalwatch.wireless_api import _sqlite_write
 from signalwatch.wireless_attribution import company_wireless_summary, delete_facility, dense_scan_cells, device_company_links, enrich_manufacturers, fetch_business_facilities, import_device_enrichment, import_manufacturer_registry, import_osm_facilities, list_facilities, match_facilities, set_device_company, upsert_facility
 
 
@@ -257,6 +259,57 @@ class WirelessAttributionTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["distance_m"], result["items"][0]["evidence"]["distance_meters"])
         self.assertEqual(result["total"], 2)
         self.assertTrue(result["truncated"])
+
+    def test_wal_reader_does_not_block_matching_and_facility_delete_is_indexed(self):
+        identifier = "00:11:22:33:44:55"
+        self.observations([[identifier, "Office", "WIFI", 44, -73, 5, "", "", -50]])
+        upsert_facility(self.store, "Branch", 44, -73, self.company, source_url="https://company.example/")
+        set_device_company(self.store, device_id("WIFI", identifier), self.company, "confirmed", "Inventory", "https://company.example/inventory")
+        with self.store.connection() as reader:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM wireless_company_links").fetchone()
+            self.assertEqual(match_facilities(self.store)["candidate_links"], 1)
+            plan = [row[3] for row in reader.execute("EXPLAIN QUERY PLAN DELETE FROM wireless_company_links WHERE facility_id=? AND origin='facility_proximity'", ("facility",))]
+            self.assertTrue(any("wireless_facility_proximity" in detail for detail in plan))
+        self.assertEqual({item["role"] for item in self.links(identifier)["items"]}, {"confirmed_operator", "candidate_business"})
+
+    def test_sqlite_retry_recovers_from_a_real_competing_writer(self):
+        attempts = []
+        def write():
+            attempts.append(1)
+            conn = sqlite3.connect(self.store.path, timeout=0.001)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("UPDATE company_profiles SET notes='retried' WHERE company_id=?", (self.company,))
+                conn.commit()
+                return "committed"
+            finally:
+                conn.close()
+        with self.store.connection(write=True) as writer:
+            writer.execute("UPDATE company_profiles SET notes='held' WHERE company_id=?", (self.company,))
+            async def release(delay):
+                writer.commit()
+            with patch("signalwatch.wireless_api.asyncio.sleep", side_effect=release) as sleep:
+                self.assertEqual(asyncio.run(_sqlite_write(write)), "committed")
+                sleep.assert_awaited_once_with(1)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.store.detail(self.company)["company_profile"]["notes"], "retried")
+
+    def test_sqlite_retry_is_bounded_and_does_not_retry_other_operational_errors(self):
+        busy = sqlite3.OperationalError("database is locked")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY | (2 << 8)
+        operation = Mock(side_effect=busy)
+        with patch("signalwatch.wireless_api.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(sqlite3.OperationalError):
+                asyncio.run(_sqlite_write(operation))
+            self.assertEqual(operation.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 2])
+        invalid = Mock(side_effect=sqlite3.OperationalError("no such table: invalid"))
+        with patch("signalwatch.wireless_api.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(sqlite3.OperationalError):
+                asyncio.run(_sqlite_write(invalid))
+            self.assertEqual(invalid.call_count, 1)
+            sleep.assert_not_awaited()
 
     def test_overpass_request_contains_only_bbox_and_business_tags(self):
         path = Path(self.temp.name) / "overpass.json"

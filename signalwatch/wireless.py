@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS wireless_devices (
 CREATE UNIQUE INDEX IF NOT EXISTS wireless_identifier ON wireless_devices(radio_type,identifier) WHERE identifier!='';
 CREATE INDEX IF NOT EXISTS wireless_type ON wireless_devices(radio_type,id);
 CREATE INDEX IF NOT EXISTS wireless_device_order ON wireless_devices(observation_count DESC,id);
+CREATE INDEX IF NOT EXISTS wireless_located_devices ON wireless_devices(id)
+ WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
 CREATE TABLE IF NOT EXISTS wireless_observations (
  id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL, source_row INTEGER NOT NULL, device_id TEXT NOT NULL,
  radio_type TEXT NOT NULL, identifier TEXT NOT NULL, ssid TEXT NOT NULL DEFAULT '', auth_mode TEXT NOT NULL DEFAULT '',

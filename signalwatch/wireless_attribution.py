@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS wireless_company_links (
 );
 CREATE INDEX IF NOT EXISTS wireless_link_company ON wireless_company_links(company_id,role,status,device_id);
 CREATE INDEX IF NOT EXISTS wireless_link_device ON wireless_company_links(device_id,role,status);
+CREATE INDEX IF NOT EXISTS wireless_facility_proximity ON wireless_company_links(facility_id) WHERE origin='facility_proximity';
+CREATE INDEX IF NOT EXISTS wireless_manual_rejection ON wireless_company_links(device_id,company_id)
+ WHERE origin='manual' AND status='rejected';
 """
 
 REGISTRY_URLS = {

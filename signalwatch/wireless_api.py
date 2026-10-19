@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any, Literal
@@ -34,6 +35,19 @@ class EnrichmentRequest(BaseModel):
     lookup_businesses: bool = False
     bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
     cells: int = Field(default=12, ge=1, le=32)
+
+
+async def _sqlite_write(function, *args, **kwargs):
+    for attempt in range(3):
+        try:
+            return await asyncio.to_thread(function, *args, **kwargs)
+        except sqlite3.OperationalError as error:
+            code = getattr(error, "sqlite_errorcode", None)
+            locked = (code & 255) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} if isinstance(code, int) else str(error).lower() in {
+                "database is locked", "database table is locked", "database schema is locked"}
+            if not locked or attempt == 2:
+                raise
+            await asyncio.sleep(attempt + 1)
 
 
 def dataset_row(row):
@@ -262,18 +276,18 @@ def register_wireless_routes(app, config, store, imports):
             raise HTTPException(400, str(error)) from error
 
     async def run_enrichment(request):
-        await asyncio.to_thread(store.update_source, "wireless_enrichment", status="running", error=None,
-                                phase="manufacturer_matching" if request.manufacturers else "business_matching")
         try:
+            await _sqlite_write(store.update_source, "wireless_enrichment", status="running", error=None,
+                                phase="manufacturer_matching" if request.manufacturers else "business_matching")
             result = {}
             if request.manufacturers:
-                result["manufacturers"] = await asyncio.to_thread(attribution.enrich_manufacturers, store)
+                result["manufacturers"] = await _sqlite_write(attribution.enrich_manufacturers, store)
             if request.facilities:
                 cells = []
                 if request.lookup_businesses:
                     cells = [[request.bbox[1], request.bbox[0], request.bbox[3], request.bbox[2]]] if request.bbox else await asyncio.to_thread(attribution.dense_scan_cells, store, limit=request.cells)
                 fetched, errors = [], []
-                await asyncio.to_thread(store.update_source, "wireless_enrichment", phase="business_lookup", cells_total=len(cells), cells_completed=0)
+                await _sqlite_write(store.update_source, "wireless_enrichment", phase="business_lookup", cells_total=len(cells), cells_completed=0)
                 async with PublicHTTP({**config, "timeout": max(60, float(config.get("timeout", 30)))}) as http:
                     for index, cell in enumerate(cells):
                         bounds = cell.get("bbox") if isinstance(cell, dict) else cell
@@ -281,24 +295,24 @@ def register_wireless_routes(app, config, store, imports):
                             fetched.append(await attribution.fetch_business_facilities(http, store, bounds))
                         except Exception as error:
                             errors.append((str(error) or type(error).__name__)[:300])
-                        await asyncio.to_thread(store.update_source, "wireless_enrichment", cells_completed=index+1,
+                        await _sqlite_write(store.update_source, "wireless_enrichment", cells_completed=index+1,
                                                 facilities_imported=sum(row["imported"] for row in fetched), lookup_errors=len(errors))
                 result["facilities"] = fetched
-                await asyncio.to_thread(store.update_source, "wireless_enrichment", phase="spatial_matching")
+                await _sqlite_write(store.update_source, "wireless_enrichment", phase="spatial_matching")
                 matches, cursor = [], ""
                 while True:
-                    page = await asyncio.to_thread(attribution.match_facilities, store, after_facility_id=cursor)
+                    page = await _sqlite_write(attribution.match_facilities, store, after_facility_id=cursor)
                     matches.append(page)
                     if not page["has_more"]:
                         break
                     cursor = page["next_cursor"]
                 result["matches"] = matches
                 result["errors"] = errors
-            await asyncio.to_thread(store.update_source, "wireless_enrichment", status="partial" if result.get("errors") else "complete", phase="finished", counts=result)
+            await _sqlite_write(store.update_source, "wireless_enrichment", status="partial" if result.get("errors") else "complete", phase="finished", counts=result)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            await asyncio.to_thread(store.update_source, "wireless_enrichment", status="failed", error=(str(error) or type(error).__name__)[:1000])
+            await _sqlite_write(store.update_source, "wireless_enrichment", status="failed", error=(str(error) or type(error).__name__)[:1000])
 
     @app.get("/api/wireless/enrichment")
     def enrichment_status():

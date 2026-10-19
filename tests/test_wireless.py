@@ -238,6 +238,11 @@ class WirelessTests(unittest.TestCase):
         self.assertEqual(stats(self.store)['company_links'], 1)
         self.assertEqual(stats(self.store, first_id)['company_links'], 1)
         self.assertEqual(stats(self.store, second_id)['company_links'], 0)
+        with self.store.connection() as conn:
+            rejection_plan = list(conn.execute("EXPLAIN QUERY PLAN SELECT count(*) FROM wireless_company_links l WHERE l.status!='rejected' AND NOT EXISTS (SELECT 1 FROM wireless_company_links deny WHERE deny.device_id=l.device_id AND deny.company_id=l.company_id AND deny.origin='manual' AND deny.status='rejected')"))
+            self.assertTrue(any('wireless_manual_rejection' in row[3] for row in rejection_plan))
+            located_plan = list(conn.execute('EXPLAIN QUERY PLAN SELECT count(*) FROM wireless_devices WHERE latitude IS NOT NULL AND longitude IS NOT NULL'))
+            self.assertTrue(any('wireless_located_devices' in row[3] for row in located_plan))
         missing = stats(self.store, 'missing')
         self.assertEqual((missing['datasets'], missing['devices'], missing['observations'], missing['located_devices'], missing['company_links']), (0, 0, 0, 0, 0))
         self.assertEqual(missing['signal_types'], {})
