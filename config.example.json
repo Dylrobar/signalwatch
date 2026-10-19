@@ -14,7 +14,7 @@
   "crawl_batch": 50,
   "crawl_interval_hours": 24,
   "max_discovered_domains": 10000,
-  "user_agent": "SignalWatch/0.12.0 (https://github.com/Dylrobar/signalwatch)",
+  "user_agent": "SignalWatch/0.12.1 (https://github.com/Dylrobar/signalwatch)",
   "headers": {},
   "interval_minutes": 30,
   "bootstrap_days": 30,

@@ -13,6 +13,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 
 from .http import display_url, public_error
 from .matching import ecosystem_identity, package_identity
+from .staging import MAX_METADATA_BYTES, bounded_json
 
 SOURCE_DEFINITIONS = [
     {"id": "github_public", "name": "GitHub public repositories", "category": "developer", "family": "developer", "access": "public", "description": "Bounded public root manifests, lock files and configuration artifacts; redacted candidate-secret patterns and up to 20 exact-version OSV queries per run. Coverage is limited to fetched files and declarations do not establish deployment.", "homepage": "https://docs.github.com/en/rest/repos", "required": ["github_org or configured public URL"]},
@@ -268,12 +269,30 @@ async def collect_developer_sources(config, store, http):
                 candidates = list(dependency_candidates.values())
                 cursor = int(cursors.get("github_osv_package", 0)) % len(candidates)
                 selected = (candidates[cursor:] + candidates[:cursor])[:20]
-                cursors["github_osv_package"] = (cursor + len(selected)) % len(candidates)
+                lookup_metadata = {"artifact_kind": "dependency_vulnerability_lookup", "lookup_provider": "osv", "queries": selected, "record_limit": maximum, "coverage": "bounded_declared_exact_versions"}
+                while selected:
+                    try:
+                        bounded_json({**lookup_metadata, "provider": provider}, MAX_METADATA_BYTES, "metadata")
+                        break
+                    except ValueError:
+                        if len(selected) > 1:
+                            selected.pop()
+                        elif len(selected[0]["occurrences"]) > 1:
+                            selected[0] = {**selected[0], "occurrences": selected[0]["occurrences"][:-1]}
+                        else:
+                            selected.clear()
+                if not selected:
+                    health["dependency_lookup"] = {"status": "metadata_budget_exceeded", "provider": "osv", "packages_queried": 0, "requests": 0, "installed_inventory": False}
+                    health["errors"].append("github_public: dependency provenance exceeds staging metadata budget")
+                    result["errors"].append(health["errors"][-1])
+                    health["status"] = "partial"
+                    return
                 url = "https://api.osv.dev/v1/querybatch"
                 request_body = {"queries": [candidate["query"] for candidate in selected]}
                 health["dependency_lookup"] = {"status": "error", "provider": "osv", "packages_queried": len(selected), "requests": 1, "installed_inventory": False}
                 cache_key = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
                 if store is not None and time.time() - float(lookup_cache.get(cache_key, 0)) < 6 * 3600:
+                    cursors["github_osv_package"] = (cursor + len(selected)) % len(candidates)
                     health["dependency_lookup"].update({"status": "cached", "packages_queried": 0, "cached_packages": len(selected), "requests": 0})
                     health["status"] = "partial" if health["errors"] else "healthy"
                     return
@@ -282,7 +301,7 @@ async def collect_developer_sources(config, store, http):
                     payload = await asyncio.to_thread(response.path.read_bytes)
                     lookup = json.loads(payload)
                     results = _osv_results(lookup, len(selected))
-                    staged = await stage_payload(config, store, payload, provider=provider, source_url=url, content_type="application/json", stream_key="github-osv:" + hashlib.sha256(json.dumps(request_body, sort_keys=True).encode()).hexdigest(), metadata={"artifact_kind": "dependency_vulnerability_lookup", "lookup_provider": "osv", "queries": selected, "record_limit": maximum, "coverage": "bounded_declared_exact_versions"})
+                    staged = await stage_payload(config, store, payload, provider=provider, source_url=url, content_type="application/json", stream_key="github-osv:" + hashlib.sha256(json.dumps(request_body, sort_keys=True).encode()).hexdigest(), metadata=lookup_metadata)
                     key = "duplicates" if isinstance(staged, dict) and staged.get("duplicate") else "staged"
                     health[key] += 1
                     result[key] += 1
@@ -290,6 +309,7 @@ async def collect_developer_sources(config, store, http):
                     result["fetched"] += 1
                     health["dependency_lookup"]["status"] = "partial" if any(value.get("next_page_token") for value in results) else "completed"
                     lookup_cache[cache_key] = time.time()
+                    cursors["github_osv_package"] = (cursor + len(selected)) % len(candidates)
                 except Exception as error:
                     message = "github_public OSV dependency lookup: " + public_error(error)
                     health["errors"].append(message)

@@ -5,10 +5,12 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from signalwatch.extension_developer import collect_developer_sources, normalize_developer
 from signalwatch.normalization import NormalizationError
 from signalwatch.store import Store
+from signalwatch.staging import MAX_METADATA_BYTES, bounded_json
 from tests import test_extension_developer as support
 
 FakeHTTP = support.FakeHTTP
@@ -357,3 +359,26 @@ class ZeroSetupDependencyLookupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["provider_health"]["github_public"]["artifact_coverage"]["files_fetched"], 0)
         self.assertFalse(any(options["metadata"]["artifact_kind"] == "manifest" for _, options in self.staged))
         self.assertEqual(http.posts, [])
+
+    async def test_osv_batch_fits_real_staging_metadata_budget_and_advances_actual_count(self):
+        manifest = {"dependencies": {f"library{index}": "1.2.3" for index in range(30)}}
+        http = self.http(manifest, lambda body: {"results": [{} for _ in body["queries"]]})
+        self.config["source_targets"][0].update({"name": "é" * 500, "company_id": "company:" + "x" * 490})
+        store = Store(Path(self.directory.name) / "budget.db")
+
+        async def bounded_stage(config, store, payload, **options):
+            bounded_json({**options["metadata"], "provider": options["provider"]}, MAX_METADATA_BYTES, "metadata")
+            self.staged.append((payload, options))
+            return {"id": len(self.staged), "duplicate": False}
+
+        with patch.dict("sys.modules", {"signalwatch.sourcehub": types.SimpleNamespace(stage_payload=bounded_stage)}):
+            first = await collect_developer_sources(self.config, store, http)
+            queried = len(http.posts[0][1]["json"]["queries"])
+            self.assertGreater(queried, 0)
+            self.assertLess(queried, 20)
+            self.assertEqual(store.source_state("developer_sources")["cursors"]["github_osv_package"], queried)
+            second = await collect_developer_sources(self.config, store, http)
+        self.assertEqual(first["provider_health"]["github_public"]["status"], "healthy")
+        self.assertEqual(second["provider_health"]["github_public"]["status"], "healthy")
+        self.assertEqual(http.posts[1][1]["json"]["queries"][0]["package"]["name"], f"library{queried}")
+        self.assertEqual(len([options for _, options in self.staged if options["metadata"]["artifact_kind"] == "dependency_vulnerability_lookup"]), 2)
