@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 from aiohttp import web
@@ -191,6 +191,86 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NVDContinuityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_api_rejects_incomplete_pages_without_advancing_watermark(self):
+        invalid_pages = [
+            {},
+            {"vulnerabilities": [], "totalResults": 1, "startIndex": 0, "resultsPerPage": 0},
+            {"vulnerabilities": [], "totalResults": "0", "startIndex": 0, "resultsPerPage": 0},
+            {"vulnerabilities": [], "totalResults": False, "startIndex": 0, "resultsPerPage": 0},
+            {"vulnerabilities": [], "totalResults": 0, "startIndex": 1, "resultsPerPage": 0},
+            {"vulnerabilities": [{"cve": {"id": "CVE-2026-12345"}}], "totalResults": 0, "startIndex": 0, "resultsPerPage": 1},
+            {"vulnerabilities": [{"cve": {"id": "CVE-2026-12345"}}], "totalResults": 2, "startIndex": 0, "resultsPerPage": 2},
+        ]
+        for payload in invalid_pages:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as folder:
+                store = CaptureStore()
+                previous = {"watermark": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}
+                store.sources["nvd"] = dict(previous)
+                collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+                path = Path(folder) / "response.json"
+                path.write_text(json.dumps(payload))
+                collector.http.get = AsyncMock(return_value=FetchResult(path, 200, {}, "https://services.nvd.nist.gov/rest/json/cves/2.0", True, "digest"))
+
+                with self.assertRaises(ValueError):
+                    await collector._nvd_api(previous)
+
+                self.assertEqual(store.sources["nvd"], previous)
+                self.assertEqual(store.batches, [])
+
+    async def test_api_empty_intermediate_page_preserves_completed_data_and_retry_window(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = CaptureStore()
+            previous = {"watermark": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}
+            store.sources["nvd"] = dict(previous)
+            collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+            responses = []
+            for index, rows in enumerate(([{"cve": {"id": "CVE-2026-12345"}}], [])):
+                path = Path(folder) / f"response-{index}.json"
+                path.write_text(json.dumps({"vulnerabilities": rows, "totalResults": 2, "startIndex": index, "resultsPerPage": len(rows)}))
+                responses.append(FetchResult(path, 200, {}, "https://services.nvd.nist.gov/rest/json/cves/2.0", True, str(index)))
+            collector.http.get = AsyncMock(side_effect=responses)
+
+            with patch("signalwatch.collectors.asyncio.sleep", new=AsyncMock()), self.assertRaises(ValueError):
+                await collector._nvd_api(previous)
+
+            self.assertEqual(store.sources["nvd"], previous)
+            self.assertEqual(len(store.batches), 1)
+            self.assertEqual(store.batches[0]["advisories"][0]["id"], "CVE-2026-12345")
+
+    async def test_api_valid_empty_window_advances_watermark(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = CaptureStore()
+            previous = {"watermark": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}
+            store.sources["nvd"] = dict(previous)
+            collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+            path = Path(folder) / "response.json"
+            path.write_text(json.dumps({"vulnerabilities": [], "totalResults": 0, "startIndex": 0, "resultsPerPage": 0}))
+            collector.http.get = AsyncMock(return_value=FetchResult(path, 200, {}, "https://services.nvd.nist.gov/rest/json/cves/2.0", True, "digest"))
+
+            self.assertEqual((await collector._nvd_api(previous))["advisories"], 0)
+            self.assertGreater(store.sources["nvd"]["watermark"], previous["watermark"])
+
+    async def test_api_complete_pages_advance_watermark_after_ingestion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = CaptureStore()
+            previous = {"watermark": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}
+            store.sources["nvd"] = dict(previous)
+            collector = Collector({**DEFAULTS, "cache_dir": folder}, store)
+            responses = []
+            for index in range(2):
+                path = Path(folder) / f"response-{index}.json"
+                path.write_text(json.dumps({"vulnerabilities": [{"cve": {"id": f"CVE-2026-{12345 + index}"}}], "totalResults": 2, "startIndex": index, "resultsPerPage": 1}))
+                responses.append(FetchResult(path, 200, {}, "https://services.nvd.nist.gov/rest/json/cves/2.0", True, str(index)))
+            collector.http.get = AsyncMock(side_effect=responses)
+
+            with patch("signalwatch.collectors.asyncio.sleep", new=AsyncMock()):
+                result = await collector._nvd_api(previous)
+
+            self.assertEqual(result["advisories"], 2)
+            self.assertGreater(store.sources["nvd"]["watermark"], previous["watermark"])
+            self.assertEqual([call.kwargs["params"]["startIndex"] for call in collector.http.get.await_args_list], [0, 1])
+            self.assertEqual([batch["advisories"][0]["id"] for batch in store.batches], ["CVE-2026-12345", "CVE-2026-12346"])
+
     async def test_bulk_feed_access_errors_use_api_only_without_active_cooldown(self):
         for status, retry_after in ((403, None), (404, None), (403, 120), (404, 0.5)):
             with self.subTest(status=status, retry_after=retry_after), tempfile.TemporaryDirectory() as folder:

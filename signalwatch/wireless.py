@@ -354,15 +354,25 @@ def _dataset_summary(conn, dataset_id):
             'signal_types': list(radio_types)}
 
 
+def _dataset_details(conn, row):
+    item = _decoded(row)
+    summary = item['metadata'].get('_summary') or {}
+    if summary.get('observations') != item['observation_count'] or not all(key in summary for key in ('devices', 'bounds', 'signal_types')):
+        summary = _dataset_summary(conn, item['id'])
+    item.update({key: summary[key] for key in ('devices', 'bounds', 'signal_types')})
+    return item
+
+
+def get_dataset(store, dataset_id):
+    with store.connection() as conn:
+        row = conn.execute('SELECT * FROM wireless_datasets WHERE id=?', (dataset_id,)).fetchone()
+        return _dataset_details(conn, row) if row is not None else None
+
+
 def datasets(store, limit=50, offset=0):
     limit, offset = min(500, max(1, int(limit))), max(0, int(offset))
     with store.connection() as conn:
-        items = [_decoded(row) for row in conn.execute('SELECT * FROM wireless_datasets ORDER BY created_at DESC,id LIMIT ? OFFSET ?', (limit, offset))]
-        for item in items:
-            summary = item['metadata'].get('_summary') or {}
-            if summary.get('observations') != item['observation_count'] or not all(key in summary for key in ('devices', 'bounds', 'signal_types')):
-                summary = _dataset_summary(conn, item['id'])
-            item.update({key: summary[key] for key in ('devices', 'bounds', 'signal_types')})
+        items = [_dataset_details(conn, row) for row in conn.execute('SELECT * FROM wireless_datasets ORDER BY created_at DESC,id LIMIT ? OFFSET ?', (limit, offset))]
         return {'items': items, 'total': conn.execute('SELECT count(*) FROM wireless_datasets').fetchone()[0]}
 
 

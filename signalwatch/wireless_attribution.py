@@ -1,4 +1,3 @@
-import asyncio
 import csv
 import hashlib
 import io
@@ -9,6 +8,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
+
+from .async_utils import to_thread
 
 
 ATTRIBUTION_SCHEMA = """
@@ -176,9 +177,9 @@ async def refresh_manufacturer_registries(http, store, registries=None):
         if registry not in REGISTRY_URLS:
             raise ValueError("Unknown manufacturer registry")
         response = await http.get(REGISTRY_URLS[registry], max_bytes=16 * 1024 * 1024)
-        results.append(await asyncio.to_thread(import_manufacturer_registry, store, response.path.read_bytes(), registry,
+        results.append(await to_thread(import_manufacturer_registry, store, response.path.read_bytes(), registry,
                                                REGISTRY_URLS[registry], response.digest))
-    return {"registries": results, "enrichment": await asyncio.to_thread(enrich_manufacturers, store)}
+    return {"registries": results, "enrichment": await to_thread(enrich_manufacturers, store)}
 
 
 def enrich_manufacturers(store):
@@ -576,5 +577,5 @@ async def fetch_business_facilities(http, store, bbox, endpoint="https://overpas
     data = json.loads(response.path.read_bytes())
     if data.get("remark"):
         raise ValueError("Overpass returned an incomplete result: " + str(data["remark"])[:160])
-    result = await asyncio.to_thread(import_osm_facilities, store, data, limit)
+    result = await to_thread(import_osm_facilities, store, data, limit)
     return {**result, "bbox": [south, west, north, east], "possibly_truncated": len(data["elements"]) >= int(limit)}

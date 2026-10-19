@@ -103,6 +103,24 @@ class WirelessImportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM wireless_observations WHERE source_row IN (1,2)").fetchone()[0], 2)
             self.assertEqual(conn.execute("SELECT status FROM wireless_datasets WHERE id=?", (identity,)).fetchone()[0], "complete")
 
+    async def test_resume_completes_dataset_older_than_the_latest_500(self):
+        path = self.archive()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        identity = "wireless:" + digest
+        register_dataset(self.store, {"source_hash": digest})
+        self.store.update_source("wireless-import:" + identity, status="importing", archive_path=str(path),
+                                 dataset_name="Older export.csv.gz", source_hash=digest)
+        with self.store.connection(write=True) as conn:
+            conn.execute("UPDATE wireless_datasets SET created_at='2000-01-01' WHERE id=?", (identity,))
+            conn.executemany("""INSERT INTO wireless_datasets
+                (id,name,source_hash,status,header,created_at,updated_at)
+                VALUES(?,?,?,'complete','[]','2026-01-01','2026-01-01')""",
+                [("wireless:" + format(number, "064x"), "Newer export", format(number, "064x"))
+                 for number in range(500)])
+        await self.imports.resume()
+        await self.finished(identity)
+        self.assertEqual(stats(self.store, dataset_id=identity)["observations"], 5)
+
     async def test_backpressure_can_be_stopped_and_resumed_without_losing_the_archive(self):
         path = self.archive()
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
