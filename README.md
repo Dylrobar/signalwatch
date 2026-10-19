@@ -166,6 +166,8 @@ For development tests, install `pip install '.[test]'` and run `python -m unitte
 
 Version 0.10.0 validation includes canonical identifiers and historical report aliases, corrected public exports, clause-scoped claim negation, five-hop cyclic graphs, strict caps, accepted-asset risk isolation and explicit group rollup. Independent connected API checks passed 22 scenarios. A synthetic 100,000-incoming-edge graph query returned its capped 120-node neighborhood in 17.4 ms; this measures isolated reads, not production collector throughput.
 
+Version 0.10.1 puts an exact identifier's canonical record first in intelligence results, ahead of newer linked reporting and companies.
+
 ### Company profiles
 
 In Infrastructure, add a company or open an existing company to edit its display name, legal name, aliases, brands, parent company, identity source, and notes. Names, aliases, brands, and legal names are searchable. Parent/subsidiary links describe the saved corporate structure; they do not automatically transfer assets or warnings between companies. Profile edits and asset decisions are stored separately from collector records and survive later collector refreshes.

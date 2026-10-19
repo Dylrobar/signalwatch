@@ -269,7 +269,9 @@ class KnowledgeGraph:
             exact=re.fullmatch(r'CVE-\d{4}-\d{4,}|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}',q.strip(),re.I)
             direct=q.strip().upper() if exact else q
             alias=conn.execute('SELECT canonical_id FROM advisory_aliases WHERE alias=?',(direct,)).fetchone()
-            if exact or alias or conn.execute('SELECT 1 FROM entities WHERE id=?',(direct,)).fetchone():
+            direct_entity=conn.execute('SELECT 1 FROM entities WHERE id=?',(direct,)).fetchone()
+            pinned_id=self.canonical(conn,direct) if exact or alias or direct_entity else None
+            if pinned_id is not None:
                 seeds=[direct]
             else:
                 expression=fts_query(q)
@@ -375,6 +377,8 @@ class KnowledgeGraph:
             ordered=sorted(results.values(),key=lambda r:r['id'])
             ordered.sort(key=lambda r:r['updated_at'] or '',reverse=True)
             ordered.sort(key=lambda r:r['kind']!='company')
+            if pinned_id in results:
+                ordered.sort(key=lambda r:r['id']!=pinned_id)
             items=[{k:v for k,v in row.items() if k!='updated_at'} for row in ordered[offset:offset+limit]]
             return {'items':items,'total':len(results),'partial':partial,'coverage':{'candidate_limit':candidate_limit,'expansion_limit':expansion_limit,
                     'company_limit':company_limit,'wireless_search':'exact identifier or ID only; no location lookup',

@@ -179,6 +179,22 @@ class GraphTests(unittest.TestCase):
         with self.store.connection() as conn:
             self.assertIsNone(self.kg.node(conn,cve))
 
+    def test_exact_identifier_and_entity_pin_requested_root_before_newer_context(self):
+        self.fixture()
+        cve='CVE-2026-12345'
+        ghsa='GHSA-AAAA-BBBB-CCCC'
+        self.store.ingest({'articles':[{'url':f'https://news.test/newer/{n}','title':f'Newer report {n}',
+                                       'summary':'Recent linked reporting','cves':[cve],'published':'2099-01-01T00:00:00Z'}
+                                      for n in range(110)]})
+        with self.store.connection(write=True) as conn:
+            conn.execute("UPDATE entities SET updated_at='2000-01-01T00:00:00Z' WHERE id=?",(cve,))
+            conn.execute("UPDATE alerts SET last_seen='2099-01-01T00:00:00Z'")
+            conn.execute('INSERT INTO advisory_aliases(alias,canonical_id) VALUES(?,?)',(ghsa,cve))
+        for query,root in ((cve,cve),(ghsa,cve),('domain:a.test','domain:a.test')):
+            result=self.kg.intelligence(query,limit=1)
+            self.assertGreater(result['total'],100)
+            self.assertEqual(result['items'][0]['id'],root)
+
     def test_authoritative_rejection_suppresses_stale_reconciled_alerts(self):
         self.fixture()
         self.store.ingest({'advisories':[{'id':'CVE-2026-12345','source':'nvd','modified':'2030-01-01T00:00:00Z','rejected':True,'affected':[]}]})
