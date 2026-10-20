@@ -96,6 +96,22 @@ class PostgresMigrationTests(unittest.TestCase):
             audit(conn, {'id': 'test', 'name': 'Tester'}, 'fixture.created', 'company:acme', after={'raw_id': raw['id']})
         return raw, job
 
+    def test_large_query_stream_uses_server_cursor_and_allows_nested_reads(self):
+        target = Store(self.target)
+        with target.connection() as conn:
+            rows = conn.stream('SELECT n,repeat(?,4096) AS payload FROM generate_series(1,250) n', ('x',))
+            self.assertEqual(next(rows)['n'], 1)
+            self.assertEqual(conn.raw.execute("SELECT count(*) FROM pg_cursors WHERE name LIKE 'sw_stream_%'").fetchone()[0], 1)
+            remaining = list(rows)
+            self.assertEqual(len(remaining), 249)
+            self.assertEqual(remaining[-1]['n'], 250)
+            self.assertEqual(remaining[-1]['payload'], 'x' * 4096)
+            self.assertEqual(conn.raw.execute("SELECT count(*) FROM pg_cursors WHERE name LIKE 'sw_stream_%'").fetchone()[0], 0)
+            rows = conn.stream('SELECT n FROM generate_series(1,250) n')
+            next(rows)
+            rows.close()
+            self.assertEqual(conn.raw.execute("SELECT count(*) FROM pg_cursors WHERE name LIKE 'sw_stream_%'").fetchone()[0], 0)
+
     def test_nul_text_is_normalized_but_source_and_binary_are_preserved(self):
         import json
         from signalwatch.postgres import postgres_value

@@ -700,7 +700,7 @@ class Store:
         with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
             ensure_schema(conn)
             evidence_index, applicability_cache = EvidenceIndex(conn), {}
-            for row in conn.execute(query, values):
+            for row in getattr(conn, "stream", conn.execute)(query, values):
                 evaluated += 1
                 affected = json.loads(row["affected_raw"])
                 matcher = osv_version_match if affected.get("ecosystem") or affected.get("package") else version_match
