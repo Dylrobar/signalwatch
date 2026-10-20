@@ -1,10 +1,13 @@
 import hashlib
+import fcntl
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 import threading
 import uuid
+import weakref
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +18,75 @@ from .staging import STAGING_SCHEMA
 from .wireless import WIRELESS_SCHEMA, ingest_wireless
 from .wireless_attribution import ATTRIBUTION_SCHEMA, company_wireless_summary
 from .technographic_store import SCHEMA as TECHNOGRAPHIC_SCHEMA
+
+
+class _WriterAdmission:
+    """One reentrant admission lock per database, shared across Store objects."""
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.RLock()
+        self._depth = 0
+        self._file = None
+
+    def __enter__(self):
+        self._lock.acquire()
+        try:
+            if not self._depth and self.path:
+                self._file = open(self.path + ".writer.lock", "a")
+                try:
+                    fcntl.flock(self._file, fcntl.LOCK_EX)
+                except BaseException:
+                    self._file.close()
+                    self._file = None
+                    raise
+            self._depth += 1
+            return self
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def __exit__(self, *_):
+        try:
+            self._depth -= 1
+            if not self._depth and self._file is not None:
+                try:
+                    fcntl.flock(self._file, fcntl.LOCK_UN)
+                finally:
+                    self._file.close()
+                    self._file = None
+        finally:
+            self._lock.release()
+
+    def after_fork(self):
+        # Never unlock the parent's shared open-file description in a child.
+        if self._file is not None:
+            self._file.close()
+        self._file = None
+        self._depth = 0
+        self._lock = threading.RLock()
+
+
+_WRITER_ADMISSIONS = weakref.WeakValueDictionary()
+_WRITER_REGISTRY_LOCK = threading.Lock()
+
+
+def _writer_admission(path):
+    with _WRITER_REGISTRY_LOCK:
+        lock = _WRITER_ADMISSIONS.get(path)
+        if lock is None:
+            lock = _WriterAdmission(path)
+            _WRITER_ADMISSIONS[path] = lock
+        return lock
+
+
+def _writer_locks_after_fork():
+    global _WRITER_REGISTRY_LOCK
+    _WRITER_REGISTRY_LOCK = threading.Lock()
+    for lock in list(_WRITER_ADMISSIONS.values()):
+        lock.after_fork()
+
+
+os.register_at_fork(after_in_child=_writer_locks_after_fork)
 
 
 SCHEMA = """
@@ -251,17 +323,18 @@ def decoded(row):
 
 class Store:
     def __init__(self, path):
-        self._writer_lock = threading.RLock()
         self.path = str(path)
         self.uri = self.path == ":memory:"
         self._keeper = None
         if self.uri:
             self.path = "file:signalwatch_" + uuid.uuid4().hex + "?mode=memory&cache=shared"
+            self._writer_lock = _WriterAdmission(None)
             self._keeper = sqlite3.connect(self.path, uri=True, check_same_thread=False)
         else:
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-            self.path = str(Path(self.path).expanduser())
-        with self.connection() as conn:
+            self.path = str(Path(self.path).expanduser().resolve())
+            self._writer_lock = _writer_admission(self.path)
+        with self._writer_lock, self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             had_advisory_seen = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='advisory_seen'").fetchone() is not None
             conn.executescript(SCHEMA)
@@ -296,10 +369,9 @@ class Store:
 
     @contextmanager
     def connection(self, write=False):
-        # The API's collectors, staging worker and imports share this Store.
-        # Queue their writers before opening SQLite connections, so a lengthy
-        # reconciliation cannot exhaust another local writer's busy timeout.
-        # Readers remain independent; other processes retain SQLite's timeout.
+        # Admit API and worker writers before opening SQLite transactions.
+        # Readers remain independent while long reconciliations hold the file
+        # lock; process-local Store objects share its reentrant thread lock.
         with self._writer_lock if write else nullcontext():
             conn = sqlite3.connect(self.path, uri=self.uri, timeout=30)
             try:

@@ -1,6 +1,6 @@
 # SignalWatch
 
-Self-hosted public infrastructure and vulnerability intelligence application for Linux/WSL. The Python 3.11+ backend uses one process, SQLite WAL, and asynchronous HTTP. This repository includes the Python service, its bundled local interface, and the tested React dashboard in `frontend/`. No external database, message broker, LLM, or paid search subscription is required. The Python service runs without Node; building the separate React frontend requires Bun or Node.
+Self-hosted public infrastructure and vulnerability intelligence application for Linux/WSL. The Python 3.11+ backend uses SQLite WAL and asynchronous HTTP. It can run as one process or use the optional [Celery/Redis background queue](docs/background-jobs.md) with durable job status and scoped company scans. This repository includes the Python service, its bundled local interface, and the tested React dashboard in `frontend/`. No external database, message broker, LLM, or paid search subscription is required for single-process operation. The Python service runs without Node; building the separate React frontend requires Bun or Node.
 
 ## Run
 
@@ -204,7 +204,7 @@ The `public_signals` staging adapter accepts operator-supplied public JSON expor
 
 Priority is a transparent heuristic from reconciled warning severity, KEV, EPSS and recent distinct linked reporting. KEV warnings have a floor of 85. It is not an exploitation probability. Product catalog edges, shared networks, candidate assets and public claims remain contextual; they do not automatically propagate company risk. The risk response discloses its bounded per-company shortlist and incomplete coverage.
 
-For development tests, install `pip install '.[test]'` and run `python -m unittest discover -s tests`.
+For development tests, install `pip install '.[test,queue]'` and run `python -m unittest discover -s tests`. Real Redis/prefork integration tests are opt-in; see `tests/test_queue_integration.py` for the environment variables.
 
 Version 0.10.0 validation includes canonical identifiers and historical report aliases, corrected public exports, clause-scoped claim negation, five-hop cyclic graphs, strict caps, accepted-asset risk isolation and explicit group rollup. Independent connected API checks passed 22 scenarios. A synthetic 100,000-incoming-edge graph query returned its capped 120-node neighborhood in 17.4 ms; this measures isolated reads, not production collector throughput.
 

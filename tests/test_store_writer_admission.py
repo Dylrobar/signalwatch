@@ -1,4 +1,7 @@
 import sqlite3
+import multiprocessing
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -7,6 +10,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from signalwatch.store import Store
+
+
+def _forked_write(store, connection):
+    store.update_source("child", status="done")
+    connection.send("done")
+    connection.close()
 
 
 class StoreWriterAdmissionTests(unittest.TestCase):
@@ -85,3 +94,60 @@ class StoreWriterAdmissionTests(unittest.TestCase):
         connection.rollback.assert_called_once()
         connection.close.assert_called_once()
         self.assert_next_writer_runs()
+
+    def test_store_instances_share_reentrant_writer_admission_for_same_path(self):
+        other = Store(Path(self.temp.name) / "." / "state.db")
+        self.assertIs(self.store._writer_lock, other._writer_lock)
+        with self.store._writer_lock, other._writer_lock:
+            self.store.update_source("nested-admission", status="done")
+        self.assertEqual(other.source_state("nested-admission")["status"], "done")
+
+    def test_other_process_waits_before_sqlite_and_readers_stay_available(self):
+        self.store.update_source("first", status="committed")
+        marker = Path(self.temp.name) / "child-opened-sqlite"
+        script = '''import sqlite3, sys
+from pathlib import Path
+from signalwatch.store import Store
+store = Store(sys.argv[1])
+connect = sqlite3.connect
+def track(*args, **kwargs):
+    Path(sys.argv[2]).touch()
+    return connect(*args, **kwargs)
+sqlite3.connect = track
+print("ready", flush=True)
+sys.stdin.readline()
+store.update_source("child", status="done")
+'''
+        child = subprocess.Popen([sys.executable, "-c", script, self.store.path, str(marker)], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        with self.store.connection(write=True) as conn:
+            conn.execute("UPDATE sources SET state=? WHERE name='first'", ('{"status":"uncommitted"}',))
+            child.stdin.write("go\n")
+            child.stdin.flush()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.wait(timeout=0.15)
+            self.assertFalse(marker.exists(), "Cross-process writers must wait before consuming SQLite's timeout")
+            self.assertEqual(self.store.source_state("first")["status"], "committed")
+        _, error = child.communicate(timeout=3)
+        self.assertEqual(child.returncode, 0, error)
+        self.assertEqual(self.store.source_state("child")["status"], "done")
+
+    def test_forked_store_does_not_inherit_parent_admission_ownership(self):
+        context = multiprocessing.get_context("fork")
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(target=_forked_write, args=(self.store, child))
+        with self.store._writer_lock:
+            process.start()
+            self.assertFalse(parent.poll(0.15), "Child must wait for the parent's file lock")
+        process.join(timeout=3)
+        if process.is_alive():
+            process.kill()
+            process.join()
+            self.fail("Forked writer did not resume")
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(parent.recv(), "done")
+        parent.close()
+        child.close()
+        self.assertEqual(self.store.source_state("child")["status"], "done")

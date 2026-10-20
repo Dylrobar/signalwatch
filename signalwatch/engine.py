@@ -1,14 +1,18 @@
 import asyncio
+import copy
 import fcntl
+import hashlib
 import importlib
 import logging
 import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .async_utils import gather, to_thread
 from .collectors import Collector
+from .companies import asset_identity, company, company_assets
 from .cve_program import collect_cve_program
 from .csaf import collect_csaf
 from .http import HTTPError, PublicRequestError
@@ -95,6 +99,77 @@ def source_outcome(result):
     return status, list(dict.fromkeys(errors)), bool(successes)
 
 
+def company_scope(store, company_id, primary_domain=None, *, include_candidates=True, limit=50):
+    """Resolve an explicit bounded scope without granting certificate names ownership."""
+    if not isinstance(company_id, str) or not company_id.strip() or len(company_id) > 300:
+        raise ValueError("A valid company_id is required")
+    limit = max(1, min(100, int(limit)))
+    with store.connection() as conn:
+        profile = company(conn, company_id)
+        assets, incomplete = company_assets(conn, company_id)
+        approved = sorted({asset["id"].removeprefix("domain:") for asset in assets if asset["included"]})
+        selected_domain = None
+        if primary_domain is not None:
+            if not isinstance(primary_domain, str) or not primary_domain.strip():
+                raise ValueError("primary_domain must be an approved company domain")
+            supplied = primary_domain.strip()
+            parsed = urlsplit(supplied if "://" in supplied else "https://" + supplied)
+            if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.port is not None:
+                raise ValueError("primary_domain must be a domain without a path, query, or port")
+            _, selected_domain = asset_identity(parsed.geturl())
+            if selected_domain not in approved:
+                raise ValueError("primary_domain is not an included company asset")
+            approved = [selected_domain]
+        if not approved:
+            raise ValueError("Company has no included domains; confirm an owned asset or an official website first")
+        domains = approved[:limit]
+        targets = [{"domain": domain, "source_url": "", "included": True} for domain in domains]
+        truncated = incomplete or len(approved) > limit
+        if include_candidates and len(targets) < limit:
+            slots = ",".join("?" for _ in approved)
+            rows = conn.execute(f"""SELECT DISTINCT d.value AS domain,min(s.source_url) AS source_url
+             FROM entities s JOIN edges report ON report.from_id=s.id AND report.relation='reports_on'
+             JOIN entities d ON d.id=report.to_id AND d.kind='domain'
+             WHERE s.kind='source_record' AND json_extract(s.metadata,'$.provider') IN ('ctlogs','crtsh','certspotter')
+              AND json_extract(s.metadata,'$.target_domain') IN ({slots})
+              AND substr(d.value,-length(json_extract(s.metadata,'$.target_domain'))-1)='.'||json_extract(s.metadata,'$.target_domain')
+              AND NOT EXISTS (SELECT 1 FROM company_asset_decisions decision WHERE decision.company_id=?
+               AND decision.asset_id=d.id AND (decision.status!='confirmed' OR decision.role!='owned'))
+             GROUP BY d.value ORDER BY d.value LIMIT ?""", (*approved, company_id, limit + 1)).fetchall()
+            known = set(domains)
+            for row in rows:
+                if row["domain"] in known:
+                    continue
+                if len(targets) == limit:
+                    truncated = True
+                    break
+                _, domain = asset_identity("https://" + row["domain"] + "/")
+                targets.append({"domain": domain, "source_url": row["source_url"], "included": False})
+                known.add(domain)
+    for target in targets:
+        domain = target["domain"]
+        target["url"] = "https://" + ("[" + domain + "]" if ":" in domain else domain) + "/"
+    return {"company_id": company_id, "company_name": profile["name"], "primary_domain": selected_domain,
+            "domains": domains, "targets": targets, "truncated": truncated,
+            "asset_ids": [company_id, *("domain:" + target["domain"] for target in targets)]}
+
+
+class _CompanyProviderStore:
+    """Keep target rotation local while sharing real provider quotas and checkpoints."""
+    def __init__(self, store, company_id):
+        self.store = store
+        self.cursor_key = "company_exposure_cursors:" + hashlib.sha256(company_id.encode()).hexdigest()
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def source_state(self, name):
+        return self.store.source_state(self.cursor_key if name == "exposure_cursors" else name)
+
+    def update_source(self, name, **fields):
+        return self.store.update_source(self.cursor_key if name == "exposure_cursors" else name, **fields)
+
+
 class Engine:
     def __init__(self, config, store):
         self.config = config
@@ -117,6 +192,10 @@ class Engine:
 
     def enabled(self):
         return [name for name, enabled in self.config["sources"].items() if enabled]
+
+    def company_scope(self, company_id, primary_domain=None):
+        return company_scope(self.store, company_id, primary_domain,
+                             limit=self.config.get("crawl_batch", 50))
 
     def interval(self, name):
         supplied = self.config.get("source_intervals", {})
@@ -327,6 +406,74 @@ class Engine:
                     self.last_result = {"started_at": started, "finished_at": now(), "error": self.last_error}
                     raise
                 finally:
+                    self.running = False
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    async def run_company(self, kind, company_id, primary_domain=None):
+        """Run a company job under the same process guard as global collection."""
+        if kind not in {"passive_scan", "web_probe"}:
+            raise ValueError("Unknown company job kind")
+        if self._guard.locked():
+            return {"busy": True}
+        async with self._guard:
+            lock_path = Path(self.config["db"] + ".collector.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a") as lock_file:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return {"busy": True, "error": "Another process is collecting this database"}
+                self.running = True
+                started = now()
+                source = "exposure" if kind == "passive_scan" else "web"
+                marker = kind + ":" + str(company_id)
+                self.current_sources.add(marker)
+                try:
+                    scope = await to_thread(company_scope, self.store, company_id, primary_domain,
+                                            include_candidates=kind == "web_probe",
+                                            limit=self.config.get("crawl_batch", 50))
+                    self.last_error = None
+                    state = await to_thread(self.store.source_state, source)
+                    retry_time = parsed_time(state.get("retry_at"))
+                    if retry_time and retry_time > datetime.now(timezone.utc):
+                        return {"company_id": company_id, "kind": kind, "sources": [
+                            {"source": kind, "ok": False, "skipped": True, "retry_at": state["retry_at"],
+                             "error": state.get("error") or "Source is waiting for its retry time"}]}
+                    if kind == "web_probe":
+                        counts = await self.collector.collect_web(targets=scope["targets"])
+                        staging = None
+                    else:
+                        from .extension_network import SOURCE_DEFINITIONS, collect_network_sources
+                        # Arbitrary saved provider searches and export URLs are
+                        # not a domain-scoped passive scan. Reuse only the public
+                        # CT/DNS adapters with explicit approved domain inputs.
+                        allowed = {"ctlogs", "crtsh", "certspotter", "passive_dns", "dns_txt"}
+                        scoped_config = copy.deepcopy(self.config)
+                        scoped_config["source_targets"] = [{"domain": domain, "company_id": company_id,
+                                                             "name": scope["company_name"]} for domain in scope["domains"]]
+                        settings = scoped_config.setdefault("provider_settings", {})
+                        for definition in SOURCE_DEFINITIONS:
+                            if definition["id"] not in allowed:
+                                settings.setdefault(definition["id"], {})["enabled"] = False
+                        scoped_store = _CompanyProviderStore(self.store, company_id)
+                        counts = await collect_network_sources(scoped_config, scoped_store, self.collector.http)
+                        staging = await self._drain_staging()
+                    _, errors, succeeded = source_outcome(counts)
+                    assets = sorted(set(scope["asset_ids"]) | set(counts.get("asset_ids", [])))
+                    matched = await to_thread(self.store.reconcile, asset_ids=assets)
+                    self.last_result = {"started_at": started, "finished_at": now(), "kind": kind,
+                                        "company_id": company_id, "scope": scope,
+                                        "sources": [{"source": kind, "ok": succeeded, "counts": counts,
+                                                     **({"error": "; ".join(errors)[:2000]} if errors else {})}],
+                                        "matching": matched, **({"staging": staging} if staging is not None else {})}
+                    return self.last_result
+                except Exception as exc:
+                    self.last_error = str(exc) or type(exc).__name__
+                    self.last_result = {"started_at": started, "finished_at": now(), "kind": kind,
+                                        "company_id": company_id, "error": self.last_error}
+                    raise
+                finally:
+                    self.current_sources.discard(marker)
                     self.running = False
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
 

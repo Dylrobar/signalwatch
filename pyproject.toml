@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signalwatch"
-version = "0.17.0"
+version = "0.18.0"
 description = "Public infrastructure and vulnerability intelligence monitor"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.10,<4", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "feedparser>=6.0,<7", "beautifulsoup4>=4.12,<5", "ijson>=3.3,<4", "packaging>=24,<27", "pypdf>=5,<7", "regex>=2024.11.6,<2027"]
 
 [project.optional-dependencies]
 test = ["httpx>=0.27,<1"]
+queue = ["celery[redis]>=5.4,<6", "redis>=5,<7"]
 
 [project.scripts]
 signalwatch = "signalwatch.cli:main"
