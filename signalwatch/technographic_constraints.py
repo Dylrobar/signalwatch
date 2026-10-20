@@ -59,6 +59,9 @@ def _repair(conn):
     # An observation is a projection only while a same-company asserted finding
     # and an active same-company source still support its document/product.
     # Extract the document key so each observation uses a primary-key lookup.
+    # The document-first tech_fingerprints_projection index also covers all
+    # matching predicates. Older SQLite planners otherwise prefer the global
+    # product index and scan every same-product document per observation.
     # The exact origin comparison remains necessary: LIKE is case insensitive.
     invalid = """origin LIKE 'technographic:%' AND NOT EXISTS (
      SELECT 1 FROM technographic_documents d JOIN tech_fingerprints f

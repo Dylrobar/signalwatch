@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tech_fingerprints (
 CREATE INDEX IF NOT EXISTS tech_fingerprints_org ON tech_fingerprints(organization_id,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_document ON tech_fingerprints(document_id);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_product ON tech_fingerprints(vendor,product,status);
+CREATE INDEX IF NOT EXISTS tech_fingerprints_projection ON tech_fingerprints(document_id,organization_id,vendor,product,status,part,version);
 CREATE TABLE IF NOT EXISTS evidence_resolution (
  source_entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
  organization_id TEXT REFERENCES entities(id) ON DELETE SET NULL, status TEXT NOT NULL,
