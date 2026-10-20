@@ -14,10 +14,11 @@ from signalwatch.proxies import ProxyPool
 
 
 class Response:
-    def __init__(self, status, url, headers=None, enter=None):
+    def __init__(self, status, url, headers=None, enter=None, body=b'{"ok":true}'):
         self.status, self.url, self.headers = status, url, headers or {}
         self.content = self
         self.enter = enter
+        self.body = body
 
     async def __aenter__(self):
         if self.enter:
@@ -28,7 +29,7 @@ class Response:
         pass
 
     async def iter_chunked(self, size):
-        yield b'{"ok":true}'
+        yield self.body
 
 
 class RedirectTests(unittest.IsolatedAsyncioTestCase):
@@ -55,6 +56,64 @@ class RedirectTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(raised.exception.retry_after, 119)
         self.assertEqual(self.http.session.get.call_count, 3)
         self.assertEqual([call.args[0] for call in self.http.session.get.call_args_list].count(target), 1)
+
+    async def test_changed_redirect_target_cannot_revalidate_another_resources_body(self):
+        start = "https://directory.example.test/company"
+        original = "https://acme.example.test/"
+        # ETags are scoped to a resource, so two destinations may legitimately
+        # use the same value for entirely different company pages.
+        for replacement in ("https://nebula.example.test/", "https://acme.example.test/new-company"):
+            with self.subTest(replacement=replacement):
+                self.http.session.get.side_effect = [
+                    Response(302, start, {"Location": original}),
+                    Response(200, original, {"ETag": '"1"', "Server": "acme-server"}, body=b"Acme technology"),
+                ]
+                await self.http.get(start, force=True)
+
+                def changed_destination(url, *, headers, **options):
+                    if url == start:
+                        return Response(302, url, {"Location": replacement})
+                    if headers.get("If-None-Match") == '"1"':
+                        return Response(304, url)
+                    return Response(200, url, {"ETag": '"1"', "Server": "nebula-server"}, body=b"Nebula technology")
+
+                self.http.session.get.side_effect = changed_destination
+                result = await self.http.get(start)
+                self.assertEqual(result.url, replacement)
+                self.assertEqual(result.path.read_bytes(), b"Nebula technology")
+                self.assertEqual(result.headers["Server"], "nebula-server")
+                self.assertTrue(result.changed)
+
+    async def test_stable_redirect_revalidates_only_its_cached_destination(self):
+        start, target = "https://directory.example.test/company", "https://acme.example.test/"
+        self.http.session.get.side_effect = [
+            Response(302, start, {"Location": target}),
+            Response(200, target, {"ETag": '"acme"'}, body=b"Acme technology"),
+            Response(302, start, {"Location": target}),
+            Response(304, target),
+        ]
+        await self.http.get(start)
+        result = await self.http.get(start)
+        initial, destination = self.http.session.get.call_args_list[-2:]
+        self.assertNotIn("If-None-Match", initial.kwargs["headers"])
+        self.assertEqual(destination.kwargs["headers"]["If-None-Match"], '"acme"')
+        self.assertEqual(result.status, 304)
+        self.assertEqual(result.path.read_bytes(), b"Acme technology")
+
+    async def test_last_modified_is_scoped_to_cached_resource_and_unsolicited_304_is_rejected(self):
+        start, target = "https://directory.example.test/company", "https://nebula.example.test/"
+        self.http.session.get.side_effect = [
+            Response(200, start, {"Last-Modified": "Tue, 20 Oct 2026 00:00:00 GMT"}, body=b"Acme technology"),
+            Response(302, start, {"Location": target}),
+            Response(304, target),
+        ]
+        saved = await self.http.get(start)
+        with self.assertRaisesRegex(PublicRequestError, "304 without a usable cached response"):
+            await self.http.get(start)
+        original, destination = self.http.session.get.call_args_list[-2:]
+        self.assertIn("If-Modified-Since", original.kwargs["headers"])
+        self.assertNotIn("If-Modified-Since", destination.kwargs["headers"])
+        self.assertEqual(saved.path.read_bytes(), b"Acme technology")
 
     async def test_redirect_destination_cooldown_is_restored_from_disk(self):
         self.http._cooldown("destination.example.test", 503, 120)

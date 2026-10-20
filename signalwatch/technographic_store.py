@@ -406,13 +406,15 @@ def project(store, conn, entity, timestamp, *, affected=None):
 
     # Entity updates merge metadata; attribution must use that retained state,
     # not interpret an omitted field in a partial refresh as its removal.
-    if entity.get("kind") in {"job_posting", "company_article", "source_record", "web_fingerprint"}:
+    if entity.get("kind") in {"job_posting", "company_article", "source_record", "web_fingerprint",
+                              "corporate_record", "document", "procurement_record", "freight_record"}:
         saved = conn.execute("SELECT * FROM entities WHERE id=?", (entity["id"],)).fetchone()
         if saved is not None:
             entity = dict(saved)
             entity["metadata"] = json.loads(entity["metadata"])
     doc = document_input(entity)
     if doc is None:
+        detached = set()
         context = (entity.get("metadata") or {}).get("company_context")
         if isinstance(context, dict):
             from .entity_resolution import resolve
@@ -423,12 +425,18 @@ def project(store, conn, entity, timestamp, *, affected=None):
             if source.get("organization_id") != result.get("organization_id"):
                 result = _unresolved(result, "Third-party record requires an approved identity binding")
             persist_resolution(conn, entity["id"], result, entity.get("source_url"), context, timestamp)
-            _detach_sources(store, conn, entity["id"], None, None, timestamp)
+            detached.update(_detach_sources(store, conn, entity["id"], None, None, timestamp))
             if result.get("organization_id"):
                 store._edge(conn, {"from_id": result["organization_id"], "to_id": entity["id"], "relation": "has_public_evidence",
                                    "source_url": entity.get("source_url") or ""}, timestamp)
-        if conn.execute("SELECT 1 FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)).fetchone():
-            _detach_sources(store, conn, entity["id"], None, None, timestamp)
+        else:
+            # A removed identity context or DNS verification token invalidates
+            # the saved attribution too, even when there was no tech document.
+            removed = conn.execute("DELETE FROM evidence_resolution WHERE source_entity_id=?", (entity["id"],)).rowcount
+            if removed or conn.execute("SELECT 1 FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)).fetchone():
+                detached.update(_detach_sources(store, conn, entity["id"], None, None, timestamp))
+        if affected is not None:
+            affected.update(detached)
         return {}
     resolution = _resolve_document(conn, entity, doc)
     provenance = {"company_context": doc["organization_context"],

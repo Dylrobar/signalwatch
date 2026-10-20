@@ -68,8 +68,26 @@ class KnowledgeGraph:
                         'observed_at': row['observed_at'], 'source_url': row['source_url'], 'risk': None}
         return None
 
-    def neighbors(self, conn, node, cap, coverage):
+    def neighbors(self, conn, node, cap, coverage, scope=None):
         key = node['id']
+        if scope and node.get('scope') == 'shared_context':
+            # Apply company provenance before the cap: a widely used product
+            # can have thousands of other companies' vendor-label edges. Those
+            # must not crowd this company's own vendor evidence out of the view.
+            sources = sorted(scope['technology_sources'].get(key, set()))
+            if not sources:
+                return []
+            slots = ','.join('?' for _ in sources)
+            rows = conn.execute("""SELECT e.* FROM edges e WHERE
+             ((e.from_id=? AND e.relation='vendor_label' AND EXISTS
+               (SELECT 1 FROM entities v WHERE v.id=e.to_id AND v.kind='vendor'))
+              OR (e.to_id=? AND e.relation='publishes' AND EXISTS
+               (SELECT 1 FROM entities v WHERE v.id=e.from_id AND v.kind='vendor')))
+             AND e.source_url IN (""" + slots + ") ORDER BY e.from_id,e.to_id,e.relation,e.source_url LIMIT ?",
+                                (key, key, *sources, cap + 1)).fetchall()
+            coverage['truncated'] |= len(rows) > cap
+            return [edge(row['from_id'], row['to_id'], row['relation'], row['source_url'],
+                         row['confidence'], row['observed_at']) for row in rows[:cap]]
         result = []
         identities = self.aliases(conn,key,coverage) if node['kind']=='vulnerability' else [key]
         for direction in ('from_id','to_id'):
@@ -246,7 +264,7 @@ class KnowledgeGraph:
                     if conn.execute('SELECT 1 FROM edges WHERE from_id=? OR to_id=? LIMIT 1',(key,key)).fetchone() or nodes[key]['kind'] in ('company','alert','software_version'):
                         coverage['truncated']=True
                     continue
-                for item in self.neighbors(conn,nodes[key],max_edges,coverage):
+                for item in self.neighbors(conn,nodes[key],max_edges,coverage,scope):
                     # Alert pairs are emitted together; only attach edges incident to this frontier.
                     if key not in (item['from_id'],item['to_id']):
                         continue
@@ -262,12 +280,16 @@ class KnowledgeGraph:
                             continue
                         target['scope'] = self.company_node_scope(conn, target, scope)
                         if target['scope'] == 'shared_context':
-                            # Shared nodes can have a last-updated source URL
-                            # from another company. Only this view's edges carry
-                            # the relevant provenance.
+                            # Shared nodes can retain another company's latest
+                            # provenance and detection method. Keep intrinsic
+                            # identity here; this view's edges carry evidence.
                             target['source_url'] = ''
                             target['observed_at'] = None
                             target['confidence'] = None
+                            target['metadata'] = {field: target['metadata'][field]
+                                                  for field in ('vendor', 'product', 'ecosystem', 'package')
+                                                  if field in target['metadata']}
+                            target['metadata']['evidence_role'] = 'shared_context'
                         if item['relation'] == 'verified_asn' and item['from_id'] == root_id:
                             anchor = conn.execute("SELECT evidence,source_url,verified_at FROM company_asn_anchors WHERE company_id=? AND 'asn:AS'||asn=?",
                                                   (root_id, item['to_id'])).fetchone()

@@ -23,6 +23,8 @@ Content hashes deduplicate within a company. Identical text belonging to differe
 
 Company evidence queries include the organization ID, and company-focused graph traversal stops shared IP, vulnerability, and vendor nodes from pulling another company's evidence into the profile. Shared product nodes can still link to their vendor. Global infrastructure exploration remains available outside a company-focused graph.
 
+When a refreshed source explicitly removes its company context or DNS verification token, its obsolete attribution is withdrawn while the raw record remains available. Partial source updates retain existing context. Shared graph nodes expose intrinsic product identity; company-specific detection details stay on their scoped evidence. HTTP cache validators apply only to the cached destination URL, so a changed redirect cannot reuse another site's response.
+
 ## Evidence and risk
 
 Technology relationships preserve the source and evidence classification: observed HTTP technology, asserted use, requirement, alternative, historical use, planned use, mention, CSP integration, or DNS verification. A DNS verification token records a verification artifact; it does not prove a current deployment or commercial contract. A job requirement does not prove deployment either.

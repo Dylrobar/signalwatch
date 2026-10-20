@@ -225,13 +225,18 @@ class PublicHTTP:
         await self.session.close()
 
     @asynccontextmanager
-    async def _request(self, url, *, method, headers, request_body, allow_redirects, proxy, state):
+    async def _request(self, url, *, method, headers, request_body, allow_redirects, proxy, state,
+                       validators=None, validator_url=None):
         """Follow bounded redirects while checking each actual destination."""
         current = aiohttp.client_reqrep.URL(url)
         request_headers = CIMultiDict(headers)
         request_body = dict(request_body or {})
         redirects = 0
         auth = None
+        try:
+            validator_target = aiohttp.client_reqrep.URL(validator_url).with_user(None).with_fragment(None) if validator_url else None
+        except (ValueError, TypeError):
+            validator_target = None
         remaining_timeout = float(self.config["timeout"])
         while True:
             if current.user is not None:
@@ -273,8 +278,15 @@ class PublicHTTP:
                 options["timeout"] = aiohttp.ClientTimeout(total=remaining_timeout, connect=min(10, remaining_timeout))
                 request = self.session.get if method == "GET" else self.session.post
                 state["url"] = str(current)
+                hop_headers = CIMultiDict(request_headers)
+                # Validators identify the cached resource, not the URL that
+                # happened to redirect to it. Sending them to a new destination
+                # can reuse another company's bytes when its ETag collides.
+                state["cache_revalidation"] = bool(validators and current.with_fragment(None) == validator_target)
+                if state["cache_revalidation"]:
+                    hop_headers.update(validators)
                 started = time.monotonic()
-                async with request(str(current), headers=CIMultiDict(request_headers), allow_redirects=False, **options) as response:
+                async with request(str(current), headers=hop_headers, allow_redirects=False, **options) as response:
                     if allow_redirects and response.status in {301, 302, 303, 307, 308}:
                         redirects += 1
                         if redirects >= 10:
@@ -371,20 +383,22 @@ class PublicHTTP:
                             meta = {}
                     request_headers = CIMultiDict(self.config.get("headers", {}))
                     request_headers.update(headers)
+                    validators = {}
                     if not force and meta:
                         if meta.get("etag"):
-                            request_headers["If-None-Match"] = meta["etag"]
+                            validators["If-None-Match"] = meta["etag"]
                         if meta.get("last_modified"):
-                            request_headers["If-Modified-Since"] = meta["last_modified"]
+                            validators["If-Modified-Since"] = meta["last_modified"]
                     attempt += 1
                     async with self._request(url, method=method, headers=request_headers,
                                              request_body=request_body, allow_redirects=allow_redirects,
-                                             proxy=proxy, state=request_state) as response:
+                                             proxy=proxy, state=request_state, validators=validators,
+                                             validator_url=meta.get("url")) as response:
                         proxy = request_state.get("retained_proxy", proxy)
                         response_headers = CIMultiDict(response.headers)
                         if response.status == 304:
                             if (not cache or force or not meta or not body.exists()
-                                    or not (meta.get("etag") or meta.get("last_modified"))):
+                                    or not request_state.get("cache_revalidation")):
                                 raise PublicRequestError("HTTP 304 without a usable cached response", str(response.url))
                             if body.stat().st_size > limit:
                                 raise ValueError(f"Response exceeds {limit} bytes: {display_url(url)}")
