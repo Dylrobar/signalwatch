@@ -40,6 +40,33 @@ class CompanyEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(targets, [{"domain": "acme.test", "name": "Acme", "company_id": "company:Acme"}])
         self.assertEqual(len(self.store.company_enrichment_targets(limit=1)), 1)
 
+    def test_target_limit_counts_accepted_owners_after_earlier_ambiguous_domains(self):
+        for index, domain in enumerate(("a-shared.test", "b-shared.test", "n-shared.test")):
+            self.add_company(f"Shared{index}One", domain)
+            self.add_company(f"Shared{index}Two", domain)
+        self.add_company("Later", "z-valid.test")
+        self.add_company("Earlier", "m-valid.test")
+        accepted = [
+            {"domain": "m-valid.test", "name": "Earlier", "company_id": "company:Earlier"},
+            {"domain": "z-valid.test", "name": "Later", "company_id": "company:Later"},
+        ]
+        for limit in (1, 2, 3):
+            with self.subTest(limit=limit):
+                self.assertEqual(self.store.company_enrichment_targets(limit=limit), accepted[:limit])
+
+    def test_target_limit_retains_primary_owner_despite_ambiguous_legacy_associations(self):
+        self.add_company("SharedOne", "a-shared.test")
+        self.add_company("SharedTwo", "a-shared.test")
+        self.add_company("Legacy", "owned.example.com")
+        self.add_company("Primary", "owned.example.com")
+        self.store.save_company_profile(
+            "company:Primary", "Reviewed primary name", primary_domain="owned.example.com",
+            primary_domain_evidence="Verified company website", primary_domain_source_url="https://owned.example.com/about")
+        self.add_company("Later", "z-valid.test")
+        self.assertEqual(self.store.company_enrichment_targets(limit=1), [
+            {"domain": "owned.example.com", "name": "Reviewed primary name", "company_id": "company:Primary"},
+        ])
+
     async def test_discovered_companies_reach_all_three_enrichment_families(self):
         self.add_company("Acme", "acme.test")
         before = copy.deepcopy(self.config)
