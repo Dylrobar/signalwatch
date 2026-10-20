@@ -8,6 +8,7 @@ PostgreSQL tables, with native constraints, transactions and indexed search.
 from __future__ import annotations
 
 import re
+import json
 import sqlite3
 import ipaddress
 from decimal import Decimal
@@ -88,6 +89,34 @@ CREATE OR REPLACE VIEW sqlite_master AS
  UNION ALL SELECT 'trigger',t.tgname::text,c.relname::text,pg_get_triggerdef(t.oid) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND NOT t.tgisinternal;
 """
+
+
+def postgres_value(value):
+    """Replace unsupported NUL text; retain binary payloads byte-for-byte."""
+    if not isinstance(value, str):
+        return value
+    value = value.replace('\x00', '\ufffd')
+    if '\\u0000' not in value:
+        return value
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+
+    def clean(item):
+        if isinstance(item, str):
+            return item.replace('\x00', '\ufffd')
+        if isinstance(item, list):
+            return [clean(v) for v in item]
+        if isinstance(item, dict):
+            result = {clean(k): clean(v) for k, v in item.items()}
+            if len(result) != len(item):
+                raise ValueError('NUL normalization would merge distinct JSON keys')
+            return result
+        return item
+
+    cleaned = clean(parsed)
+    return json.dumps(cleaned, ensure_ascii=False, separators=(',', ':')) if cleaned != parsed else value
 
 
 class Row:
@@ -364,6 +393,7 @@ class Connection:
         if identity:
             sql += ' RETURNING id'
         if parameters is not None:
+            parameters = tuple(postgres_value(v) for v in parameters)
             sql = sql.replace('%', '%%')
             sql = _code_transform(sql, lambda part: part.replace('?', '%s'))
         try:
@@ -386,7 +416,7 @@ class Connection:
         statement = _code_transform(statement, lambda part: part.replace('?', '%s'))
         try:
             cursor = self.raw.cursor()
-            cursor.executemany(statement, (tuple(values) for values in parameters))
+            cursor.executemany(statement, (tuple(postgres_value(v) for v in values) for values in parameters))
             return Cursor(cursor)
         except psycopg.IntegrityError as error:
             raise sqlite3.IntegrityError(str(error)) from error
