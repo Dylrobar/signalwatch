@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import json
+import uuid
 import sqlite3
 import ipaddress
 from decimal import Decimal
@@ -410,6 +411,23 @@ class Connection:
             raise sqlite3.IntegrityError(str(error)) from error
         except psycopg.Error as error:
             raise sqlite3.OperationalError(str(error)) from error
+    def stream(self, sql, parameters=()):
+        """Read large matching joins in bounded batches on the current transaction."""
+        import psycopg
+        statement = translate(sql).replace('%', '%%')
+        statement = _code_transform(statement, lambda part: part.replace('?', '%s'))
+        try:
+            with self.raw.cursor(name='sw_stream_' + uuid.uuid4().hex) as cursor:
+                cursor.itersize = 100
+                cursor.execute(statement, tuple(postgres_value(v) for v in parameters))
+                names = tuple(column.name for column in cursor.description)
+                for values in cursor:
+                    yield Row(names, values)
+        except psycopg.IntegrityError as error:
+            raise sqlite3.IntegrityError(str(error)) from error
+        except psycopg.Error as error:
+            raise sqlite3.OperationalError(str(error)) from error
+
     def executemany(self, sql, parameters):
         import psycopg
         statement = translate(sql).replace('%', '%%')
