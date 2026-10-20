@@ -33,7 +33,7 @@ PostgreSQL restore uses `pg_restore --single-transaction --exit-on-error`, check
 
 The migration tool copies real rows, raw bytes, IDs, and scoped relationships into PostgreSQL; it verifies each source table with row counts and order-independent content checksums, repairs identity sequences, and writes an activation manifest. Keep the original SQLite file and its WAL-backed backup for rollback. Do not run two installations against separate database copies.
 
-1. Provision an empty PostgreSQL database and set `SIGNALWATCH_DATABASE_URL` through the deployment's secret environment. Use a direct PostgreSQL connection or a session pool; transaction pooling cannot preserve the session advisory locks that fence running workers. Keep the existing archive disk mounted. Local raw archives use `data_dir` when set, otherwise the parent of `cache_dir` under PostgreSQL.
+1. Provision an empty PostgreSQL database and set `SIGNALWATCH_DATABASE_URL` through the deployment's secret environment. Use a direct PostgreSQL connection or a session pool; transaction pooling cannot preserve the session advisory locks that fence running workers. Keep the existing archive disk mounted. Local raw archives use `data_dir` when set, otherwise the preserved SQLite database directory during migration, or the parent of `cache_dir` for PostgreSQL-only installations.
 2. Run read-only checks. This command never initializes or migrates either database:
 
    ```sh

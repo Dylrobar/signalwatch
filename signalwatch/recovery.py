@@ -110,10 +110,10 @@ def _destination(destination):
 
 
 def create_backup(config, destination):
-    from .config import VERSION
+    from .config import VERSION, data_directory
     from .jobs import stamp
     postgres = is_postgres(config["db"])
-    archive_root = (Path(config.get("data_dir") or Path(config["cache_dir"]).parent) if postgres else Path(config["db"]).parent) / "wireless-imports"
+    archive_root = data_directory(config) / "wireless-imports"
     with _destination(destination) as (root, final):
         db_path = root / ("database.dump" if postgres else "database.sqlite")
         if postgres:

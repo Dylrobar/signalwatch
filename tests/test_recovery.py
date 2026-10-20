@@ -26,6 +26,16 @@ class RecoveryTests(unittest.TestCase):
         self.store = Store(self.config["db"])
         self.jobs = Jobs(self.store)
 
+    def test_postgres_cutover_retains_archive_root_when_cache_is_elsewhere(self):
+        from signalwatch.config import data_directory
+        from signalwatch.wireless_import import WirelessImports
+        migrated = {**self.config, 'db': 'postgresql://localhost/target', 'sqlite_db': self.config['db'],
+                    'cache_dir': str(self.root / 'different-disk' / 'cache')}
+        self.assertEqual(data_directory(migrated), Path(self.config['db']).parent)
+        self.assertEqual(WirelessImports(self.store, migrated).directory, Path(self.config['db']).parent / 'wireless-imports')
+        migrated['data_dir'] = str(self.root / 'explicit-archive-root')
+        self.assertEqual(data_directory(migrated), Path(migrated['data_dir']))
+
     def test_restore_preserves_wal_data_raw_payloads_and_rebinds_archives(self):
         raw = b'{"url":"https://example.test","unchanged":"payload"}'
         StagingQueue(self.store).enqueue(raw, source="test", adapter="auto")

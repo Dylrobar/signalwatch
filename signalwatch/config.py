@@ -137,6 +137,13 @@ DEFAULTS = {
 }
 
 
+def data_directory(config):
+    """Keep archive paths stable when an environment URL replaces SQLite."""
+    if str(config["db"]).startswith(("postgres://", "postgresql://")):
+        return Path(config.get("data_dir") or Path(config.get("sqlite_db") or config["cache_dir"]).parent)
+    return Path(config["db"]).parent
+
+
 def load_config(path="config.json"):
     path = Path(path).expanduser().resolve()
     config = json.loads(json.dumps(DEFAULTS))

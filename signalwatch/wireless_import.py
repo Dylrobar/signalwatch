@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from .async_utils import gather, to_thread
+from .config import data_directory
 from .ingestion import staging_queue
 from .staging import QueueFull
 
@@ -10,9 +11,7 @@ class WirelessImports:
     def __init__(self, store, config):
         self.store = store
         self.config = config
-        postgres = str(config["db"]).startswith(("postgres://", "postgresql://"))
-        data_root = Path(config.get("data_dir") or Path(config["cache_dir"]).parent) if postgres else Path(config["db"]).parent
-        self.directory = data_root / "wireless-imports"
+        self.directory = data_directory(config) / "wireless-imports"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tasks = {}
         self.lock = asyncio.Lock()
