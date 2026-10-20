@@ -2,6 +2,8 @@
 
 Self-hosted public infrastructure and vulnerability intelligence application for Linux/WSL. The Python 3.11+ backend uses SQLite WAL and asynchronous HTTP. It can run as one process or use the optional [Celery/Redis background queue](docs/background-jobs.md) with durable job status and scoped company scans. This repository includes the Python service, its bundled local interface, and the tested React dashboard in `frontend/`. No external database, message broker, LLM, or paid search subscription is required for single-process operation. The Python service runs without Node; building the separate React frontend requires Bun or Node.
 
+See the [platform upgrade guide](docs/platform-upgrade.md) for access roles and evidence review, and the [operations, backup, and PostgreSQL migration runbook](docs/recovery.md) for monitoring and recovery.
+
 ## Run
 
 ```bash

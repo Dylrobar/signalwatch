@@ -42,6 +42,23 @@ class CompanyGraphIsolationTests(unittest.TestCase):
                             'affected': [{'vendor': 'maker', 'product': 'widget', 'version': '1.0'}]}]})
         self.store.reconcile()
 
+    def test_branch_focus_retains_company_boundary_and_limits(self):
+        self.observations('acme.example.com', 'nebula.example.com')
+        self.decision('company:acme', 'acme.example.com')
+        self.decision('company:nebula', 'nebula.example.com')
+        self.assertIn('applicability', self.graph.company_risk('company:acme')['items'][0]['assessment'])
+        branch = self.graph.graph('company:acme', 3, 300, 800, focus_id='domain:acme.example.com')
+        self.assertEqual(branch['root_id'], 'company:acme')
+        self.assertIn('domain:acme.example.com', {row['id'] for row in branch['nodes']})
+        self.assertNotIn('domain:nebula.example.com', {row['id'] for row in branch['nodes']})
+        with self.assertRaises(ValueError):
+            self.graph.graph('company:acme', focus_id='domain:nebula.example.com')
+        with self.assertRaises(ValueError):
+            self.graph.graph('company:acme', max_nodes=1, focus_id='domain:acme.example.com')
+        small = self.graph.graph('company:acme', 3, 2, 1, focus_id='domain:acme.example.com')
+        self.assertLessEqual(len(small['nodes']), 2)
+        self.assertLessEqual(len(small['edges']), 1)
+
     def test_primary_namespace_candidates_require_ownership_and_nested_anchor_is_fenced(self):
         self.anchor('company:acme', 'example.com')
         self.anchor('company:nebula', 'division.example.com')
@@ -213,11 +230,17 @@ class CompanyGraphIsolationTests(unittest.TestCase):
         with self.store.connection() as conn:
             alert = conn.execute("SELECT id FROM alerts WHERE asset_id='company:acme'").fetchone()[0]
         self.assertIn(alert, {node['id'] for node in self.graph.graph('company:acme', 5)['nodes']})
+        risk = self.graph.company_risk('company:acme')
+        public_match = next(item for item in risk['items'] if item['id'] == alert)
+        self.assertEqual(public_match['evidence_basis'], 'company_public_text')
+        self.assertEqual(public_match['paths'][0][0]['relation'], 'public_text_match')
+        self.assertEqual(self.graph.company_risk('company:nebula')['items'], [])
         # A retained alert with mismatched provenance must not regain scope
         # just because its asset_id still points at this company.
         with self.store.connection(write=True) as conn:
             conn.execute("UPDATE alerts SET source_url='https://example.org/engineering' WHERE id=?", (alert,))
         self.assertNotIn(alert, {node['id'] for node in self.graph.graph('company:acme', 5)['nodes']})
+        self.assertNotIn(alert, {item['id'] for item in self.graph.company_risk('company:acme')['items']})
         with self.store.connection(write=True) as conn:
             conn.execute("UPDATE alerts SET source_url='https://example.com/engineering' WHERE id=?", (alert,))
             conn.execute("UPDATE observations SET origin='imported' WHERE asset_id='company:acme'")

@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.19.3"
+VERSION = "0.20.0"
 
 
 DEFAULTS = {
@@ -182,8 +182,20 @@ def load_config(path="config.json"):
         origins.append(urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), "", "", "")))
     config["cors_origins"] = list(dict.fromkeys(origins))
     for name in ("db", "cache_dir"):
+        if name == "db" and str(config[name]).startswith(("postgres://", "postgresql://")):
+            continue
         target = Path(config[name]).expanduser()
         config[name] = str(target if target.is_absolute() else path.parent / target)
+    if config.get("data_dir"):
+        target = Path(config["data_dir"]).expanduser()
+        config["data_dir"] = str(target if target.is_absolute() else path.parent / target)
+    database_url = os.environ.get("SIGNALWATCH_DATABASE_URL", "").strip()
+    if database_url:
+        if not database_url.startswith(("postgres://", "postgresql://")):
+            raise ValueError("SIGNALWATCH_DATABASE_URL must be a PostgreSQL connection URL")
+        if not str(config["db"]).startswith(("postgres://", "postgresql://")):
+            config["sqlite_db"] = config["db"]
+        config["db"] = database_url
     for name in ("concurrency", "per_host", "timeout", "crawl_pages", "crawl_batch", "interval_minutes",
                  "osv_max_records", "osv_index_chunk_mb", "osv_index_chunks", "osv_index_max_chunks", "cve_max_records",
                  "staging_max_records", "staging_batch", "staging_max_completed",

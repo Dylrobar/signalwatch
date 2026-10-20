@@ -1,4 +1,4 @@
-"""Durable collection jobs; Redis transports IDs, SQLite owns their state."""
+"""Durable collection jobs; Redis transports IDs, the database owns their state."""
 import fcntl
 import hashlib
 import json
@@ -25,6 +25,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS collection_job_idempotency ON collection_jobs(
 CREATE INDEX IF NOT EXISTS collection_job_outbox ON collection_jobs(status,available_at,last_dispatched_at);
 CREATE INDEX IF NOT EXISTS collection_job_request ON collection_jobs(request_hash,status);
 CREATE INDEX IF NOT EXISTS collection_job_history ON collection_jobs(finished_at,id);
+CREATE TABLE IF NOT EXISTS collection_job_progress (
+ job_id TEXT PRIMARY KEY REFERENCES collection_jobs(id) ON DELETE CASCADE,
+ stage TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, total INTEGER,
+ unit TEXT NOT NULL DEFAULT 'sources', message TEXT NOT NULL DEFAULT '',
+ updated_at TEXT NOT NULL, partial INTEGER NOT NULL DEFAULT 0
+);
 """
 ACTIVE = ("queued", "running", "retrying")
 TERMINAL = ("succeeded", "failed")
@@ -68,9 +74,54 @@ def _decode(row, *, token=False):
     result["payload"] = json.loads(result["payload"])
     result["result"] = json.loads(result["result"]) if result["result"] is not None else None
     result.pop("request_hash", None)
+    result["progress"] = {"stage": result.pop("progress_stage", None) or result["status"],
+                          "completed": result.pop("progress_completed", None) or 0,
+                          "total": result.pop("progress_total", None),
+                          "unit": result.pop("progress_unit", None) or "sources",
+                          "message": result.pop("progress_message", None) or "",
+                          "updated_at": result.pop("progress_updated_at", None) or result["updated_at"],
+                          "partial": bool(result.pop("progress_partial", False))}
     if not token:
         result.pop("lease_token", None)
     return result
+
+
+JOB_SELECT = """SELECT j.*, p.stage AS progress_stage, p.completed AS progress_completed,
+ p.total AS progress_total,p.unit AS progress_unit,p.message AS progress_message,
+ p.updated_at AS progress_updated_at,p.partial AS progress_partial
+ FROM collection_jobs j LEFT JOIN collection_job_progress p ON p.job_id=j.id"""
+
+
+@contextmanager
+def database_lock(store, name, *, path=None):
+    """Nonblocking session locks survive transactions and coordinate separate hosts."""
+    if getattr(store, "is_postgres", False):
+        key = int.from_bytes(hashlib.sha256(("signalwatch:" + name).encode()).digest()[:8], "big", signed=True)
+        with store.connection() as conn:
+            acquired = conn.advisory_lock(key, wait=False)
+            # Session locks remain held after commit; avoid keeping a snapshot
+            # idle in transaction throughout long network collection.
+            conn.commit()
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    conn.advisory_unlock(key)
+        return
+    if path is None:
+        path = (Path(tempfile.gettempdir()) / "signalwatch-job-locks" / hashlib.sha256(store.path.encode()).hexdigest() / "collector.lock"
+                if store.uri else Path(store.path + ".collector.lock"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 class Jobs:
@@ -81,10 +132,12 @@ class Jobs:
         self.store = store
         self.max_active, self.max_completed, self.retention_days = max_active, max_completed, retention_days
         self.lock_dir = (Path(tempfile.gettempdir()) / "signalwatch-job-locks" / hashlib.sha256(store.path.encode()).hexdigest()
-                         if store.uri else Path(store.path + ".jobs"))
-        self.collector_lock = self.lock_dir / "collector.lock" if store.uri else Path(store.path + ".collector.lock")
+                         if store.uri or getattr(store, "is_postgres", False) else Path(store.path + ".jobs"))
+        self.collector_lock = self.lock_dir / "collector.lock" if store.uri or getattr(store, "is_postgres", False) else Path(store.path + ".collector.lock")
         with store.connection(write=True) as conn:
             conn.executescript(SCHEMA)
+            from .operations import ensure_schema
+            ensure_schema(conn)
 
     def _lock_path(self, job_id):
         # Fixed stripes bound disk usage without unlinking an inode that a
@@ -114,11 +167,11 @@ class Jobs:
                 if previous is not None:
                     if previous["request_hash"] != request_hash:
                         raise IdempotencyConflict("Idempotency key already represents a different collection request")
-                    return _decode(previous)
+                    return _decode(conn.execute(JOB_SELECT + " WHERE j.id=?", (previous["id"],)).fetchone())
             if deduplicate_active:
                 previous = conn.execute("SELECT * FROM collection_jobs WHERE request_hash=? AND status IN ('queued','running','retrying') ORDER BY created_at,id LIMIT 1", (request_hash,)).fetchone()
                 if previous is not None:
-                    return _decode(previous)
+                    return _decode(conn.execute(JOB_SELECT + " WHERE j.id=?", (previous["id"],)).fetchone())
             if conn.execute("SELECT count(*) FROM collection_jobs WHERE status IN ('queued','running','retrying')").fetchone()[0] >= self.max_active:
                 raise QueueFull("Collection job queue is full")
             clock = time.time()
@@ -131,11 +184,48 @@ class Jobs:
 
     def get(self, job_id):
         with self.store.connection() as conn:
-            return _decode(conn.execute("SELECT * FROM collection_jobs WHERE id=?", (job_id,)).fetchone())
+            return _decode(conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone())
 
-    def list(self, limit=30):
+    def _filters(self, *, company_id="", status="", kind=""):
+        conditions, values = [], []
+        if company_id:
+            expression = "(j.payload::jsonb ->> 'company_id')" if getattr(self.store, "is_postgres", False) else "json_extract(j.payload,'$.company_id')"
+            conditions.append(expression + "=?")
+            values.append(company_id)
+        for name, value in (("status", status), ("kind", kind)):
+            if value:
+                conditions.append("j." + name + "=?")
+                values.append(value)
+        return (" WHERE " + " AND ".join(conditions) if conditions else ""), values
+
+    def list(self, limit=30, offset=0, **filters):
+        where, values = self._filters(**filters)
         with self.store.connection() as conn:
-            return [_decode(row) for row in conn.execute("SELECT * FROM collection_jobs ORDER BY created_at DESC,id DESC LIMIT ?", (min(500, max(1, int(limit))),))]
+            return [_decode(row) for row in conn.execute(JOB_SELECT + where + " ORDER BY j.created_at DESC,j.id DESC LIMIT ? OFFSET ?",
+                     (*values, min(500, max(1, int(limit))), max(0, int(offset))))]
+
+    def count(self, **filters):
+        where, values = self._filters(**filters)
+        with self.store.connection() as conn:
+            return conn.execute("SELECT count(*) FROM collection_jobs j" + where, values).fetchone()[0]
+
+    def record_progress(self, job_id, stage, *, completed=0, total=None, unit="sources", message="", partial=False, lease_token):
+        if not lease_token:
+            raise LeaseLost("Progress requires the active execution token")
+        if not isinstance(stage, str) or not stage or len(stage) > 80:
+            raise ValueError("Progress stage must contain at most 80 characters")
+        if type(completed) is not int or completed < 0 or completed > 2**31 - 1:
+            raise ValueError("Progress completed must be a nonnegative integer")
+        if total is not None and (type(total) is not int or total < completed or total > 2**31 - 1):
+            raise ValueError("Progress total must be at least completed")
+        with self.store.connection(write=True) as conn:
+            self._row(conn, job_id, lease_token)
+            timestamp = stamp()
+            conn.execute("""INSERT INTO collection_job_progress(job_id,stage,completed,total,unit,message,updated_at,partial)
+             VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET stage=excluded.stage,completed=excluded.completed,
+             total=excluded.total,unit=excluded.unit,message=excluded.message,updated_at=excluded.updated_at,partial=excluded.partial""",
+                         (job_id, stage, completed, total, str(unit)[:30], str(message)[:500], timestamp, int(bool(partial))))
+            conn.execute("UPDATE collection_jobs SET updated_at=? WHERE id=?", (timestamp, job_id))
 
     def pending_dispatch(self, limit=20):
         clock = time.time()
@@ -157,6 +247,8 @@ class Jobs:
              started_at=?,updated_at=?,finished_at=NULL,error='',result=NULL,lease_token=?
              WHERE id=? AND status IN ('queued','retrying') AND available_at<=?""",
                                    (timestamp, timestamp, uuid.uuid4().hex, job_id, timestamp)).rowcount
+            if changed:
+                conn.execute("DELETE FROM collection_job_progress WHERE job_id=?", (job_id,))
             return _decode(conn.execute("SELECT * FROM collection_jobs WHERE id=?", (job_id,)).fetchone(), token=True) if changed else None
 
     def _row(self, conn, job_id, lease_token=None):
@@ -176,9 +268,19 @@ class Jobs:
             if row["status"] != "running":
                 raise InvalidJobState("Only a running collection job can finish")
             timestamp = stamp()
+            sources = result.get("sources", []) if isinstance(result, dict) else []
+            sources = sources if isinstance(sources, list) else []
+            partial = status == "failed" and any(isinstance(item, dict) and item.get("ok") for item in sources)
+            if not partial and status == "failed":
+                partial = any(isinstance(item, dict) and isinstance(item.get("counts"), dict) and
+                              any(isinstance(item["counts"].get(key), (int, float)) and item["counts"][key] > 0
+                                  for key in ("pages", "observations", "fingerprints", "processed", "assets", "records", "staged")) for item in sources)
+            conn.execute("""INSERT INTO collection_job_progress(job_id,stage,updated_at,partial) VALUES(?,?,?,?)
+             ON CONFLICT(job_id) DO UPDATE SET stage=excluded.stage,updated_at=excluded.updated_at,partial=excluded.partial""",
+                         (job_id, "completed" if status == "succeeded" else "failed", timestamp, int(partial)))
             conn.execute("""UPDATE collection_jobs SET status=?,result=?,error=?,finished_at=?,updated_at=?,lease_token=NULL WHERE id=?""",
                          (status, encoded, str(error)[:2000], timestamp, timestamp, job_id))
-            return _decode(conn.execute("SELECT * FROM collection_jobs WHERE id=?", (job_id,)).fetchone())
+            return _decode(conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone())
 
     def defer(self, job_id, error="", delay=30, *, lease_token=None, attempted=True):
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or not 0 <= delay <= 7 * 86400:
@@ -194,7 +296,8 @@ class Jobs:
             conn.execute("""UPDATE collection_jobs SET status='retrying',available_at=?,updated_at=?,error=?,
              last_dispatched_at=NULL,lease_token=NULL,attempts=? WHERE id=?""",
                          (stamp(clock + delay), stamp(clock), str(error)[:2000], max(0, attempts), job_id))
-            return _decode(conn.execute("SELECT * FROM collection_jobs WHERE id=?", (job_id,)).fetchone())
+            conn.execute("UPDATE collection_job_progress SET stage='waiting',updated_at=? WHERE job_id=?", (stamp(clock), job_id))
+            return _decode(conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone())
 
     def retry(self, job_id):
         with self.store.connection(write=True) as conn:
@@ -204,9 +307,10 @@ class Jobs:
             if conn.execute("SELECT count(*) FROM collection_jobs WHERE status IN ('queued','running','retrying')").fetchone()[0] >= self.max_active:
                 raise QueueFull("Collection job queue is full")
             timestamp = stamp()
+            conn.execute("DELETE FROM collection_job_progress WHERE job_id=?", (job_id,))
             conn.execute("""UPDATE collection_jobs SET status='queued',available_at=?,updated_at=?,started_at=NULL,
              finished_at=NULL,last_dispatched_at=NULL,result=NULL,error='',lease_token=NULL,attempts=0 WHERE id=?""", (timestamp, timestamp, job_id))
-            return _decode(conn.execute("SELECT * FROM collection_jobs WHERE id=?", (job_id,)).fetchone())
+            return _decode(conn.execute(JOB_SELECT + " WHERE j.id=?", (job_id,)).fetchone())
 
     @contextmanager
     def worker_lock(self, job_id):
@@ -214,27 +318,15 @@ class Jobs:
         if self.get(job_id) is None:
             yield False
             return
-        self.lock_dir.mkdir(parents=True, exist_ok=True)
-        with self._lock_path(job_id).open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                yield False
-                return
-            try:
-                yield True
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        with database_lock(self.store, "job:" + job_id, path=self._lock_path(job_id)) as acquired:
+            yield acquired
 
     def recover(self):
-        self.collector_lock.parent.mkdir(parents=True, exist_ok=True)
         count = 0
-        with self.collector_lock.open("a") as guard:
-            try:
-                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with database_lock(self.store, "collector", path=self.collector_lock) as acquired:
+            if not acquired:
                 return 0
-            try:
+            if acquired:
                 with self.store.connection() as conn:
                     ids = [row[0] for row in conn.execute("SELECT id FROM collection_jobs WHERE status='running' ORDER BY started_at,id LIMIT ?", (self.max_active,))]
                 for job_id in ids:
@@ -248,6 +340,4 @@ class Jobs:
                              WHERE id=? AND status='running'""", (timestamp, timestamp, job_id)).rowcount
                 with self.store.connection(write=True) as conn:
                     self._prune(conn, time.time())
-            finally:
-                fcntl.flock(guard, fcntl.LOCK_UN)
         return count

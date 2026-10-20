@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import re
-import secrets
 import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
@@ -117,6 +116,12 @@ class CompanyAssetRequest(BaseModel):
     role: Literal["owned", "service"] = "owned"
     evidence: str = Field(default="", max_length=10000)
     source_url: str = Field(default="", max_length=2000)
+
+
+class CompanyPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["profile", "asset"]
+    values: dict[str, Any]
 
 
 class StagingRequest(BaseModel):
@@ -234,19 +239,33 @@ def create_app(config, auto_collect=True):
     app.state.jobs = jobs
     app.state.queue_enabled = queue_enabled
     app.state.staging = ingress
-    api_token = config.get("api_token", "").encode("utf-8")
+    from .access import Access, audit, register_access_routes
+    access = Access(store, config.get("api_token", ""))
+    app.state.access = access
     @app.middleware("http")
     async def authorize(request, call_next):
         path = request.scope["path"]
         root_path = request.scope.get("root_path", "")
         if root_path and path.startswith(root_path + "/"):
             path = path[len(root_path):]
-        if api_token and (path == "/api" or path.startswith("/api/")):
-            scheme, _, credential = request.headers.get("authorization", "").partition(" ")
-            if scheme.lower() != "bearer" or not secrets.compare_digest(credential.encode("utf-8"), api_token):
+        if path == "/api" or path.startswith("/api/"):
+            actor = await asyncio.to_thread(access.authenticate, request.headers.get("authorization", ""))
+            if actor is None:
                 return JSONResponse({"detail": "Bearer authentication required"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+            if not access.allowed(actor, request.method, path.rstrip("/")):
+                return JSONResponse({"detail": "This credential does not have permission for this action"}, status_code=403)
+            request.state.actor = actor
         try:
-            return await call_next(request)
+            response = await call_next(request)
+            # Detailed decisions audit in their own transaction. Other actions
+            # retain actor and outcome without storing payloads or credentials.
+            if path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"} and path not in {"/api/companies/resolve", "/api/companies/preview"}:
+                def record_action():
+                    with store.connection(write=True) as conn:
+                        audit(conn, request.state.actor, "http.mutation", path,
+                              after={"method": request.method, "status": response.status_code})
+                await asyncio.to_thread(record_action)
+            return response
         except Exception:
             logging.getLogger("signalwatch").exception("HTTP request failed")
             return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
@@ -259,6 +278,15 @@ def create_app(config, auto_collect=True):
     register_prerelease_routes(app, store)
     from .queue_api import register_job_routes
     register_job_routes(app, config, engine, jobs, queue_enabled)
+    register_access_routes(app, store, config, access)
+    from .reviews import register_review_routes
+    register_review_routes(app, store, config)
+    from .evidence import register_evidence_routes
+    register_evidence_routes(app, store, config)
+    from .data_quality import register_quality_routes
+    register_quality_routes(app, store, config)
+    from .operations import register_operations_routes
+    register_operations_routes(app, store, config, jobs)
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 
@@ -268,7 +296,7 @@ def create_app(config, auto_collect=True):
 
     @app.get("/health")
     def health():
-        return {"service": "SignalWatch", "version": VERSION, "auth_required": bool(api_token)}
+        return {"service": "SignalWatch", "version": VERSION, "auth_required": access.required()}
 
     @app.get("/api/status")
     def status():
@@ -534,13 +562,18 @@ def create_app(config, auto_collect=True):
         return {"queued": True, "sources": names}
 
     @app.post("/api/companies/profile")
-    def save_company_profile(request: CompanyProfileRequest):
+    def save_company_profile(request: CompanyProfileRequest, http_request: Request):
         from .entity_resolution import DomainConflict
         values = request.model_dump()
         try:
             if values["source_url"]:
                 values["source_url"] = public_url(values["source_url"])
-            return store.save_company_profile(**values)
+            with store.connection(write=True) as conn:
+                before = store.detail(values["company_id"], conn=conn) if values["company_id"] else None
+                result = store.save_company_profile(**values, conn=conn)
+                audit(conn, http_request.state.actor, "company.profile.saved", result["id"],
+                      before=before and before.get("company_profile"), after=result.get("company_profile"), reason=values["notes"])
+                return result
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
         except DomainConflict as exc:
@@ -559,7 +592,7 @@ def create_app(config, auto_collect=True):
             raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/companies/assets")
-    def set_company_asset(request: CompanyAssetRequest):
+    def set_company_asset(request: CompanyAssetRequest, http_request: Request):
         values = request.model_dump()
         try:
             values["asset_url"] = public_url(values["asset_url"])
@@ -567,7 +600,12 @@ def create_app(config, auto_collect=True):
                 raise ValueError("An evidence description and source URL are required for asset decisions")
             if values["source_url"]:
                 values["source_url"] = public_url(values["source_url"])
-            result = store.set_company_asset(**values)
+            with store.connection(write=True) as conn:
+                before = store.detail(request.company_id, conn=conn)
+                result = store.set_company_asset(**values, conn=conn)
+                audit(conn, http_request.state.actor, "company.asset.decided", request.company_id,
+                      before=before and before.get("company_profile", {}).get("assets"),
+                      after=result.get("company_profile", {}).get("assets"), reason=values["evidence"])
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
@@ -575,6 +613,55 @@ def create_app(config, auto_collect=True):
         if values["status"] == "confirmed" and values["role"] == "owned":
             store.enqueue_url(values["asset_url"], source_url=values["source_url"], company_id=request.company_id)
         return result
+
+    @app.post("/api/companies/preview")
+    def preview_company(body: CompanyPreviewRequest):
+        from .entity_resolution import DomainConflict
+        class PreviewComplete(Exception):
+            def __init__(self, result):
+                self.result = result
+
+        def summary(detail):
+            detail = detail or {}
+            profile, evidence = detail.get("company_profile", {}), detail.get("technographics", {})
+            return {"company_id": detail.get("id", ""), "name": detail.get("name", ""),
+                    "included_assets": [item["id"] for item in profile.get("assets", []) if item["included"]],
+                    "fingerprints": evidence.get("total", 0), "alerts": len(detail.get("alerts", [])),
+                    "conflicts": evidence.get("resolution", {}).get("conflict", 0)}
+        try:
+            model = CompanyProfileRequest if body.kind == "profile" else CompanyAssetRequest
+            values = model.model_validate(body.values).model_dump()
+            if values["source_url"]:
+                values["source_url"] = public_url(values["source_url"])
+            if body.kind == "asset":
+                values["asset_url"] = public_url(values["asset_url"])
+            with store.connection(write=True) as conn:
+                previous = store.detail(values["company_id"], conn=conn) if values.get("company_id") else None
+                result = (store.save_company_profile if body.kind == "profile" else store.set_company_asset)(**values, conn=conn)
+                before, after = summary(previous), summary(result)
+                warnings = []
+                if result.get("company_profile", {}).get("assets_truncated") or (previous or {}).get("company_profile", {}).get("assets_truncated"):
+                    warnings.append("Asset impact is bounded by the company graph limit; additional assets may be affected.")
+                if len(result.get("alerts", [])) == 500 or len((previous or {}).get("alerts", [])) == 500:
+                    warnings.append("Warning counts reach the detail limit and may be higher.")
+                if after["conflicts"]:
+                    warnings.append("Unresolved evidence conflicts remain; these records are excluded from company technology matches.")
+                # Roll back every projection, alert and evidence-history write.
+                raise PreviewComplete({"preview": True, "before": before, "after": after, "warnings": warnings,
+                      "changes": {"included_added": sorted(set(after["included_assets"]) - set(before["included_assets"])),
+                                  "included_removed": sorted(set(before["included_assets"]) - set(after["included_assets"])),
+                                  "fingerprints_delta": after["fingerprints"] - before["fingerprints"],
+                                  "alerts_delta": after["alerts"] - before["alerts"]}})
+        except PreviewComplete as exc:
+            return exc.result
+        except ValidationError as exc:
+            raise HTTPException(422, "Invalid company preview values") from exc
+        except DomainConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/seeds")
     def seeds(request: SeedRequest):

@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 from collections import deque
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from .companies import company, company_assets
@@ -236,10 +237,10 @@ class KnowledgeGraph:
         # Shared infrastructure and software labels are retained as leaves.
         return target['kind'] in SOFTWARE_LABEL_KINDS | {'ip', 'prefix', 'asn', 'vendor', 'vulnerability'}
 
-    def graph(self, root_id, depth=2, max_nodes=120, max_edges=300, include_wireless=False):
+    def graph(self, root_id, depth=2, max_nodes=120, max_edges=300, include_wireless=False, focus_id='', *, _conn=None):
         if not root_id or not 1<=depth<=5 or not 1<=max_nodes<=300 or not 1<=max_edges<=800:
             raise ValueError('Invalid graph limits')
-        with self.store.connection() as conn:
+        with (self.store.connection() if _conn is None else nullcontext(_conn)) as conn:
             root = self.node(conn,root_id)
             if root is None:
                 raise LookupError('Graph root not found')
@@ -252,6 +253,23 @@ class KnowledgeGraph:
                 root['scope'] = 'company'
                 coverage.update(scope='company', shared_context_expansion=False,
                                 vendor_context='technology-to-vendor labels only; no legal-company ownership inferred')
+            if focus_id and focus_id != root_id:
+                if max_nodes < 2:
+                    raise ValueError('Branch expansion requires room for the root and selected node')
+                # A branch must first be reachable through the original root's
+                # fenced graph. Arbitrary IDs cannot turn a company view into
+                # another company's graph through a shared vendor or product.
+                proof = self.graph(root_id, 5, 300, 800, False, _conn=conn)
+                focus = next((node for node in proof['nodes'] if node['id'] == focus_id), None)
+                if focus is None:
+                    raise ValueError('Branch is outside the reachable root graph; choose a visible node within the graph limits')
+                nodes[focus_id] = focus
+                queue = deque([(focus_id, 0)])
+                if scope:
+                    for relation in proof['edges']:
+                        for endpoint in (relation['from_id'], relation['to_id']):
+                            scope['technology_sources'].setdefault(endpoint, set()).add(relation['source_url'])
+                coverage.update(focus_id=focus_id, focus_validation_truncated=proof['truncated'])
             while queue:
                 key, level = queue.popleft()
                 if key in visited:
@@ -354,25 +372,35 @@ class KnowledgeGraph:
             results, contexts = {}, []
             total=0
             for cid,group_path in groups:
-                assets, incomplete=company_assets(conn,cid)
-                truncated |= incomplete
+                scope_coverage = {'truncated': False}
+                scope = self.company_scope(conn, cid, scope_coverage)
+                assets = list(scope['assets'].values())
+                truncated |= scope_coverage['truncated']
                 included = [a for a in assets if a['included']]
                 contexts.extend({'company_id':cid,**a} for a in assets if not a['included'])
-                if not included:
-                    continue
                 ids=[a['id'] for a in included]
-                slots=','.join('?' for _ in ids)
-                total+=conn.execute('SELECT count(*) FROM alerts WHERE asset_id IN ('+slots+') AND '+self.active_alert_filter(),ids).fetchone()[0]
-                rows=conn.execute('SELECT * FROM alerts WHERE asset_id IN ('+slots+') AND '+self.active_alert_filter()+' ORDER BY kev DESC,rank DESC,id LIMIT ?',(*ids,limit+1)).fetchall()
+                selection = 'asset_id IN (' + ','.join('?' for _ in ids) + ')' if ids else '0=1'
+                documents = sorted('technographic:' + document for document in scope['documents'])
+                if documents:
+                    selection += ''' OR (asset_id=? AND EXISTS (SELECT 1 FROM observations o WHERE
+                      o.asset_id=alerts.asset_id AND o.vendor=alerts.vendor AND o.product=alerts.product
+                      AND o.version=alerts.version AND o.source_url=alerts.source_url AND o.origin IN (''' + ','.join('?' for _ in documents) + ')))'
+                    ids.extend([cid, *documents])
+                where = '(' + selection + ') AND ' + self.active_alert_filter()
+                total+=conn.execute('SELECT count(*) FROM alerts WHERE '+where,ids).fetchone()[0]
+                rows=conn.execute('SELECT * FROM alerts WHERE '+where+' ORDER BY kev DESC,rank DESC,id LIMIT ?',(*ids,limit+1)).fetchall()
                 truncated |= len(rows)>limit
                 by_id={a['id']:a for a in included}
                 for row in rows[:limit]:
                     alert=dict(row)
-                    asset=by_id[row['asset_id']]
+                    public_text = row['asset_id'] == cid
+                    proof = [] if public_text else by_id[row['asset_id']]['evidence']
                     result={'id':row['id'],'company_id':cid,'asset_id':row['asset_id'],'advisory_id':row['advisory_id'],
                             'risk':self.driver(conn,alert),'version_state':row['version_state'],'version':row['version'],
                             'observed_at':row['observed_at'],'last_matched':row['last_seen'],'reasons':json.loads(row['reasons']),
-                            'paths':[group_path+asset['evidence']+[edge(row['asset_id'],row['id'],'potential_match',row['source_url'],row['confidence'],row['observed_at'],'potential',row['evidence']),
+                            'assessment':json.loads(alert.get('assessment') or '{}'),
+                            'evidence_basis':'company_public_text' if public_text else 'owned_asset',
+                            'paths':[group_path+proof+[edge(row['asset_id'],row['id'],'public_text_match' if public_text else 'potential_match',row['source_url'],row['confidence'],row['observed_at'],'potential',row['evidence']),
                             edge(row['id'],row['advisory_id'],'matched_advisory',row['url'],status='potential',evidence={'version_state':row['version_state']})]]}
                     if row['id'] in results:
                         results[row['id']]['paths']+=result['paths']
@@ -382,7 +410,7 @@ class KnowledgeGraph:
             return {'company_id':company_id,'group':include_subsidiaries,'items':ordered[:limit], 'score':max((r['risk']['score'] for r in ordered),default=None),
                     'total':len(results) if not truncated else None,'truncated':truncated or len(ordered)>limit or len(contexts)>limit,
                     'context_assets':contexts[:limit],'coverage':{'companies':len(groups),'company_limit':50,'hierarchy_depth':5,'matches_considered':total,'per_company_alert_limit':limit,'selection':'bounded per-company KEV/rank shortlist, then heuristic score; not a global exhaustive ranking',
-                    'risk_basis':'included company assets + existing reconciled alerts; no network, catalog or claim propagation'}}
+                    'risk_basis':'included company assets and validated company public-text matches; no network or catalog propagation'}}
 
     def intelligence(self, q='', limit=25, offset=0):
         from .store import fts_query
@@ -511,7 +539,7 @@ class KnowledgeGraph:
             if report_targets:
                 slots=','.join('?' for _ in report_targets)
                 for table,column in (('signal_mentions','entity_id'),('article_links','advisory_id')):
-                    rows=conn.execute('SELECT DISTINCT article_id FROM '+table+' WHERE '+column+' IN ('+slots+') ORDER BY '+column+',article_id LIMIT ?',(*sorted(report_targets),candidate_limit+1)).fetchall()
+                    rows=conn.execute('SELECT article_id FROM '+table+' WHERE '+column+' IN ('+slots+') GROUP BY article_id ORDER BY min('+column+'),article_id LIMIT ?',(*sorted(report_targets),candidate_limit+1)).fetchall()
                     partial |= len(rows)>candidate_limit
                     for row in rows[:candidate_limit]:
                         add_entity(row[0])
@@ -540,8 +568,8 @@ def register_graph_routes(app, store):
         except ValueError as error:
             raise HTTPException(422,str(error)) from error
     @app.get('/api/graph')
-    def graph(root_id: str=Query(...,min_length=1,max_length=2048),depth: int=Query(2,ge=1,le=5),max_nodes: int=Query(120,ge=1,le=300),max_edges: int=Query(300,ge=1,le=800),include_wireless: bool=False):
-        return call(service.graph,root_id,depth,max_nodes,max_edges,include_wireless)
+    def graph(root_id: str=Query(...,min_length=1,max_length=2048),depth: int=Query(2,ge=1,le=5),max_nodes: int=Query(120,ge=1,le=300),max_edges: int=Query(300,ge=1,le=800),include_wireless: bool=False,focus_id: str=Query('',max_length=2048)):
+        return call(service.graph,root_id,depth,max_nodes,max_edges,include_wireless,focus_id)
     @app.get('/api/company-risk')
     def risk(id: str=Query(...,min_length=1,max_length=2048),include_subsidiaries: bool=False,limit: int=Query(50,ge=1,le=100)):
         return call(service.company_risk,id,include_subsidiaries,limit)

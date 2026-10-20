@@ -60,6 +60,23 @@ _ELLIPTICAL_ACTIVE = re.compile(r"^\s*(?:(?:currently|actively|already|also|stil
 _PRODUCT_SUBJECT = re.compile(r"\s+(?:customers?|clients?|users?|partners?|uses|runs|operates|deploys|provides|offers|released|announced|supports|enables|allows|requires|integrates)\b|\s+(?:is|are|was|were|has|have)\s+(?:a|an|the|published|announced|released|available)\b", re.I)
 
 
+def _literal_object_context(text, match):
+    """Reject explicit physical senses of ambiguous names, not lowercase brands.
+
+    This deliberately recognizes only local noun phrases with clear physical
+    meaning. It does not try to infer deployment from capitalization or suppress
+    an entire sentence merely because it also mentions weather or buildings.
+    """
+    before, after = text[max(0, match.start() - 80):match.start()], text[match.end():match.end() + 100]
+    if match.lastgroup == "windows":
+        return bool(re.search(r"\b(?:stained[ -]glass|glass|double[ -]glazed|triple[ -]glazed|casement|sash|bay|dormer)\s+$", before, re.I)
+                    or re.match(r"\s+(?:to\s+(?:ventilate|illuminate|let\s+in\s+(?:fresh\s+)?air)|and\s+(?:external|interior|wooden|sliding)\s+doors|(?:panes|glazing))\b", after, re.I))
+    if match.lastgroup == "snowflake":
+        return bool(re.search(r"\b(?:a|each|the)\s+(?:(?:individual|tiny|single|delicate|paper)\s+)?$", before, re.I)
+                    and re.match(r"\s+(?:(?:that|which)\s+)?(?:landed|melted|melts|drifted|fluttered|fell|falls)\b", after, re.I))
+    return False
+
+
 def _status(clause, match, matches, qualification_section, inherited_first_party=False):
     start, end = match.span()
     previous = next((item for item in reversed(matches) if item.end() <= start), None)
@@ -129,6 +146,8 @@ def extract(text, *, source_type=""):
     cursor = 0
     last = 0
     for match in _TECH.finditer(text):
+        if _literal_object_context(text, match):
+            continue
         while cursor < len(boundaries) and boundaries[cursor][1] <= match.start():
             last = boundaries[cursor][1]
             cursor += 1
@@ -136,7 +155,7 @@ def extract(text, *, source_type=""):
         left = max(last, match.start() - 1200)
         right = min(stop, match.end() + 1200)
         clause = text[left:right]
-        local_matches = list(_TECH.finditer(clause))
+        local_matches = [item for item in _TECH.finditer(clause) if not _literal_object_context(clause, item)]
         local_match = next(item for item in local_matches if item.start() == match.start() - left)
         qualification_section = False
         if re.search(r"job|greenhouse|lever|ashby|career|ats", str(source_type), re.I):

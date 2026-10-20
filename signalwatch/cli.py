@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,18 @@ def parser():
     bootstrap = commands.add_parser("bootstrap")
     bootstrap.add_argument("--years", nargs="+", default=[str(datetime.now(timezone.utc).year)])
     commands.add_parser("status")
+    backup = commands.add_parser("backup", help="Create a consistent database and raw archive snapshot")
+    backup.add_argument("destination", type=Path)
+    restore = commands.add_parser("restore", help="Verify a backup and restore into a new data directory")
+    restore.add_argument("backup", type=Path)
+    restore.add_argument("--destination", required=True, type=Path)
+    restore.add_argument("--database-url-env", help="Environment variable containing an empty PostgreSQL target URL")
+    preflight = commands.add_parser("migration-preflight", help="Read-only SQLite to PostgreSQL migration checks")
+    preflight.add_argument("--source", type=Path)
+    preflight.add_argument("--database-url-env", default="SIGNALWATCH_DATABASE_URL")
+    migrate = commands.add_parser("migrate-postgres", help="Copy a SQLite snapshot into PostgreSQL and verify it")
+    migrate.add_argument("--source", required=True, type=Path)
+    migrate.add_argument("--database-url-env", default="SIGNALWATCH_DATABASE_URL")
     seeds = commands.add_parser("seed")
     seeds.add_argument("urls", nargs="+")
     importing = commands.add_parser("import-jsonl")
@@ -85,6 +98,28 @@ def main():
         from .runtime import run
         raise SystemExit(run(args.config, host=args.host, port=args.port, no_collect=args.no_collect))
     config = load_config(args.config)
+    if args.command in {"backup", "restore", "migration-preflight", "migrate-postgres"}:
+        from .recovery import create_backup, restore_backup, migration_preflight
+        if args.command == "backup":
+            result = create_backup(config, args.destination)
+        elif args.command == "restore":
+            target = os.environ.get(args.database_url_env, "") if args.database_url_env else None
+            if args.database_url_env and not target:
+                raise ValueError("The requested target database environment variable is empty")
+            result = restore_backup(args.backup, args.destination, database_url=target)
+        elif args.command == "migration-preflight":
+            result = migration_preflight(args.source or config.get("sqlite_db") or config["db"],
+                                         database_url=os.environ.get(args.database_url_env))
+        else:
+            from .postgres_migrate import migrate_sqlite
+            target = os.environ.get(args.database_url_env, "")
+            if not target:
+                raise ValueError("The requested target database environment variable is empty")
+            result = migrate_sqlite(args.source, target)
+        print(json.dumps(result, indent=2))
+        if args.command == "migration-preflight" and not result["ready"]:
+            raise SystemExit(1)
+        return
     if args.command == "serve":
         import uvicorn
         from .api import create_app

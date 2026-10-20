@@ -2,6 +2,7 @@ import re
 import unicodedata
 
 from packaging.version import InvalidVersion, Version
+from packaging.specifiers import InvalidSpecifier, Specifier
 
 
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.I)
@@ -102,6 +103,32 @@ def rank(severity=None, kev=False, epss=None):
     return round(min(100.0, max(0.0, float(severity or 0)) * 5 + (40 if kev else 0) + max(0.0, min(1.0, float(epss or 0))) * 10), 2)
 
 
+def semver(value, *, allow_v=False):
+    """Strict SemVer 2.0 precedence, including prereleases and build metadata."""
+    value = str(value or "")
+    if len(value) > 256:
+        return None
+    if allow_v:
+        value = value.removeprefix("v")
+    number = r"(?:0|[1-9][0-9]*)"
+    match = re.fullmatch(rf"({number})\.({number})\.({number})(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?", value)
+    if not match:
+        return None
+    prerelease = match.group(4)
+    identifiers = (prerelease or "").split(".") if prerelease else []
+    if any(item.isdigit() and len(item) > 1 and item.startswith("0") for item in identifiers):
+        return None
+    return (*map(int, match.groups()[:3]), 0 if prerelease else 1,
+            tuple((0, int(item)) if item.isdigit() else (1, item) for item in identifiers))
+
+
+def pep440(value):
+    try:
+        return Version(str(value)) if len(str(value)) <= 256 else None
+    except InvalidVersion:
+        return None
+
+
 def osv_version_match(observed, affected):
     observed = str(observed or "").strip()
     if not observed or observed in {"*", "-", "unknown"}:
@@ -116,36 +143,44 @@ def osv_version_match(observed, affected):
         if versions:
             return False, "unaffected", "Observed package version is absent from OSV's enumerated affected versions."
         return True, "version_unverified", "OSV does not provide comparable affected versions."
-    current = comparable(observed)
     uncertain = False
     for interval in ranges:
+        if not isinstance(interval, dict):
+            uncertain = True
+            continue
         range_type = interval.get("type")
         supported = range_type == "SEMVER" or (range_type == "ECOSYSTEM" and ecosystem_identity(affected.get("ecosystem")) == "pypi")
-        strict_semver = range_type != "SEMVER" or re.fullmatch(r"\d+\.\d+\.\d+", observed) is not None
-        if not supported or not strict_semver or current is None or not interval.get("events"):
+        compare = semver if range_type == "SEMVER" else pep440
+        current = compare(observed)
+        if not supported or current is None or not isinstance(interval.get("events"), list) or not interval["events"]:
             uncertain = True
             continue
         introduced = None
         active = False
         for event in interval.get("events", []):
+            if not isinstance(event, dict) or len(event) != 1 or not set(event) <= {"introduced", "fixed", "last_affected", "limit"}:
+                uncertain = True
+                continue
             if "introduced" in event:
+                if active:
+                    uncertain = True
                 introduced = event["introduced"]
                 active = True
                 continue
             closing = next((key for key in ("fixed", "last_affected", "limit") if key in event), None)
             if not closing or not active:
+                uncertain = True
                 continue
-            lower = None if introduced in (None, "0") else comparable(introduced)
-            upper = comparable(event[closing])
-            strict_bounds = range_type != "SEMVER" or (re.fullmatch(r"\d+\.\d+\.\d+", str(event[closing])) is not None and (introduced in (None, "0") or re.fullmatch(r"\d+\.\d+\.\d+", str(introduced)) is not None))
-            if not strict_bounds or upper is None or (introduced not in (None, "0") and lower is None):
+            lower = None if introduced == "0" else compare(introduced)
+            upper = compare(event[closing])
+            if upper is None or (introduced != "0" and lower is None) or (lower is not None and upper < lower):
                 uncertain = True
             elif (lower is None or current >= lower) and (current <= upper if closing == "last_affected" else current < upper):
                 return True, "affected_range", "Observed package version matches an OSV affected range."
             active = False
         if active:
-            lower = None if introduced in (None, "0") else comparable(introduced)
-            if introduced not in (None, "0") and (lower is None or (range_type == "SEMVER" and re.fullmatch(r"\d+\.\d+\.\d+", str(introduced)) is None)):
+            lower = None if introduced == "0" else compare(introduced)
+            if introduced != "0" and lower is None:
                 uncertain = True
             elif lower is None or current >= lower:
                 return True, "affected_range", "Observed package version matches an OSV affected range."
@@ -159,24 +194,31 @@ def github_version_match(observed, affected):
     observed = str(observed or "").strip()
     if ecosystem not in {"pypi", "npm", "crates.io", "go"}:
         return True, "version_unverified", "GitHub package range requires ecosystem-specific verification."
-    if ecosystem != "pypi" and re.fullmatch(r"v?\d+\.\d+\.\d+", observed) is None:
-        return True, "version_unverified", "GitHub package version requires ecosystem-specific verification."
-    current = comparable(observed)
+    compare = pep440 if ecosystem == "pypi" else lambda value: semver(value, allow_v=True)
+    current = compare(observed)
     if current is None:
         return True, "version_unverified", "GitHub package version syntax is unsupported."
     conditions = str(affected.get("version_range") or "").split(",")
     evaluated = []
+    prerelease_anchor = False
     for condition in conditions:
         match = re.fullmatch(r"\s*(<=|>=|<|>|==|=)\s*(\S+)\s*", condition)
         if match is None:
             return True, "version_unverified", "GitHub package range syntax is unsupported."
         operator, version = match.groups()
-        if ecosystem != "pypi" and re.fullmatch(r"v?\d+\.\d+\.\d+", version) is None:
-            return True, "version_unverified", "GitHub package range syntax is unsupported."
-        bound = comparable(version)
+        bound = compare(version)
         if bound is None:
             return True, "version_unverified", "GitHub package range syntax is unsupported."
-        evaluated.append({"<=": current <= bound, ">=": current >= bound, "<": current < bound, ">": current > bound, "==": current == bound, "=": current == bound}[operator])
+        if ecosystem == "pypi":
+            try:
+                evaluated.append(Specifier(("==" if operator == "=" else operator) + version).contains(current, prereleases=True))
+            except InvalidSpecifier:
+                return True, "version_unverified", "GitHub package range syntax is unsupported."
+        else:
+            prerelease_anchor = prerelease_anchor or bound[3] == 0 and bound[:3] == current[:3]
+            evaluated.append({"<=": current <= bound, ">=": current >= bound, "<": current < bound, ">": current > bound, "==": current == bound, "=": current == bound}[operator])
+    if ecosystem != "pypi" and current[3] == 0 and not prerelease_anchor:
+        return True, "version_unverified", "Prerelease inclusion requires an explicit same-release prerelease bound."
     if not all(evaluated):
         return False, "unaffected", "Observed package version falls outside GitHub's affected range."
     return True, "affected_range", "Observed package version matches GitHub's affected range."

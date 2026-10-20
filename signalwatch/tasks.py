@@ -2,6 +2,9 @@
 
 import asyncio
 import os
+import socket
+import time
+import logging
 from datetime import datetime, timezone
 
 from .celery_app import EXECUTE_TASK, SCHEDULE_TASK, app
@@ -9,6 +12,7 @@ from .config import load_config
 from .engine import Engine, source_outcome
 from .http import public_error
 from .jobs import Jobs
+from .operations import heartbeat
 from .store import Store
 
 MAX_RECOVERY_ATTEMPTS = 3
@@ -25,6 +29,10 @@ async def _execute(config, store, job):
     # must not enqueue unrelated configured websites before run_company scopes it.
     run_config = {**config, "seed_urls": []} if job["kind"] in {"passive_scan", "web_probe"} else config
     async with Engine(run_config, store) as engine:
+        jobs = Jobs(store)
+        engine.progress_callback = lambda stage, **fields: jobs.record_progress(
+            job["id"], stage, lease_token=job["lease_token"], **fields)
+        await asyncio.to_thread(engine.progress_callback, "preparing")
         payload = job["payload"]
         if job["kind"] == "collect":
             return await engine.run(payload.get("sources"), scheduled=bool(payload.get("scheduled", False)))
@@ -94,6 +102,33 @@ def execute_job(job_id):
             jobs.finish(job_id, status, error="Collection finished, but its result could not be recorded",
                         lease_token=lease)
         return {"job_id": job_id, "status": status}
+
+
+# Celery emits heartbeat_sent from its parent process, including while idle or
+# while a child waits on a slow source. Limit database writes to once per 20s.
+_heartbeat_state = {"pid": None, "last": 0, "store": None}
+
+
+def _worker_heartbeat(sender=None, *, stopped=False, force=False, **kwargs):
+    clock = time.monotonic()
+    state = _heartbeat_state
+    if not force and state["pid"] == os.getpid() and clock - state["last"] < 20:
+        return
+    try:
+        if state["pid"] != os.getpid() or state["store"] is None:
+            _, state["store"], _ = _context()
+            state["pid"] = os.getpid()
+        heartbeat(state["store"], socket.gethostname() + ":" + str(os.getpid()), status="stopped" if stopped else "ready")
+        state["last"] = clock
+    except Exception:
+        # Credentials and source URLs must not enter Celery logs on DB failure.
+        logging.getLogger("signalwatch").warning("Worker heartbeat could not be saved")
+
+
+from celery.signals import heartbeat_sent, worker_ready, worker_shutdown
+heartbeat_sent.connect(_worker_heartbeat, weak=False)
+worker_ready.connect(lambda **kwargs: _worker_heartbeat(force=True, **kwargs), weak=False)
+worker_shutdown.connect(lambda **kwargs: _worker_heartbeat(stopped=True, force=True, **kwargs), weak=False)
 
 
 async def _due(config, store):

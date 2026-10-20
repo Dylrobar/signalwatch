@@ -10,7 +10,9 @@ class WirelessImports:
     def __init__(self, store, config):
         self.store = store
         self.config = config
-        self.directory = Path(config["db"]).parent / "wireless-imports"
+        postgres = str(config["db"]).startswith(("postgres://", "postgresql://"))
+        data_root = Path(config.get("data_dir") or Path(config["cache_dir"]).parent) if postgres else Path(config["db"]).parent
+        self.directory = data_root / "wireless-imports"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tasks = {}
         self.lock = asyncio.Lock()

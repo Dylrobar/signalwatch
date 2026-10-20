@@ -1,4 +1,4 @@
-"""SQLite outbox dispatcher: publishing failure never discards an accepted job."""
+"""Database outbox dispatcher: publishing failure never discards an accepted job."""
 
 import asyncio
 import logging

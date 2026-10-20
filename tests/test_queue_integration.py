@@ -129,6 +129,8 @@ class QueueIntegrationTests(unittest.TestCase):
         self.assertTrue(self.request("/api/jobs")["enabled"])
         self.wait_for(lambda: "ready." in self.log()[previous_logs:], description="prefork worker readiness")
         self.assertIn("concurrency: 1 (prefork)", self.log()[previous_logs:])
+        self.wait_for(lambda: self.request("/api/operations")["workers"]["status"] == "ready",
+                      timeout=15, description="persisted Celery heartbeat")
 
     def stop_runtime(self):
         if self.runtime is None:
@@ -183,6 +185,7 @@ class QueueIntegrationTests(unittest.TestCase):
         job_id = accepted["job"]["id"]
         completed = self.wait_job(job_id)
         self.assertEqual(completed["attempts"], 1)
+        self.assertEqual(completed["progress"]["stage"], "completed")
         self.assertEqual(completed["result"]["sources"], [])
         self.assertEqual(self.request("/api/collect", payload)["job"]["id"], job_id)
 

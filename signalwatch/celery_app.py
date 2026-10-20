@@ -1,4 +1,4 @@
-"""Celery transport configuration; durable job payloads remain in SQLite."""
+"""Celery transport configuration; durable job payloads remain in the database."""
 
 import os
 
@@ -38,7 +38,7 @@ app.conf.update(
         "socket_timeout": BROKER_TIMEOUT,
         "retry_on_timeout": False,
         # Long imports may exceed Redis' default one-hour visibility window.
-        # A redelivery still cannot execute concurrently: jobs hold a file lock.
+        # A redelivery cannot execute concurrently: jobs hold a database/file lock.
         "visibility_timeout": 24 * 60 * 60,
     },
     task_publish_retry=False,

@@ -13,7 +13,7 @@ from urllib.parse import urljoin, urlsplit
 METHOD = "http_fingerprint_v1"
 HTML_LIMIT = 250_000
 FINDING_LIMIT = 100
-VERSION = r"[0-9]+(?:\.[0-9]+){0,4}(?:[-+~][0-9A-Za-z_.-]+)?"
+VERSION = r"[0-9]+(?:\.[0-9]+){0,4}(?:\.v[0-9]{8})?(?:[-+~][0-9A-Za-z_.-]+)?"
 
 # key: canonical vendor/product, display names, category, CPE part, known CPE identity.
 _TECH = {
@@ -35,6 +35,11 @@ _TECH = {
     "jquery": ("jquery", "jquery", "jQuery", "jQuery", "JavaScript Library", "a", True),
     "laravel": ("laravel", "framework", "Laravel", "Laravel", "Web Framework", "a", True),
     "tomcat": ("apache", "tomcat", "Apache", "Apache Tomcat", "Application Server", "a", True),
+    # Reviewed CPE identities require these specific response signatures. The
+    # broad fingerprint catalog is never permitted to invent vendor mappings.
+    "jetty": ("eclipse", "jetty", "Eclipse", "Eclipse Jetty", "Application Server", "a", True),
+    "caddy": ("caddyserver", "caddy", "Caddy", "Caddy", "Web Server", "a", True),
+    "jenkins": ("jenkins", "jenkins", "Jenkins", "Jenkins", "CI/CD", "a", True),
     "servlet": ("java", "servlet", "Java", "Java Servlet", "Web Framework", "a", False),
     "java": ("java", "java", "Java", "Java Runtime", "Runtime", "a", False),
     "react": ("facebook", "react", "Meta", "React", "Web Framework", "a", True),
@@ -209,6 +214,9 @@ def analyze_http_response(url, headers, html, *, cookie_names=()):
         ("server", rf"\bMicrosoft-IIS(?:/({VERSION}))?(?=[\s;()]|$)", "iis"),
         ("server", rf"\bApache Tomcat(?:/({VERSION}))?(?=[\s;()]|$)", "tomcat"),
         ("server", rf"\bVarnish(?:/({VERSION}))?(?=[\s;()]|$)", "varnish"),
+        ("server", rf"^\s*Jetty\(({VERSION})\)\s*$", "jetty"),
+        ("server", rf"^\s*Caddy(?:/v?({VERSION}))?\s*$", "caddy"),
+        ("x-jenkins", rf"^\s*({VERSION})\s*$", "jenkins"),
         ("x-powered-by", rf"\bPHP(?:/({VERSION}))?(?=[\s;,()]|$)", "php"),
         ("x-powered-by", rf"\bASP\.NET(?:/({VERSION}))?(?=[\s;,()]|$)", "aspnet"),
         ("x-powered-by", rf"\bExpress(?:/({VERSION}))?(?=[\s;,()]|$)", "express"),

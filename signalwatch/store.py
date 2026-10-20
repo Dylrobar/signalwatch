@@ -301,7 +301,7 @@ def decoded(row):
     if row is None:
         return None
     item = dict(row)
-    for key in ("metadata", "aliases", "affected", "references", "configurations", "cves", "reasons", "raw", "before", "after"):
+    for key in ("metadata", "aliases", "affected", "references", "configurations", "cves", "reasons", "raw", "before", "after", "assessment"):
         if key in item and isinstance(item[key], str):
             try:
                 item[key] = json.loads(item[key])
@@ -322,11 +322,14 @@ def decoded(row):
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, *, _connection=None):
         self.path = str(path)
+        self.is_postgres = self.path.startswith(("postgres://", "postgresql://"))
         self.uri = self.path == ":memory:"
         self._keeper = None
-        if self.uri:
+        if self.is_postgres:
+            self._writer_lock = _WriterAdmission(None)
+        elif self.uri:
             self.path = "file:signalwatch_" + uuid.uuid4().hex + "?mode=memory&cache=shared"
             self._writer_lock = _WriterAdmission(None)
             self._keeper = sqlite3.connect(self.path, uri=True, check_same_thread=False)
@@ -334,7 +337,10 @@ class Store:
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
             self.path = str(Path(self.path).expanduser().resolve())
             self._writer_lock = _writer_admission(self.path)
-        with self._writer_lock, self.connection() as conn:
+        schema_connection = self.connection(write=self.is_postgres) if _connection is None else nullcontext(_connection)
+        with self._writer_lock, schema_connection as conn:
+            if self.is_postgres:
+                conn.initialize()
             conn.execute("PRAGMA journal_mode=WAL")
             had_advisory_seen = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='advisory_seen'").fetchone() is not None
             conn.executescript(SCHEMA)
@@ -351,6 +357,12 @@ class Store:
             conn.executescript(TECHNOGRAPHIC_SCHEMA)
             from .technographic_store import ensure_schema as ensure_technographic_schema
             ensure_technographic_schema(conn)
+            from .access import ensure_schema as ensure_access_schema
+            from .reviews import ensure_schema as ensure_review_schema
+            from .applicability import ensure_schema as ensure_applicability_schema
+            ensure_access_schema(conn)
+            ensure_review_schema(conn)
+            ensure_applicability_schema(conn)
             if "superseded_by" not in {row[1] for row in conn.execute("PRAGMA table_info(raw_ingress)")}:
                 conn.execute("ALTER TABLE raw_ingress ADD COLUMN superseded_by INTEGER")
             if not had_advisory_seen:
@@ -377,6 +389,22 @@ class Store:
 
     @contextmanager
     def connection(self, write=False):
+        if self.is_postgres:
+            from .postgres import connect, WRITER_LOCK
+            conn = connect(self.path)
+            try:
+                if write:
+                    # Serialize legacy multi-statement read/modify/write flows
+                    # across API and worker processes, without disk affinity.
+                    conn.raw.execute("SELECT pg_advisory_xact_lock(%s)", (WRITER_LOCK,))
+                yield conn
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return
         # Admit API and worker writers before opening SQLite transactions.
         # Readers remain independent while long reconciliations hold the file
         # lock; process-local Store objects share its reentrant thread lock.
@@ -650,6 +678,9 @@ class Store:
         return counts
 
     def reconcile(self, *, asset_ids=None, conn=None):
+        from .alert_evidence import EvidenceIndex
+        from .applicability import ensure_schema, evaluate
+
         timestamp, token = now(), uuid.uuid4().hex
         candidates = {}
         evaluated = 0
@@ -667,15 +698,26 @@ class Store:
         if scoped_ids is not None:
             query += " AND o." + scope
         with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
+            ensure_schema(conn)
+            evidence_index, applicability_cache = EvidenceIndex(conn), {}
             for row in conn.execute(query, values):
                 evaluated += 1
                 affected = json.loads(row["affected_raw"])
                 matcher = osv_version_match if affected.get("ecosystem") or affected.get("package") else version_match
                 matches, state, reason = matcher(row["version"], affected)
                 if not matches:
+                    evidence_index.add(row, False, state, reason)
                     continue
-                reasons = ["Exact normalized product and vendor/ecosystem match.", reason,
-                 "Potential match: deployment, CPE configuration logic, and operating-system prerequisites require verification."]
+                applicability_key = (row["asset_id"], row["source_advisory_id"], row["vendor"], row["product"], row["part"])
+                if applicability_key not in applicability_cache:
+                    applicability_cache[applicability_key] = evaluate(json.loads(row["configurations"] or "null"),
+                        evidence_index.observations(row["asset_id"]), row)
+                applicability = applicability_cache[applicability_key]
+                if applicability["state"] == "false":
+                    evidence_index.add(row, False, "configuration_mismatch", applicability["reasons"][0])
+                    continue
+                evidence_index.add(row, True, state, reason)
+                reasons = ["Exact normalized product and vendor/ecosystem match.", reason, *applicability["reasons"]]
                 if row["origin"].startswith("technographic:"):
                     reasons.append("Technology use is asserted in public company text; current deployment and affected version are unverified.")
                 is_kev = row["kev_cve"] is not None
@@ -692,12 +734,19 @@ class Store:
                  "confidence": round(confidence, 4), "status": "potential", "version_state": state, "reasons": encode(reasons),
                  "first_seen": timestamp, "last_seen": timestamp, "source_url": row["source_url"], "evidence": row["evidence"],
                  "vendor": row["vendor_name"], "product": row["product_name"], "version": row["version"],
-                 "observed_at": row["observed_at"], "checked_token": token}
+                 "observed_at": row["observed_at"], "checked_token": token,
+                 "assessment": {"applicability": applicability}, "vendor_identity": row["vendor"],
+                 "product_identity": row["product"], "part_identity": row["part"]}
                 key = (row["asset_id"], row["canonical_id"])
                 previous = candidates.get(key)
                 strengths = {"exact": 3, "affected_range": 2, "version_unverified": 1, "unknown": 0}
                 if previous is None or (record["confidence"], strengths[state], record["rank"], record["observed_at"]) > (previous["confidence"], strengths[previous["version_state"]], previous["rank"], previous["observed_at"]):
                     candidates[key] = record
+            for key, record in candidates.items():
+                record["assessment"]["evidence"] = evidence_index.assessment(key, record)
+                record["assessment"] = encode(record["assessment"])
+                for field in ("vendor_identity", "product_identity", "part_identity"):
+                    record.pop(field)
             conn.execute("CREATE TEMP TABLE alert_current(asset_id TEXT NOT NULL,advisory_id TEXT NOT NULL,PRIMARY KEY(asset_id,advisory_id))")
             conn.executemany("INSERT INTO alert_current(asset_id,advisory_id) VALUES(?,?)", candidates)
             existing_alerts = {row["id"] for row in conn.execute("SELECT id FROM alerts WHERE " + scope, values)}
@@ -757,7 +806,7 @@ class Store:
 
     def save_company_profile(self, company_id="", name="", legal_name="", aliases=None, brands=None,
                              parent_company_id="", notes="", source_url="", primary_domain=None,
-                             primary_domain_evidence=None, primary_domain_source_url=None, verified_asns=None):
+                             primary_domain_evidence=None, primary_domain_source_url=None, verified_asns=None, *, conn=None):
         from .entity_resolution import DomainConflict, canonical_domain, prepare_asns, provenance_url, refresh_labels
         from .entity_resolution import verified_asns as saved_asns
         name = str(name).strip()
@@ -765,7 +814,7 @@ class Store:
             raise ValueError("Company name is required")
         aliases, brands = labels(aliases if aliases is not None else []), labels(brands if brands is not None else [])
         timestamp = now()
-        with self.connection(write=True) as conn:
+        with (self.connection(write=True) if conn is None else nullcontext(conn)) as conn:
             if company_id:
                 company(conn, company_id)
             else:
@@ -825,9 +874,9 @@ class Store:
             affected = reproject_company_identity(self, conn, company_id, (old_domain,), (domain,))
             if affected:
                 self.reconcile(asset_ids=affected, conn=conn)
-        return self.detail(company_id)
+            return self.detail(company_id, conn=conn)
 
-    def set_company_asset(self, company_id, asset_url, status="confirmed", role="owned", evidence="", source_url=""):
+    def set_company_asset(self, company_id, asset_url, status="confirmed", role="owned", evidence="", source_url="", *, conn=None):
         if status not in {"confirmed", "candidate", "rejected", "automatic"}:
             raise ValueError("Invalid company asset status")
         if role not in {"owned", "service"}:
@@ -836,7 +885,7 @@ class Store:
             raise ValueError("Manual company asset decisions require evidence and a source URL")
         asset_id, host = asset_identity(asset_url)
         timestamp = now()
-        with self.connection(write=True) as conn:
+        with (self.connection(write=True) if conn is None else nullcontext(conn)) as conn:
             company(conn, company_id)
             if status == "automatic":
                 conn.execute("DELETE FROM company_asset_decisions WHERE company_id=? AND asset_id=?", (company_id, asset_id))
@@ -852,7 +901,7 @@ class Store:
             affected = reproject_domain(self, conn, asset_id)
             if affected:
                 self.reconcile(asset_ids=affected, conn=conn)
-        return self.detail(company_id)
+            return self.detail(company_id, conn=conn)
 
     def advisories(self, q="", kev=False, limit=50, offset=0, *, sort="rank"):
         if sort not in {"rank", "newest"}:
@@ -917,9 +966,9 @@ class Store:
         with self.connection() as conn:
             return self._page(conn, "articles", where, values, "published DESC,id", limit, offset)
 
-    def detail(self, entity_id):
+    def detail(self, entity_id, *, conn=None):
         entity_id = identifier(entity_id)
-        with self.connection() as conn:
+        with (self.connection() if conn is None else nullcontext(conn)) as conn:
             entity = decoded(conn.execute("SELECT * FROM entities WHERE id=?", (entity_id,)).fetchone())
             advisory = decoded(conn.execute("SELECT " + ADVISORY_SELECT + " FROM " + ADVISORY_TABLE + " WHERE a.id=?", (entity_id,)).fetchone())
             if advisory is None:

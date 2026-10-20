@@ -211,7 +211,7 @@ def enrich_manufacturers(store):
           AND o.manufacturer_id!='' AND lower(substr(trim(o.manufacturer_id),1,2))!='0x'
           AND o.radio_type IN ('BLE','BT')
           AND trim(o.manufacturer_id) NOT GLOB '*[^0-9]*'
-         GROUP BY o.device_id,r.company_id""", (timestamp,))
+         GROUP BY o.device_id,r.company_id,r.registry,r.prefix,r.version,r.source_url""", (timestamp,))
         conn.execute("""INSERT OR IGNORE INTO wireless_company_links
          SELECT o.device_id,r.company_id,'advertised_provider','claimed','','bluetooth_registry',
           json_object('registry',r.registry,'company_identifier',r.prefix,'registry_version',r.version,
@@ -223,7 +223,7 @@ def enrich_manufacturers(store):
           AND o.radio_type IN ('BLE','BT')
           AND length(trim(o.manufacturer_id)) BETWEEN 3 AND 6
           AND upper(substr(trim(o.manufacturer_id),3)) NOT GLOB '*[^0-9A-F]*'
-         GROUP BY o.device_id,r.company_id""", (timestamp,))
+         GROUP BY o.device_id,r.company_id,r.registry,r.prefix,r.version,r.source_url""", (timestamp,))
         counts = {row["role"]: row["count"] for row in conn.execute("""SELECT role,count(*) AS count FROM wireless_company_links
          WHERE origin IN ('ieee_registry','bluetooth_registry') GROUP BY role""")}
     return {"manufacturer_links": counts.get("manufacturer", 0), "advertised_provider_links": counts.get("advertised_provider", 0)}
@@ -433,14 +433,14 @@ def device_company_links(conn, device_id, limit=100):
     if not 1 <= int(limit) <= 1000:
         raise ValueError("Invalid attribution limit")
     rows = conn.execute("""SELECT l.*,coalesce(p.name,e.name) AS company_name,f.name AS facility_name,
-     json_extract(l.evidence,'$.distance_meters') AS distance_m,
+     CAST(json_extract(l.evidence,'$.distance_meters') AS REAL) AS distance_m,
      EXISTS(SELECT 1 FROM wireless_company_links deny WHERE deny.device_id=l.device_id AND deny.company_id=l.company_id
       AND deny.origin='manual' AND deny.status='rejected') AS rejected_by_user
      FROM wireless_company_links l JOIN entities e ON e.id=l.company_id
      LEFT JOIN company_profiles p ON p.company_id=l.company_id
      LEFT JOIN wireless_facilities f ON f.id=l.facility_id WHERE l.device_id=?
      ORDER BY CASE l.role WHEN 'confirmed_operator' THEN 0 WHEN 'manufacturer' THEN 1 WHEN 'advertised_provider' THEN 2 ELSE 3 END,
-      CASE WHEN l.role='candidate_business' THEN json_extract(l.evidence,'$.distance_meters') END,
+      CASE WHEN l.role='candidate_business' THEN CAST(json_extract(l.evidence,'$.distance_meters') AS REAL) END,
       l.company_id,l.facility_id LIMIT ?""", (device_id, int(limit)))
     items = [{**dict(row), "evidence": json.loads(row["evidence"]), "rejected_by_user": bool(row["rejected_by_user"])} for row in rows]
     providers = {row[0] for row in conn.execute("SELECT company_id FROM wireless_company_links WHERE device_id=? AND origin='bluetooth_registry'", (device_id,))}
