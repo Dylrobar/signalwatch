@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from signalwatch.store import Store
+from signalwatch.store import SCHEMA as STORE_SCHEMA, Store
 from signalwatch.technographic_store import SCHEMA, document_input
 from signalwatch.technographic_verifier import verify_batch
 
@@ -168,7 +168,13 @@ class WebFingerprintStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "legacy.db"
             with sqlite3.connect(path) as conn:
+                conn.executescript(STORE_SCHEMA)
                 conn.executescript(SCHEMA.replace(",\n evidence_details TEXT NOT NULL DEFAULT '{}'", ""))
+                conn.execute("INSERT INTO entities(id,kind,name,value,updated_at) VALUES(?,?,?,?,?)",
+                             ("company:old", "company", "Old company", "Old company", "2026-10-01"))
+                conn.execute("INSERT INTO technographic_documents VALUES(?,?,?,?,?,?,?,?)",
+                             ("document:old", "company:old", "old-hash", "Old title", "retained text evidence", None,
+                              "2026-10-01", "2026-10-01"))
                 conn.execute("INSERT INTO tech_fingerprints VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                              ("old", "company:old", "document:old", "vendor", "product", "Vendor", "Product", "category", "a", "", None,
                               "asserted_use", 0.8, "retained text evidence", "text-method", "2026-10-01", "2026-10-01"))

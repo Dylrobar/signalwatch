@@ -30,15 +30,14 @@ class CompanyEnrichmentTests(unittest.IsolatedAsyncioTestCase):
             {"id": domain_id, "kind": "domain", "name": domain, "value": domain}],
             "edges": [{"from_id": company_id, "to_id": domain_id, "relation": relation}]})
 
-    def test_targets_use_official_company_domains_and_preserve_shared_domain_ambiguity(self):
+    def test_targets_use_official_company_domains_and_skip_ambiguous_shared_domains(self):
         self.add_company("Acme", "acme.test")
         self.add_company("Parent", "shared.test")
         self.add_company("Subsidiary", "shared.test")
         self.add_company("Candidate", "candidate.test", "candidate_asset")
         self.store.ingest({"entities": [{"id": "domain:orphan.test", "kind": "domain", "name": "orphan.test", "value": "orphan.test"}]})
         targets = self.store.company_enrichment_targets()
-        self.assertEqual(targets, [{"domain": "acme.test", "name": "Acme", "company_id": "company:Acme"},
-                                   {"domain": "shared.test", "name": "", "company_id": ""}])
+        self.assertEqual(targets, [{"domain": "acme.test", "name": "Acme", "company_id": "company:Acme"}])
         self.assertEqual(len(self.store.company_enrichment_targets(limit=1)), 1)
 
     async def test_discovered_companies_reach_all_three_enrichment_families(self):

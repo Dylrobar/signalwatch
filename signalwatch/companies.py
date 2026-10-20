@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS company_profiles (
  company_id TEXT PRIMARY KEY, name TEXT NOT NULL, legal_name TEXT NOT NULL DEFAULT '',
  aliases TEXT NOT NULL DEFAULT '[]', brands TEXT NOT NULL DEFAULT '[]',
  parent_company_id TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
- source_url TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+ source_url TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+ primary_domain TEXT NOT NULL DEFAULT '', primary_domain_evidence TEXT NOT NULL DEFAULT '',
+ primary_domain_source_url TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS company_parent ON company_profiles(parent_company_id);
 CREATE TABLE IF NOT EXISTS company_asset_decisions (
@@ -59,13 +61,14 @@ def company(conn, company_id):
 
 
 def labels(values):
+    from .entity_resolution import normalize_company_name
     if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
         raise ValueError("Company aliases and brands must be arrays of strings")
     unique = {}
     for value in values:
         value = value.strip()
         if value:
-            unique.setdefault(value.casefold(), value)
+            unique.setdefault(normalize_company_name(value) or value.casefold(), value)
     return list(unique.values())
 
 
@@ -109,6 +112,7 @@ def compact_company(conn, company_id):
 
 
 def company_profile(conn, entity):
+    from .entity_resolution import verified_asns
     row = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (entity["id"],)).fetchone()
     saved = dict(row) if row else {}
     parent_id = saved.get("parent_company_id", "")
@@ -123,6 +127,10 @@ def company_profile(conn, entity):
         "subsidiaries": [dict(child) for child in children], "notes": saved.get("notes", ""),
         "source_url": saved.get("source_url", entity.get("source_url") or ""),
         "updated_at": saved.get("updated_at", entity["updated_at"]),
+        "primary_domain": saved.get("primary_domain", ""),
+        "primary_domain_evidence": saved.get("primary_domain_evidence", ""),
+        "primary_domain_source_url": saved.get("primary_domain_source_url", ""),
+        "verified_asns": verified_asns(conn, entity["id"]),
     }
 
 
@@ -141,8 +149,14 @@ def www_equivalent(left, right):
 
 def company_assets(conn, company_id):
     """Resolve a bounded graph without treating shared networks as ownership."""
+    from .entity_resolution import resolve
     nodes, decisions, official, edges, proofs = {}, {}, defaultdict(list), [], defaultdict(set)
     truncated = False
+    saved = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (company_id,)).fetchone()
+    profile = dict(saved) if saved else {}
+    primary_domain = profile.get("primary_domain", "")
+    primary_asset = "domain:" + primary_domain if primary_domain else ""
+    namespace_edges = {}
 
     def add(asset_id):
         nonlocal truncated
@@ -182,6 +196,14 @@ def company_assets(conn, company_id):
                 selected.append(index)
         return set((selected + variants)[:MAX_PROOF])
 
+    if primary_asset and add(primary_asset):
+        item = {"from_id": company_id, "to_id": primary_asset, "relation": "primary_domain_anchor",
+                "source_url": profile.get("primary_domain_source_url", ""),
+                "observed_at": profile["updated_at"], "confidence": 1.0,
+                "evidence": profile.get("primary_domain_evidence", "")}
+        official[primary_asset].append(item)
+        proofs[primary_asset].add(edge(item))
+
     # User decisions take precedence and remain visible even without a current
     # source relationship. They never rewrite the source-managed graph.
     rows = conn.execute("SELECT * FROM company_asset_decisions WHERE company_id=? ORDER BY asset_id LIMIT ?", (company_id, MAX_ASSETS + 1))
@@ -206,9 +228,35 @@ def company_assets(conn, company_id):
             official[item["to_id"]].append(item)
             proofs[item["to_id"]].add(edge(item))
 
+    # A primary domain establishes a namespace, not ownership of every hostname.
+    # Keep discovered descendants visible as candidates without adding their
+    # observations or alerts to company risk. A more-specific company anchor
+    # fences its entire subtree from the broader namespace.
+    anchor_decision = decisions.get(primary_asset)
+    anchor_resolution = resolve(conn, {"domain": primary_domain, "company_id": company_id}) if primary_asset else {}
+    expand_namespace = primary_asset and anchor_resolution.get("organization_id") == company_id and (not anchor_decision or
+        anchor_decision["status"] == "confirmed" and anchor_decision["role"] == "owned")
+    if expand_namespace:
+        rows = conn.execute("""SELECT e.id FROM entities e WHERE e.id LIKE ?
+         AND NOT EXISTS (SELECT 1 FROM company_profiles p WHERE p.company_id!=?
+          AND p.primary_domain!='' AND length(p.primary_domain)>length(?)
+          AND p.primary_domain LIKE ? AND (e.id='domain:'||p.primary_domain OR e.id LIKE 'domain:%.'||p.primary_domain))
+         ORDER BY e.id LIMIT ?""", ("domain:%." + primary_domain, company_id, primary_domain,
+                                     "%." + primary_domain, MAX_ASSETS + 1))
+        for raw in rows:
+            asset_id = raw["id"]
+            if not add(asset_id):
+                continue
+            identity = edge({"from_id": primary_asset, "to_id": asset_id, "relation": "namespace_candidate",
+                             "source_url": profile.get("primary_domain_source_url", ""),
+                             "observed_at": profile["updated_at"], "confidence": 0.5,
+                             "evidence": "Known hostname within the primary domain; ownership is unconfirmed"})
+            namespace_edges[asset_id] = identity
+            proofs[asset_id].update(proofs[primary_asset] | {identity})
+
     # Load redirects at most once per domain, four hops from direct evidence.
     # Candidate paths can be inspected, but cannot grant included status.
-    frontier, visited, redirects = set(nodes), set(), []
+    frontier, visited, redirects = set(decisions) | set(official), set(), []
     for _ in range(MAX_HOPS):
         frontier = {asset_id for asset_id in frontier - visited
                     if decisions.get(asset_id, {}).get("status") != "rejected"
@@ -242,8 +290,17 @@ def company_assets(conn, company_id):
                                + ") AND to_id LIKE 'domain:%' LIMIT 1", sorted(boundary)).fetchone()
         truncated = truncated or omitted is not None
 
+    # Keep conflicting decisions visible, but never let an ambiguous owner
+    # seed inclusion or propagate inclusion through a www/apex redirect.
+    conflicts = {}
+    for asset_id in nodes:
+        resolution = resolve(conn, {"domain": asset_id.removeprefix("domain:"), "company_id": company_id})
+        if resolution["status"] == "conflict" or resolution.get("organization_id") not in (None, company_id):
+            conflicts[asset_id] = resolution
     included = {}
     for asset_id in nodes:
+        if asset_id in conflicts:
+            continue
         decision = decisions.get(asset_id)
         if decision:
             if decision["status"] == "confirmed" and decision["role"] == "owned":
@@ -256,6 +313,10 @@ def company_assets(conn, company_id):
     reachable_confidence = {asset_id: included.get(asset_id, 1.0 if asset_id in decisions else max((confidence(item["confidence"]) for item in official[asset_id]), default=0.0)) for asset_id in nodes if asset_id in decisions or official[asset_id]}
     paths = {asset_id: [max(proofs[asset_id], key=lambda index: (confidence(edges[index]["confidence"]), -index))]
              for asset_id in reachable_confidence}
+    for asset_id, identity in namespace_edges.items():
+        if asset_id not in reachable_confidence:
+            reachable_confidence[asset_id] = 0.5
+            paths[asset_id] = paths.get(primary_asset, []) + [identity]
     included_paths = {asset_id: paths[asset_id] for asset_id in included}
     for _ in range(MAX_HOPS):
         next_proofs = {asset_id: set(proof) for asset_id, proof in proofs.items()}
@@ -269,7 +330,7 @@ def company_assets(conn, company_id):
             path = paths[source] + [identity]
             if target not in next_paths or len(path) < len(next_paths[target]):
                 next_paths[target] = path
-            if source in included and target not in decisions and www_equivalent(source, target):
+            if source in included and target not in decisions and target not in conflicts and www_equivalent(source, target):
                 next_included[target] = max(next_included.get(target, 0.0), min(included[source], confidence(item["confidence"])))
                 path = included_paths[source] + [identity]
                 if target not in next_included_paths or len(path) < len(next_included_paths[target]):
@@ -296,19 +357,29 @@ def company_assets(conn, company_id):
             reasons = [{"confirmed": "Manual confirmation", "candidate": "Manual candidate", "rejected": "Manual rejection"}[status] + (": " + decision["evidence"] if decision["evidence"] else "")]
             if role == "service":
                 reasons.append("Service dependency; excluded from company-owned infrastructure")
+        elif asset_id == primary_asset:
+            status, role = "primary", "owned"
+            reasons = ["Explicit primary-domain identity anchor"]
         elif official[asset_id]:
             status, role = "official", "website"
             reasons = ["Official website evidence; legal ownership is not established"]
         elif asset_id in included:
             status, role = "redirect", "website"
             reasons = ["Observed www/apex-equivalent redirect from an included website"]
+        elif asset_id in namespace_edges:
+            status, role = "candidate", "website"
+            reasons = ["Known hostname within the primary domain; ownership requires confirmation"]
         else:
             status, role = "candidate", "website"
             reasons = ["Observed redirect destination; company association needs confirmation"]
+        if asset_id in conflicts and (not decision or decision["status"] == "confirmed" and decision["role"] == "owned"):
+            status = "conflict"
+            reasons.append("Excluded from company risk: " + conflicts[asset_id]["reason"])
         proof = sorted(bounded_proof(proofs[asset_id], asset_id, included_paths.get(asset_id, paths.get(asset_id, []))))
         assets.append({
             "id": asset_id, "name": entities.get(asset_id, {}).get("name", asset_id.removeprefix("domain:")),
             "status": status, "role": role, "included": asset_id in included,
+            "decision_status": decision["status"] if decision else None,
             "confidence": included.get(asset_id, reachable_confidence.get(asset_id, 0.0)),
             "reasons": reasons, "evidence": [edges[index] for index in proof[:MAX_PROOF]],
             "observation_count": observations.get(asset_id, 0), "warning_count": warnings.get(asset_id, 0),

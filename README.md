@@ -214,6 +214,8 @@ Version 0.10.2 bounds catalog candidate reads in each full-text index before sor
 
 ### Company profiles
 
+Version 0.19 adds unique primary-domain anchors and verified ASN records with supporting evidence. Company resolution checks the source and domain before assigning documents, fingerprints, or vendor relationships; name and alias matches remain candidates. Conflicting ownership is visible and excluded from risk totals. Company-focused graphs stop shared infrastructure and products from pulling in another company's evidence. See [company identity and evidence isolation](docs/company-isolation.md) for the API, migration, and access model.
+
 In Infrastructure, add a company or open an existing company to edit its display name, legal name, aliases, brands, parent company, identity source, and notes. Names, aliases, brands, and legal names are searchable. Parent/subsidiary links describe the saved corporate structure; they do not automatically transfer assets or warnings between companies. Profile edits and asset decisions are stored separately from collector records and survive later collector refreshes.
 
 Company profiles list official website associations, observed redirect destinations, and manual asset decisions with their sources, timestamps, confidence, and reasons. Observed redirects between a hostname and its `www` equivalent contribute to the company's observations and potential warnings. Other redirect destinations appear as candidates until reviewed. DNS answers, shared addresses, hosting networks, and CNAMEs do not establish company ownership.

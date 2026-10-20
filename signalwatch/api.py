@@ -69,6 +69,13 @@ class SBOMRequest(BaseModel):
     document: dict
 
 
+class VerifiedASNRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    asn: int = Field(strict=True, ge=1, le=4294967295)
+    evidence: str = Field(min_length=1, max_length=10000)
+    source_url: str = Field(min_length=1, max_length=2000)
+
+
 class CompanyProfileRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     company_id: str = Field(default="", max_length=300)
@@ -79,6 +86,10 @@ class CompanyProfileRequest(BaseModel):
     parent_company_id: str = Field(default="", max_length=300)
     notes: str = Field(default="", max_length=10000)
     source_url: str = Field(default="", max_length=2000)
+    primary_domain: str | None = Field(default=None, max_length=253)
+    primary_domain_evidence: str | None = Field(default=None, max_length=10000)
+    primary_domain_source_url: str | None = Field(default=None, max_length=2000)
+    verified_asns: list[VerifiedASNRequest] | None = Field(default=None, max_length=100)
 
     @field_validator("aliases", "brands")
     @classmethod
@@ -86,6 +97,16 @@ class CompanyProfileRequest(BaseModel):
         if any(len(value) > 200 for value in values):
             raise ValueError("Each alias or brand must be at most 200 characters")
         return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+class CompanyResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    company_id: str = Field(default="", max_length=300)
+    domain: str = Field(default="", max_length=253)
+    name: str = Field(default="", max_length=300)
+    asn: int | None = Field(default=None, strict=True, ge=1, le=4294967295)
+    source_url: str = Field(default="", max_length=2000)
+    text: str = Field(default="", max_length=16000)
 
 
 class CompanyAssetRequest(BaseModel):
@@ -514,6 +535,7 @@ def create_app(config, auto_collect=True):
 
     @app.post("/api/companies/profile")
     def save_company_profile(request: CompanyProfileRequest):
+        from .entity_resolution import DomainConflict
         values = request.model_dump()
         try:
             if values["source_url"]:
@@ -521,6 +543,18 @@ def create_app(config, auto_collect=True):
             return store.save_company_profile(**values)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
+        except DomainConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/companies/resolve")
+    def resolve_company(request: CompanyResolveRequest):
+        from .entity_resolution import resolve
+        context = request.model_dump(exclude={"source_url", "text"}, exclude_none=True)
+        try:
+            with store.connection() as conn:
+                return resolve(conn, context, source_url=request.source_url, text=request.text)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 

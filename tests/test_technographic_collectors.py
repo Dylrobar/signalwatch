@@ -56,7 +56,7 @@ class TechnographicNormalizationTests(unittest.TestCase):
         self.assertEqual((fields["title"], fields["url"], fields["description"]), ("SRE", job["jobUrl"], "We run Kubernetes."))
         self.assertEqual(fields["published_at"], job["publishedAt"])
         self.assertEqual(entity["metadata"]["company_context"]["company_id"], "company:example")
-        self.assertEqual(batch["edges"][0]["relation"], "has_public_evidence")
+        self.assertEqual(batch["edges"][0]["relation"], "candidate_evidence")
         self.assertFalse(entity["metadata"]["deployment_verified"])
         job["descriptionHtml"] = "<p>Updated stack</p>"
         self.assertEqual(entity["id"], normalize_corporate(envelope({"jobs": [job]}, "ashby", company_id="company:example"))["entities"][0]["id"])

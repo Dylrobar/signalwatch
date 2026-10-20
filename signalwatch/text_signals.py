@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 
-METHOD = 'deterministic-catalog-v1'
+METHOD = 'deterministic-catalog-v2'
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS text_signals (
  article_id TEXT PRIMARY KEY, text_hash TEXT NOT NULL, method TEXT NOT NULL,
@@ -24,12 +24,17 @@ CREATE INDEX IF NOT EXISTS observations_asset_order_graph ON observations(asset_
 
 
 def extract(conn, article):
+    from .entity_resolution import resolve
     original = str(article.get('title') or '') + '\n' + str(article.get('summary') or '')
     text = original[:16000]
     all_tokens = list(dict.fromkeys(re.findall(r'[\w.-]{3,}', text)))
     tokens = all_tokens[:128]
     expression = ' OR '.join('"' + token.replace('"', '""') + '"' for token in tokens)
     catalog = {}
+    company_ids = set()
+    # Reuse the bounded FTS candidate set below for names instead of scanning
+    # the full company catalogue for every article.
+    resolution = resolve(conn, source_url=article.get('url') or '')
     truncation = []
     if len(original)>16000:
         truncation.append('text')
@@ -59,6 +64,7 @@ def extract(conn, article):
         for row in rows:
             labels = [row['name'], row['profile_name'], row['legal_name']]
             if row['kind'] == 'company':
+                company_ids.add(row['id'])
                 labels += json.loads(row['aliases'] or '[]') + json.loads(row['brands'] or '[]')
             else:
                 meta = json.loads(row['metadata'])
@@ -75,8 +81,11 @@ def extract(conn, article):
         for entity_id in sorted(ids):
             if entity_id in mentions and mentions[entity_id]['status'] == 'resolved':
                 continue
-            mentions[entity_id] = {'entity_id': entity_id, 'status': 'resolved' if len(ids) == 1 and not truncated else 'candidate',
-                                   'quote': quote, 'confidence': 0.85 if len(ids) == 1 and not truncated else 0.35}
+            resolved = len(ids) == 1 and not truncated
+            if entity_id in company_ids:
+                resolved = resolved and resolution.get('organization_id') == entity_id
+            mentions[entity_id] = {'entity_id': entity_id, 'status': 'resolved' if resolved else 'candidate',
+                                   'quote': quote, 'confidence': 0.85 if resolved else 0.35}
     all_cves = sorted(set(c.upper() for c in re.findall(r'\bCVE-\d{4}-\d{4,}\b', text, re.I)))
     cves = all_cves[:32]
     if len(all_cves)>32:
@@ -110,14 +119,20 @@ def extract(conn, article):
     if len(mentions)>100:
         truncation.append('mentions')
     ordered_mentions=sorted(mentions.values(),key=lambda m:m['status']!='identifier')
+    company_candidates = sorted(company_ids.intersection(mentions))
+    if not resolution.get('organization_id') and company_candidates and resolution['status'] != 'conflict':
+        resolution.update(status='candidate', method='name_candidate', candidates=company_candidates,
+                          reason='Company names in text require supporting domain evidence')
     return {'method': METHOD, 'text_hash': hashlib.sha256(text.encode()).hexdigest(), 'mentions': ordered_mentions[:100],
             'claims': claims[:32], 'versions': versions, 'truncated': bool(truncation),
             'coverage': {'text_char_limit': 16000, 'catalog_candidate_limit': 200, 'token_limit': 128, 'truncation_reasons': truncation},
-            'source_url': article['url'], 'published': article.get('published')}
+            'source_url': article['url'], 'published': article.get('published'), 'resolution': resolution}
 
 
 def project(store, conn, article, article_id, timestamp):
     result = extract(conn, article)
+    from .technographic_store import persist_resolution
+    persist_resolution(conn, article_id, result['resolution'], article['url'], {}, timestamp)
     conn.execute('INSERT INTO text_signals VALUES(?,?,?,?,?) ON CONFLICT(article_id) DO UPDATE SET text_hash=excluded.text_hash,method=excluded.method,extraction=excluded.extraction,updated_at=excluded.updated_at',
                  (article_id, result['text_hash'], METHOD, json.dumps(result), timestamp))
     conn.execute('DELETE FROM signal_mentions WHERE article_id=?', (article_id,))
@@ -140,3 +155,60 @@ def backfill(store, after=0, limit=25):
             project(store, conn, dict(row), row['id'], now())
         return {'processed': min(limit,len(rows)), 'next_cursor': rows[min(limit,len(rows))-1]['cursor'] if rows else after,
                 'has_more': len(rows)>limit, 'method': METHOD}
+
+
+def refresh_company_resolution(store, conn, company_id=''):
+    """Withdraw legacy name-only resolution cheaply; refresh bounded alias matches.
+
+    The normal paged text backfill discovers remaining new alias mentions.
+    Existing mentions are downgraded immediately even beyond the refresh budget.
+    """
+    from .entity_resolution import resolve
+    from .store import now
+    from .technographic_store import persist_resolution
+
+    timestamp = now()
+    ids = set()
+    if company_id:
+        ids.update(row[0] for row in conn.execute('SELECT article_id FROM signal_mentions WHERE entity_id=?', (company_id,)))
+        profile = conn.execute('''SELECT e.name,p.name AS profile_name,p.legal_name,p.aliases,p.brands FROM entities e
+         LEFT JOIN company_profiles p ON p.company_id=e.id WHERE e.id=?''', (company_id,)).fetchone()
+        if profile:
+            labels = [profile['name'], profile['profile_name'], profile['legal_name']]
+            labels += json.loads(profile['aliases'] or '[]') + json.loads(profile['brands'] or '[]')
+            terms = ['"' + label.replace('"', '""') + '"' for label in labels if isinstance(label, str) and label.strip()]
+            if terms:
+                ids.update(row[0] for row in conn.execute('''SELECT a.id FROM article_fts JOIN articles a ON a.rowid=article_fts.rowid
+                 WHERE article_fts MATCH ?''', (' OR '.join(terms),)))
+        rows = (conn.execute('''SELECT a.id,a.url,a.title,a.summary,a.published,t.extraction FROM articles a
+                LEFT JOIN text_signals t ON t.article_id=a.id WHERE a.id=?''', (key,)).fetchone() for key in sorted(ids))
+    else:
+        rows = conn.execute('''SELECT a.id,a.url,a.title,a.summary,a.published,t.extraction FROM articles a
+         JOIN text_signals t ON t.article_id=a.id WHERE EXISTS(SELECT 1 FROM signal_mentions m
+          JOIN entities e ON e.id=m.entity_id AND e.kind='company' WHERE m.article_id=a.id)''')
+    refreshed = 0
+    for row in rows:
+        if row is None:
+            continue
+        if company_id and refreshed < 500:
+            project(store, conn, dict(row), row['id'], timestamp)
+            refreshed += 1
+            continue
+        if not row['extraction']:
+            continue
+        result = json.loads(row['extraction'])
+        companies = {item[0] for item in conn.execute("SELECT m.entity_id FROM signal_mentions m JOIN entities e ON e.id=m.entity_id AND e.kind='company' WHERE m.article_id=?", (row['id'],))}
+        resolution = resolve(conn, source_url=row['url'])
+        if not resolution.get('organization_id') and companies and resolution['status'] != 'conflict':
+            resolution.update(status='candidate', method='name_candidate', candidates=sorted(companies),
+                              reason='Company names in retained text require domain evidence')
+        for mention in result.get('mentions', []):
+            if mention['entity_id'] in companies:
+                mention.update(status='candidate', confidence=0.35)
+        result.update(method=METHOD, resolution=resolution)
+        conn.execute('UPDATE text_signals SET method=?,extraction=?,updated_at=? WHERE article_id=?', (METHOD, json.dumps(result), timestamp, row['id']))
+        conn.execute("UPDATE signal_mentions SET status='candidate',confidence=0.35 WHERE article_id=? AND entity_id IN (SELECT id FROM entities WHERE kind='company')", (row['id'],))
+        conn.execute("DELETE FROM edges WHERE from_id=? AND relation='text_mentions' AND to_id IN (SELECT id FROM entities WHERE kind='company')", (row['id'],))
+        for key in companies:
+            store._edge(conn, {'from_id': row['id'], 'to_id': key, 'relation': 'candidate_mention', 'source_url': row['url'], 'confidence': 0.35}, timestamp)
+        persist_resolution(conn, row['id'], resolution, row['url'], {}, timestamp)

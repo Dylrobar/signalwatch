@@ -57,7 +57,7 @@ class CorporateNormalizationTests(unittest.TestCase):
         self.assertEqual(entity["metadata"]["fields"]["description"], "Experience with nginx and Linux.")
         self.assertFalse(entity["metadata"]["deployment_verified"])
         self.assertEqual(entity["metadata"]["staging"]["raw_reference"], "staging:37")
-        self.assertEqual(batch["edges"][0]["relation"], "has_public_evidence")
+        self.assertEqual(batch["edges"][0]["relation"], "candidate_evidence")
         self.assertFalse(set(batch) & {"observations", "advisories"})
         self.assertFalse(any(row["kind"] == "company" for row in batch["entities"]))
         changed = normalize_corporate(item({"jobs": [{**payload["jobs"][0], "content": "Updated description"}]}, target={"company_id": "company:test", "domain": "example.com"}))

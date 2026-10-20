@@ -343,6 +343,8 @@ class Store:
             conn.executescript(COMPANY_SCHEMA)
             conn.execute("CREATE INDEX IF NOT EXISTS company_parent_order_graph ON company_profiles(parent_company_id,company_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS company_decision_asset_graph ON company_asset_decisions(asset_id,company_id)")
+            from .entity_resolution import ensure_schema as ensure_company_identity_schema
+            ensure_company_identity_schema(conn)
             conn.executescript(STAGING_SCHEMA)
             conn.executescript(WIRELESS_SCHEMA)
             conn.executescript(ATTRIBUTION_SCHEMA)
@@ -366,6 +368,12 @@ class Store:
             for column in ("epss_date", "kev_date"):
                 if column not in alert_columns:
                     conn.execute("ALTER TABLE alerts ADD COLUMN " + column + " TEXT")
+            from .technographic_constraints import ensure_constraints
+            affected = ensure_constraints(conn)
+            from .technographic_store import backfill_resolution
+            backfill_resolution(self, conn)
+            if affected:
+                self.reconcile(asset_ids=affected, conn=conn)
 
     @contextmanager
     def connection(self, write=False):
@@ -376,6 +384,7 @@ class Store:
             conn = sqlite3.connect(self.path, uri=self.uri, timeout=30)
             try:
                 conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA busy_timeout=30000")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 if write:
@@ -417,6 +426,9 @@ class Store:
          (key, item.get("kind") or "technology", str(item.get("name") or item.get("value") or key),
           str(item.get("value") or item.get("name") or key), encode(item.get("metadata") or {}),
           item.get("observed_at") or timestamp, item.get("source_url") or "", float(item.get("confidence", 1)), timestamp))
+        if item.get("kind") == "company":
+            from .entity_resolution import refresh_labels
+            refresh_labels(conn, key)
 
     def _edge(self, conn, item, timestamp):
         conn.execute("""INSERT INTO edges(from_id,to_id,relation,source_url,observed_at,confidence) VALUES(?,?,?,?,?,?)
@@ -744,7 +756,10 @@ class Store:
             return result
 
     def save_company_profile(self, company_id="", name="", legal_name="", aliases=None, brands=None,
-                             parent_company_id="", notes="", source_url=""):
+                             parent_company_id="", notes="", source_url="", primary_domain=None,
+                             primary_domain_evidence=None, primary_domain_source_url=None, verified_asns=None):
+        from .entity_resolution import DomainConflict, canonical_domain, prepare_asns, provenance_url, refresh_labels
+        from .entity_resolution import verified_asns as saved_asns
         name = str(name).strip()
         if not name:
             raise ValueError("Company name is required")
@@ -758,12 +773,58 @@ class Store:
                 self._entity(conn, {"id": company_id, "kind": "company", "name": name, "value": name,
                                     "metadata": {"origin": "manual"}, "source_url": source_url}, timestamp)
             validate_parent(conn, company_id, parent_company_id)
-            conn.execute("""INSERT INTO company_profiles(company_id,name,legal_name,aliases,brands,parent_company_id,notes,source_url,updated_at)
-             VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET name=excluded.name,legal_name=excluded.legal_name,
+            previous = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (company_id,)).fetchone()
+            previous = dict(previous) if previous else {}
+            old_domain = previous.get("primary_domain", "")
+            domain = old_domain if primary_domain is None else canonical_domain(primary_domain) if primary_domain != "" else ""
+            domain_evidence = previous.get("primary_domain_evidence", "") if primary_domain_evidence is None else primary_domain_evidence
+            domain_source = previous.get("primary_domain_source_url", "") if primary_domain_source_url is None else primary_domain_source_url
+            if domain:
+                if domain != old_domain and (primary_domain_evidence is None or primary_domain_source_url is None):
+                    raise ValueError("A new primary domain requires its own evidence and source URL")
+                if not isinstance(domain_evidence, str) or not domain_evidence.strip() or len(domain_evidence) > 10000:
+                    raise ValueError("Primary domain requires nonempty evidence of at most 10000 characters")
+                domain_evidence = domain_evidence.strip()
+                domain_source = provenance_url(domain_source)
+                conflict = conn.execute("SELECT company_id FROM company_profiles WHERE primary_domain=? AND company_id!=?", (domain, company_id)).fetchone()
+                if conflict:
+                    raise DomainConflict("Primary domain is already assigned to another company")
+            else:
+                domain_evidence = domain_source = ""
+            prior_asns = saved_asns(conn, company_id)
+            anchors = prior_asns if verified_asns is None else prepare_asns(verified_asns, prior_asns, timestamp)
+            conn.execute("""INSERT INTO company_profiles(company_id,name,legal_name,aliases,brands,parent_company_id,notes,source_url,updated_at,
+             primary_domain,primary_domain_evidence,primary_domain_source_url)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET name=excluded.name,legal_name=excluded.legal_name,
              aliases=excluded.aliases,brands=excluded.brands,parent_company_id=excluded.parent_company_id,
-             notes=excluded.notes,source_url=excluded.source_url,updated_at=excluded.updated_at""",
+             notes=excluded.notes,source_url=excluded.source_url,updated_at=excluded.updated_at,
+             primary_domain=excluded.primary_domain,primary_domain_evidence=excluded.primary_domain_evidence,
+             primary_domain_source_url=excluded.primary_domain_source_url""",
                          (company_id, name, str(legal_name).strip(), encode(aliases), encode(brands), parent_company_id,
-                          notes, source_url, timestamp))
+                          notes, source_url, timestamp, domain, domain_evidence, domain_source))
+            refresh_labels(conn, company_id)
+            if verified_asns is not None:
+                conn.execute("DELETE FROM company_asn_anchors WHERE company_id=?", (company_id,))
+                conn.executemany("INSERT INTO company_asn_anchors(company_id,asn,evidence,source_url,verified_at) VALUES(?,?,?,?,?)",
+                                 [(company_id, anchor["asn"], anchor["evidence"], anchor["source_url"], anchor["verified_at"]) for anchor in anchors])
+            # Only these managed relations are replaced; collected evidence and
+            # manual ownership decisions retain their independent provenance.
+            conn.execute("DELETE FROM edges WHERE from_id=? AND relation IN ('primary_domain_anchor','verified_asn')", (company_id,))
+            if domain:
+                self._entity(conn, {"id": "domain:" + domain, "kind": "domain", "name": domain, "value": domain,
+                                    "source_url": domain_source, "_reference_only": True}, timestamp)
+                self._edge(conn, {"from_id": company_id, "to_id": "domain:" + domain, "relation": "primary_domain_anchor",
+                                  "source_url": domain_source}, timestamp)
+            for anchor in anchors:
+                asn_id = "asn:AS" + str(anchor["asn"])
+                self._entity(conn, {"id": asn_id, "kind": "asn", "name": "AS" + str(anchor["asn"]), "value": str(anchor["asn"]),
+                                    "source_url": anchor["source_url"], "_reference_only": True}, timestamp)
+                self._edge(conn, {"from_id": company_id, "to_id": asn_id, "relation": "verified_asn",
+                                  "source_url": anchor["source_url"], "observed_at": anchor["verified_at"]}, timestamp)
+            from .technographic_store import reproject_company_identity
+            affected = reproject_company_identity(self, conn, company_id, (old_domain,), (domain,))
+            if affected:
+                self.reconcile(asset_ids=affected, conn=conn)
         return self.detail(company_id)
 
     def set_company_asset(self, company_id, asset_url, status="confirmed", role="owned", evidence="", source_url=""):
