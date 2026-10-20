@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 
 
 DEFAULTS = {
@@ -23,6 +23,7 @@ DEFAULTS = {
     "crawl_depth": 1,
     "crawl_batch": 50,
     "crawl_interval_hours": 24,
+    "web_fingerprint_catalog": True,
     "max_discovered_domains": 10000,
     "user_agent": f"SignalWatch/{VERSION} (https://github.com/Dylrobar/signalwatch)",
     "headers": {},
@@ -200,6 +201,8 @@ def load_config(path="config.json"):
     config["wireless_chunk_rows"] = int(chunk_rows)
     if config["dns_mode"] not in {"system", "fallback", "doh"}:
         raise ValueError("dns_mode must be system, fallback, or doh")
+    if type(config["web_fingerprint_catalog"]) is not bool:
+        raise ValueError("web_fingerprint_catalog must be a boolean")
     if int(config["staging_batch"]) > 500:
         raise ValueError("staging_batch must be at most 500")
     if int(config["public_source_records"]) > 5000:

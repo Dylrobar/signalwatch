@@ -285,7 +285,7 @@ class RobotsRepairTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = CaptureStore()
-        self.collector = Collector({**DEFAULTS, "cache_dir": self.temp.name, "seed_urls": []}, self.store)
+        self.collector = Collector({**DEFAULTS, "cache_dir": self.temp.name, "seed_urls": [], "web_fingerprint_catalog": False}, self.store)
         self.collector._resolve = AsyncMock(return_value=([], []))
 
     async def test_concurrent_failed_robots_is_cached_without_granting_permission(self):

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import re
 
 from bs4 import BeautifulSoup
@@ -29,7 +30,8 @@ CREATE TABLE IF NOT EXISTS tech_fingerprints (
  product_name TEXT NOT NULL, category TEXT NOT NULL, part TEXT NOT NULL,
  version TEXT NOT NULL DEFAULT '', cpe TEXT, status TEXT NOT NULL,
  confidence REAL NOT NULL, evidence_snippet TEXT NOT NULL, method TEXT NOT NULL,
- first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+ first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+ evidence_details TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS tech_fingerprints_org ON tech_fingerprints(organization_id,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_document ON tech_fingerprints(document_id);
@@ -46,10 +48,73 @@ _DNS_PROVIDERS = (
     ("Okta", "okta", r"okta-domain-verification\s*="),
 )
 _DNS_SIGNATURES = [(name, vendor, re.compile(pattern, re.I)) for name, vendor, pattern in _DNS_PROVIDERS]
+_HTTP_STATUSES = {"http_detected", "implied_dependency", "csp_integration"}
+_HTTP_DETAILS = ("evidence_type", "implied_by", "csp_directive", "matched_host")
+
+
+def ensure_schema(conn):
+    if "evidence_details" not in {row[1] for row in conn.execute("PRAGMA table_info(tech_fingerprints)")}:
+        conn.execute("ALTER TABLE tech_fingerprints ADD COLUMN evidence_details TEXT NOT NULL DEFAULT '{}'")
+
+
+def _http_document(entity, metadata):
+    from .companies import asset_identity
+
+    url = canonical_url(str(entity.get("source_url") or ""))
+    if not url:
+        return None
+    asset_id, domain = asset_identity(url)
+    findings = metadata.get("fingerprints")
+    if not isinstance(findings, list) or len(findings) > 500:
+        raise ValueError("HTTP fingerprint evidence requires a bounded findings array")
+    retained = {}
+    for finding in findings:
+        if (not isinstance(finding, dict) or finding.get("status") not in _HTTP_STATUSES
+                or not all(isinstance(finding.get(key), str) and finding[key] for key in ("vendor", "product", "evidence_snippet"))):
+            raise ValueError("Invalid HTTP fingerprint finding")
+        confidence = finding.get("confidence", 0.0)
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("Invalid HTTP fingerprint confidence")
+        value = {key: str(finding.get(key) or "")[:2000] for key in
+                 ("vendor", "product", "vendor_name", "product_name", "category", "version", "evidence_snippet")}
+        value.update(vendor_name=value["vendor_name"] or value["vendor"], product_name=value["product_name"] or value["product"],
+                     part=finding.get("part") if finding.get("part") in {"a", "o", "h"} else "a",
+                     cpe=str(finding["cpe"])[:1000] if finding.get("cpe") else None,
+                     status=finding["status"], confidence=confidence,
+                     method="projectdiscovery_wappalyzer" if finding.get("method") == "projectdiscovery_wappalyzer" else "http_fingerprint_v1")
+        if value["status"] != "http_detected":
+            value.update(version="", cpe=None)
+        if value["method"] == "projectdiscovery_wappalyzer":
+            value["cpe"] = None
+        details = {"asset_id": asset_id}
+        for key in _HTTP_DETAILS:
+            detail = finding.get(key)
+            if isinstance(detail, str):
+                details[key] = detail[:1000]
+            elif key == "implied_by" and isinstance(detail, list):
+                details[key] = [str(name)[:200] for name in detail[:20]]
+        value["evidence_details"] = details
+        identity = json.dumps([value[key] for key in ("vendor", "product", "version", "status", "evidence_snippet", "method", "part", "cpe", "evidence_details")],
+                              sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if identity not in retained or confidence > retained[identity]["confidence"]:
+            retained[identity] = value
+    retained = list(retained.values())
+    # A page's own evidence remains distinct from an identical response on a
+    # different host. Collection time is deliberately outside the content hash.
+    content = json.dumps({"source_url": url, "findings": retained}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    title = "HTTP technology evidence: " + domain
+    text = title + "\n" + "\n".join(finding["evidence_snippet"] for finding in retained)
+    return {"organization_context": {"domain": domain}, "asset_id": asset_id,
+            "title": title, "text": text, "source_url": url,
+            "url_hash": hashlib.sha256(url.encode()).hexdigest(), "endpoint_url": url,
+            "source_type": "http_fingerprint", "published_at": None,
+            "content_hash": hashlib.sha256(content.encode()).hexdigest(), "findings": retained}
 
 
 def document_input(entity):
     metadata = entity.get("metadata") or {}
+    if entity.get("kind") == "web_fingerprint":
+        return _http_document(entity, metadata)
     if entity.get("kind") == "source_record" and metadata.get("provider") == "dns_txt":
         record = metadata.get("provider_fields") or {}
         if not isinstance(record, dict) or not isinstance(record.get("data"), str) or not any(pattern.search(record["data"]) for _, _, pattern in _DNS_SIGNATURES):
@@ -106,6 +171,37 @@ def organization(conn, context):
     return rows[0][0] if len(rows) == 1 else None
 
 
+def _http_organization(conn, asset_id):
+    from .companies import company_assets
+
+    domain = asset_id.removeprefix("domain:")
+    apex = domain.removeprefix("www.")
+    candidates = conn.execute("""SELECT DISTINCT association.company_id FROM (
+     SELECT from_id AS company_id FROM edges WHERE relation='official_website' AND to_id IN (?,?)
+     UNION SELECT company_id FROM company_asset_decisions WHERE asset_id IN (?,?)
+    ) association JOIN entities c ON c.id=association.company_id AND c.kind='company'
+    ORDER BY association.company_id""", ("domain:" + apex, "domain:www." + apex) * 2).fetchall()
+    owners = []
+    for (company_id,) in candidates:
+        # Exact manual/official decisions must not disappear merely because
+        # the bounded UI asset graph omitted this host from its first page.
+        decision = conn.execute("SELECT status,role FROM company_asset_decisions WHERE company_id=? AND asset_id=?",
+                                (company_id, asset_id)).fetchone()
+        if decision is not None:
+            included = tuple(decision) == ("confirmed", "owned")
+        elif conn.execute("SELECT 1 FROM edges WHERE from_id=? AND to_id=? AND relation='official_website' LIMIT 1",
+                          (company_id, asset_id)).fetchone():
+            included = True
+        else:
+            assets, _ = company_assets(conn, company_id)
+            included = any(asset["id"] == asset_id and asset["included"] for asset in assets)
+        if included:
+            owners.append(company_id)
+            if len(owners) > 1:
+                return None
+    return owners[0] if len(owners) == 1 else None
+
+
 def enrichment_targets(conn, limit):
     rows = conn.execute("""WITH associations AS (
       SELECT e.from_id AS company_id,e.to_id AS asset_id FROM edges e WHERE e.relation='official_website'
@@ -133,7 +229,7 @@ def enrichment_targets(conn, limit):
 def reproject_domain(store, conn, asset_id):
     """Apply a manual decision to retained evidence without changing its source record."""
     domain = asset_id.removeprefix("domain:").removeprefix("www.")
-    rows = conn.execute("""SELECT * FROM entities WHERE kind IN ('job_posting','company_article','source_record')
+    rows = conn.execute("""SELECT * FROM entities WHERE kind IN ('job_posting','company_article','source_record','web_fingerprint')
      AND lower(rtrim(coalesce(json_extract(metadata,'$.company_context.domain'),
       json_extract(metadata,'$.target_domain'),''),'.')) IN (?,?)""", (domain, "www." + domain)).fetchall()
     affected = set()
@@ -157,7 +253,7 @@ def project(store, conn, entity, timestamp):
 
     # Entity updates merge metadata; attribution must use that retained state,
     # not interpret an omitted field in a partial refresh as its removal.
-    if entity.get("kind") in {"job_posting", "company_article", "source_record"}:
+    if entity.get("kind") in {"job_posting", "company_article", "source_record", "web_fingerprint"}:
         saved = conn.execute("SELECT * FROM entities WHERE id=?", (entity["id"],)).fetchone()
         if saved is not None:
             entity = dict(saved)
@@ -167,7 +263,8 @@ def project(store, conn, entity, timestamp):
         if conn.execute("SELECT 1 FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)).fetchone():
             _detach_sources(store, conn, entity["id"], None, None, timestamp)
         return {}
-    company_id = organization(conn, doc["organization_context"])
+    company_id = (_http_organization(conn, doc["asset_id"]) if doc["source_type"] == "http_fingerprint"
+                  else organization(conn, doc["organization_context"]))
     document_id = ("technographic_document:" + hashlib.sha256((company_id + "\0" + doc["content_hash"]).encode()).hexdigest()) if company_id else None
     _detach_sources(store, conn, entity["id"], company_id, document_id, timestamp)
     if company_id is None:
@@ -188,7 +285,9 @@ def project(store, conn, entity, timestamp):
         _graph(store, conn, entity["id"], document_id, doc["source_url"], timestamp)
         _observations(store, conn, company_id, document_id, timestamp)
         return {"technographic_duplicates": 1}
-    if doc["source_type"] == "dns_txt":
+    if doc["source_type"] == "http_fingerprint":
+        findings = doc["findings"]
+    elif doc["source_type"] == "dns_txt":
         findings = [{"vendor": vendor, "vendor_name": name, "product": "domain verification", "product_name": name + " domain verification",
                      "category": "SaaS verification", "part": "a", "version": "", "cpe": None, "status": "domain_verification",
                      "confidence": 1.0, "evidence_snippet": doc["text"][:600], "method": "dns-verification-v1"}
@@ -196,7 +295,7 @@ def project(store, conn, entity, timestamp):
     else:
         findings = extract(doc["text"], source_type=doc["source_type"])
     verification = (entity.get("metadata") or {}).get("technographic_verification") or {}
-    if verification.get("content_hash") == doc["content_hash"]:
+    if doc["source_type"] != "http_fingerprint" and verification.get("content_hash") == doc["content_hash"]:
         for checked in verification.get("findings", []):
             index = checked.get("index")
             if (type(index) is int and 0 <= index < len(findings)
@@ -205,11 +304,18 @@ def project(store, conn, entity, timestamp):
                     and (checked["status"] != "asserted_use" or findings[index]["status"] == "asserted_use")):
                 findings[index] = {**findings[index], **{key: checked[key] for key in ("status", "confidence", "method")}}
     for finding in findings:
-        fingerprint_id = "tech_fingerprint:" + hashlib.sha256(json.dumps([document_id, finding["vendor"], finding["product"], finding.get("version"), finding["status"], finding["evidence_snippet"]], ensure_ascii=False).encode()).hexdigest()
-        conn.execute("""INSERT INTO tech_fingerprints VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        details = finding.get("evidence_details") or {}
+        identity = [document_id, finding["vendor"], finding["product"], finding.get("version"), finding["status"], finding["evidence_snippet"]]
+        if details:
+            identity.extend((finding["method"], finding["part"], finding.get("cpe"), details))
+        fingerprint_id = "tech_fingerprint:" + hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        conn.execute("""INSERT INTO tech_fingerprints(id,organization_id,document_id,vendor,product,vendor_name,
+         product_name,category,part,version,cpe,status,confidence,evidence_snippet,method,first_seen_at,last_seen_at,evidence_details)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                      (fingerprint_id, company_id, document_id, finding["vendor"], finding["product"], finding["vendor_name"],
                       finding["product_name"], finding["category"], finding["part"], finding.get("version") or "", finding.get("cpe"),
-                      finding["status"], finding["confidence"], finding["evidence_snippet"], finding["method"], timestamp, timestamp))
+                      finding["status"], finding["confidence"], finding["evidence_snippet"], finding["method"], timestamp, timestamp,
+                      json.dumps(details, sort_keys=True, separators=(",", ":"))))
     _graph(store, conn, entity["id"], document_id, doc["source_url"], timestamp)
     _observations(store, conn, company_id, document_id, timestamp)
     return {"technographic_documents": 1, "tech_fingerprints": len(findings)}
@@ -225,7 +331,8 @@ def _detach_sources(store, conn, entity_id, company_id, document_id, timestamp):
             _clear_projection(store, conn, old_company, old_document, timestamp)
         else:
             _observations(store, conn, old_company, old_document, timestamp)
-    conn.execute("DELETE FROM edges WHERE to_id=? AND relation='has_public_evidence' AND (? IS NULL OR from_id!=?)",
+    conn.execute("""DELETE FROM edges WHERE to_id=? AND relation='has_public_evidence'
+     AND from_id IN (SELECT id FROM entities WHERE kind='company') AND (? IS NULL OR from_id!=?)""",
                  (entity_id, company_id, company_id))
     if company_id is None:
         conn.execute("DELETE FROM edges WHERE from_id=? AND relation LIKE 'technology_%'", (entity_id,))
@@ -235,8 +342,9 @@ def _graph(store, conn, entity_id, document_id, source_url, timestamp):
     conn.execute("DELETE FROM edges WHERE from_id=? AND relation LIKE 'technology_%'", (entity_id,))
     for finding in conn.execute("SELECT * FROM tech_fingerprints WHERE document_id=?", (document_id,)):
         key = "technographic_product:" + hashlib.sha256((finding["vendor"] + "\0" + finding["product"]).encode()).hexdigest()
+        role = "http_technology_label" if finding["status"] in _HTTP_STATUSES else "textual_technology_label"
         store._entity(conn, {"id": key, "kind": "technology", "name": finding["product_name"],
-                            "metadata": {"vendor": finding["vendor"], "product": finding["product"], "evidence_role": "textual_technology_label"},
+                            "metadata": {"vendor": finding["vendor"], "product": finding["product"], "evidence_role": role},
                             "source_url": source_url}, timestamp)
         store._edge(conn, {"from_id": entity_id, "to_id": key, "relation": "technology_" + finding["status"],
                            "source_url": source_url, "confidence": finding["confidence"]}, timestamp)
@@ -282,4 +390,10 @@ def company_evidence(conn, company_id, limit=100):
     total = conn.execute("""SELECT count(*) FROM tech_fingerprints f WHERE organization_id=?
      AND EXISTS (SELECT 1 FROM technographic_sources s WHERE s.document_id=f.document_id)""", (company_id,)).fetchone()[0]
     documents = conn.execute("SELECT count(DISTINCT document_id) FROM technographic_sources WHERE organization_id=?", (company_id,)).fetchone()[0]
-    return {"documents": documents, "fingerprints": [dict(row) for row in rows[:limit]], "total": total, "truncated": len(rows) > limit}
+    fingerprints = []
+    for row in rows[:limit]:
+        finding = dict(row)
+        details = json.loads(finding.pop("evidence_details"))
+        finding.update({key: details[key] for key in ("asset_id", *_HTTP_DETAILS) if key in details})
+        fingerprints.append(finding)
+    return {"documents": documents, "fingerprints": fingerprints, "total": total, "truncated": len(rows) > limit}

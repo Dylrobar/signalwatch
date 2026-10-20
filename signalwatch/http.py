@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import time
 from contextlib import asynccontextmanager
@@ -84,6 +85,27 @@ class FetchResult:
     url: str
     changed: bool
     digest: str
+    cookie_names: tuple[str, ...] = ()
+
+
+def response_cookie_names(headers, previous=()):
+    """Keep cookie names for fingerprinting without retaining session values."""
+    names = set()
+    for name in previous:
+        if isinstance(name, str) and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", name):
+            names.add(name)
+    for value in headers.getall("Set-Cookie", []):
+        name, separator, _ = value.partition("=")
+        name = name.strip()
+        if separator and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", name):
+            names.add(name)
+    return tuple(sorted(names)[:128])
+
+
+def cached_response_headers(headers):
+    # A list preserves repeated CSP and other headers. CIMultiDict also accepts
+    # the dictionary representation in older cache entries.
+    return [(key, value) for key, value in headers.items() if key.lower() != "set-cookie"]
 
 
 def retry_delay(value, attempt):
@@ -368,7 +390,15 @@ class PublicHTTP:
                                 raise ValueError(f"Response exceeds {limit} bytes: {display_url(url)}")
                             cached_headers = CIMultiDict(meta.get("headers", {}))
                             cached_headers.update(response_headers)
-                            return FetchResult(body, 304, cached_headers, str(response.url), False, meta.get("digest", ""))
+                            cookie_names = response_cookie_names(response_headers, meta.get("cookie_names", ()))
+                            # Retain metadata refreshed by a 304 for subsequent
+                            # revalidations, including cookie names only.
+                            meta.update(headers=cached_response_headers(cached_headers), cookie_names=cookie_names,
+                                        etag=cached_headers.get("ETag"), last_modified=cached_headers.get("Last-Modified"))
+                            meta_temp = meta_path.with_suffix(".json.tmp")
+                            meta_temp.write_text(json.dumps(meta, separators=(",", ":")))
+                            meta_temp.replace(meta_path)
+                            return FetchResult(body, 304, cached_headers, str(response.url), False, meta.get("digest", ""), cookie_names)
                         limited_403 = response.status == 403 and (
                             response_headers.get("Retry-After") is not None
                             or response_headers.get("X-RateLimit-Remaining") == "0")
@@ -414,13 +444,14 @@ class PublicHTTP:
                             "url": str(response.url), "etag": response_headers.get("ETag"),
                             "last_modified": response_headers.get("Last-Modified"),
                             "digest": value, "size": size, "fetched_at": time.time(),
-                            "headers": {key: value for key, value in response_headers.items() if key.lower() != "set-cookie"},
+                            "headers": cached_response_headers(response_headers),
+                            "cookie_names": response_cookie_names(response_headers),
                         }
                         if cache:
                             meta_temp = meta_path.with_suffix(".json.tmp")
                             meta_temp.write_text(json.dumps(metadata, separators=(",", ":")))
                             meta_temp.replace(meta_path)
-                        return FetchResult(body, response.status, response_headers, str(response.url), changed, value)
+                        return FetchResult(body, response.status, response_headers, str(response.url), changed, value, metadata["cookie_names"])
             except (aiohttp.ClientError, asyncio.TimeoutError) as error:
                 failed_url = request_state["url"]
                 failed_host = aiohttp.client_reqrep.URL(failed_url).host
