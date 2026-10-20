@@ -207,8 +207,10 @@ def refresh_company_resolution(store, conn, company_id=''):
                 mention.update(status='candidate', confidence=0.35)
         result.update(method=METHOD, resolution=resolution)
         conn.execute('UPDATE text_signals SET method=?,extraction=?,updated_at=? WHERE article_id=?', (METHOD, json.dumps(result), timestamp, row['id']))
-        conn.execute("UPDATE signal_mentions SET status='candidate',confidence=0.35 WHERE article_id=? AND entity_id IN (SELECT id FROM entities WHERE kind='company')", (row['id'],))
-        conn.execute("DELETE FROM edges WHERE from_id=? AND relation='text_mentions' AND to_id IN (SELECT id FROM entities WHERE kind='company')", (row['id'],))
+        conn.execute("""UPDATE signal_mentions SET status='candidate',confidence=0.35 WHERE article_id=?
+         AND EXISTS (SELECT 1 FROM entities e WHERE e.id=signal_mentions.entity_id AND e.kind='company')""", (row['id'],))
+        conn.execute("""DELETE FROM edges WHERE from_id=? AND relation='text_mentions'
+         AND EXISTS (SELECT 1 FROM entities e WHERE e.id=edges.to_id AND e.kind='company')""", (row['id'],))
         for key in companies:
             store._edge(conn, {'from_id': row['id'], 'to_id': key, 'relation': 'candidate_mention', 'source_url': row['url'], 'confidence': 0.35}, timestamp)
         persist_resolution(conn, row['id'], resolution, row['url'], {}, timestamp)

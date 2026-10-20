@@ -1,12 +1,16 @@
 import hashlib
 import json
+import logging
 import math
 import re
+import time
 from urllib.parse import urlsplit, unquote
 
 from bs4 import BeautifulSoup
 
 from .extract import canonical_url
+
+log = logging.getLogger("signalwatch")
 
 
 SCHEMA = """
@@ -374,10 +378,14 @@ def backfill_resolution(store, conn):
     conn.execute("CREATE TABLE IF NOT EXISTS evidence_resolution_migrations(version TEXT PRIMARY KEY)")
     if conn.execute("SELECT 1 FROM evidence_resolution_migrations WHERE version='company-isolation-v1'").fetchone():
         return
+    started = time.monotonic()
+    log.info("Company evidence migration started: version=company-isolation-v1")
     affected = reproject_company_identity(store, conn, "") - {""}
     if affected:
         store.reconcile(asset_ids=affected, conn=conn)
     conn.execute("INSERT INTO evidence_resolution_migrations VALUES('company-isolation-v1')")
+    log.info("Company evidence migration completed: version=company-isolation-v1 elapsed_seconds=%.3f affected_companies=%d",
+             time.monotonic() - started, len(affected))
 
 
 def document_seen(conn, context, content_hash):
@@ -504,7 +512,8 @@ def _detach_sources(store, conn, entity_id, company_id, document_id, timestamp):
         else:
             _observations(store, conn, old_company, old_document, timestamp)
     conn.execute("""DELETE FROM edges WHERE to_id=? AND relation IN ('has_public_evidence','candidate_evidence')
-     AND from_id IN (SELECT id FROM entities WHERE kind='company') AND (? IS NULL OR from_id!=?)""",
+     AND EXISTS (SELECT 1 FROM entities e WHERE e.id=edges.from_id AND e.kind='company')
+     AND (? IS NULL OR from_id!=?)""",
                  (entity_id, company_id, company_id))
     if company_id is None:
         conn.execute("DELETE FROM edges WHERE from_id=? AND relation LIKE 'technology_%'", (entity_id,))
