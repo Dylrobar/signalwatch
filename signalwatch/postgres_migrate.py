@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,13 +99,31 @@ def migrate_sqlite(source_path, target_dsn):
     # mode=ro prevents any source writes; BEGIN plus the first SELECT pins the
     # same WAL snapshot for integrity checks, checksums and all table copies.
     with closing(sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True)) as snapshot:
+        # Integrity checks revisit index pages; SQLite's ~2 MiB default cache
+        # causes excessive random I/O on large databases backed by network disks.
+        # This is connection-local and bounded, not a change to the source file.
+        snapshot.execute('PRAGMA cache_size=-131072')
         snapshot.execute('BEGIN')
         snapshot.execute('SELECT count(*) FROM sqlite_master').fetchone()
-        log.info('Pinned consistent read-only SQLite snapshot; no temporary database copy')
+        page_count = snapshot.execute('PRAGMA page_count').fetchone()[0]
+        page_size = snapshot.execute('PRAGMA page_size').fetchone()[0]
+        log.info('Pinned consistent read-only SQLite snapshot: %s bytes; 128 MiB page-cache limit; no temporary copy', page_count * page_size)
+        last_progress = time.monotonic()
+
+        def report_progress():
+            nonlocal last_progress
+            now = time.monotonic()
+            if now - last_progress >= 30:
+                log.info('SQLite source check/read is still making progress')
+                last_progress = now
+            return 0
+
+        snapshot.set_progress_handler(report_progress, 100000)
         try:
-            log.info('Checking SQLite snapshot integrity and foreign keys')
+            log.info('Checking SQLite snapshot integrity')
             if snapshot.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise RuntimeError('Source SQLite integrity check failed')
+            log.info('Checking SQLite snapshot foreign keys')
             foreign_keys = snapshot.execute('PRAGMA foreign_key_check').fetchall()
             if foreign_keys:
                 raise RuntimeError('Source SQLite has foreign-key violations; repair before migration')

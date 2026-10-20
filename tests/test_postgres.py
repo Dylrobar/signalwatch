@@ -96,6 +96,21 @@ class PostgresMigrationTests(unittest.TestCase):
             audit(conn, {'id': 'test', 'name': 'Tester'}, 'fixture.created', 'company:acme', after={'raw_id': raw['id']})
         return raw, job
 
+    def test_long_edge_urls_migrate_and_upsert_without_truncation(self):
+        import random
+        rng = random.Random(123)
+        url = 'https://example.test/?data=' + rng.randbytes(12000).hex()
+        edge = {'from_id': 'company:long', 'to_id': 'asset:long',
+                'relation': 'uses', 'source_url': url, 'confidence': 0.5}
+        self.source.ingest({'edges': [edge, {**edge, 'source_url': url + 'x'}]})
+        report = migrate_sqlite(self.source_path, self.target)
+        self.assertTrue(report['verified'])
+        target = Store(self.target)
+        target.ingest({'edges': [{**edge, 'confidence': 0.9}]})
+        with target.connection() as conn:
+            rows = conn.execute('SELECT source_url,confidence FROM edges ORDER BY source_url').fetchall()
+        self.assertEqual([(r[0], r[1]) for r in rows], [(url, 0.9), (url + 'x', 0.5)])
+
     def test_copy_preserves_ids_links_binary_audit_search_and_sequences(self):
         from signalwatch.staging import StagingQueue
         from signalwatch.jobs import Jobs
