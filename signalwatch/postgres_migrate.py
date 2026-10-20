@@ -1,7 +1,7 @@
 """Verified, atomic SQLite-to-PostgreSQL migration.
 
-Run with writers stopped. SQLite's backup API captures a consistent source
-snapshot without changing the original database. The destination must be empty
+Run with writers stopped. A read-only SQLite transaction pins a consistent source
+snapshot without copying or changing the original database. The destination must be empty
 (or have the matching completed manifest). Copy, byte-for-byte logical content
 verification, sequence repair and the activation manifest commit together.
 """
@@ -11,8 +11,7 @@ import hashlib
 import json
 import logging
 import sqlite3
-import tempfile
-import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -94,24 +93,14 @@ def migrate_sqlite(source_path, target_dsn):
         raise ValueError('SQLite migration source does not exist')
     if not str(target_dsn).startswith(('postgres://', 'postgresql://')):
         raise ValueError('Migration target must be a PostgreSQL connection URL')
-    with tempfile.TemporaryDirectory(prefix='signalwatch-migration-') as directory:
-        snapshot_path = Path(directory) / 'snapshot.sqlite3'
-        original = sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True)
-        snapshot = sqlite3.connect(snapshot_path)
-        last_progress = 0
-
-        def progress(_status, remaining, total):
-            nonlocal last_progress
-            now = time.monotonic()
-            if not remaining or now - last_progress >= 30:
-                log.info('SQLite migration snapshot: %s of %s pages copied', total - remaining, total)
-                last_progress = now
-
-        try:
-            log.info('Creating consistent SQLite migration snapshot')
-            original.backup(snapshot, pages=8192, progress=progress)
-        finally:
-            original.close()
+    # Keep every source read in one transaction. This avoids duplicating a
+    # multi-gigabyte database and leaves no scratch snapshot after SIGKILL.
+    # mode=ro prevents any source writes; BEGIN plus the first SELECT pins the
+    # same WAL snapshot for integrity checks, checksums and all table copies.
+    with closing(sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True)) as snapshot:
+        snapshot.execute('BEGIN')
+        snapshot.execute('SELECT count(*) FROM sqlite_master').fetchone()
+        log.info('Pinned consistent read-only SQLite snapshot; no temporary database copy')
         try:
             log.info('Checking SQLite snapshot integrity and foreign keys')
             if snapshot.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
@@ -199,4 +188,4 @@ def migrate_sqlite(source_path, target_dsn):
             finally:
                 conn.close()
         finally:
-            snapshot.close()
+            snapshot.rollback()

@@ -52,19 +52,24 @@ The migration tool copies real rows, raw bytes, IDs, and scoped relationships in
 
 If startup migration fails, fix the reported integrity/target problem before starting collection. A populated database from another source is never overwritten. Once PostgreSQL has accepted new production writes, rolling back to the old SQLite file would lose those writes; first stop writes and plan a controlled data reconciliation.
 
-On Render, set `TMPDIR=/data` before migrating a large database so the consistent
-snapshot uses the persistent disk rather than the 2 GB temporary-storage volume.
-Ensure the disk has room for both the original database and its snapshot. During
-runtime migration, a maintenance listener binds the configured application port
+Migration pins a single read-only SQLite transaction across integrity checks,
+source checksums and table copies. It creates no temporary database copy, so
+there is no extra snapshot-space requirement or abandoned snapshot after a killed
+migration. Writers must remain stopped until cutover; a consistent read snapshot
+does not include writes made after it starts. During runtime migration, a
+maintenance listener binds the configured application port
 and returns HTTP 503 with `ready: false` on every route, including `/health`.
 This permits port discovery without exposing application data or reporting
 readiness. Keep HTTP readiness checks pointed at `/health`. A TCP-only deployment
 status is not evidence that migration completed: check the verified migration
-log and the application's normal HTTP 200 health response. Snapshot progress,
+log and the application's normal HTTP 200 health response. Snapshot establishment,
 integrity checks, source checksums, table copies and verification are logged
 without credentials or row contents. After a verified cutover, set
 `SIGNALWATCH_MIGRATE_SQLITE=false` while retaining the PostgreSQL URL, so later
-restarts do not snapshot and recheck the preserved SQLite database.
+restarts do not recheck the preserved SQLite database. Older, failed versions may
+have left `signalwatch-migration-*` scratch directories; these are not reused or
+automatically deleted because they lack ownership markers. Only remove such a
+directory after confirming no migration uses it; retain the original SQLite file.
 
 ## Reproducible checks
 
