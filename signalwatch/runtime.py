@@ -1,4 +1,4 @@
-"""Supervise the API and one Celery worker beside the same SQLite disk."""
+"""Supervise API and workers; activate verified database migrations first."""
 
 import fcntl
 import logging
@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -129,30 +129,43 @@ def run(config_path, *, host=None, port=None, no_collect=False):
         raise ValueError("SIGNALWATCH_CONFIG must be absolute and match --config")
     env["SIGNALWATCH_CONFIG"] = str(path)
     config = load_config(path)
-    if not env.get("CELERY_BROKER_URL", "").strip():
-        command = [sys.executable, "-m", "signalwatch", "--config", str(path), "serve"]
-        if host is not None:
-            command.extend(["--host", host])
-        if port is not None:
-            command.extend(["--port", str(port)])
-        if no_collect:
-            command.append("--no-collect")
-        os.execvpe(sys.executable, command, env)
-        return 0
-    # Uvicorn and Celery must remain separate single-owner processes on this
-    # local database. Do not inherit a platform-wide multiworker setting.
-    broker = env["CELERY_BROKER_URL"].strip()
-    try:
-        parsed = urlsplit(broker)
-        valid = parsed.scheme in {"redis", "rediss"} and bool(parsed.hostname)
-        parsed.port
-    except ValueError:
-        valid = False
-    if not valid:
-        raise ValueError("CELERY_BROKER_URL must be a Redis or TLS Redis URL with an explicit host")
-    env["CELERY_BROKER_URL"] = broker
-    env["WEB_CONCURRENCY"] = "1"
-    commands = child_commands(config, host=host, port=port, no_collect=no_collect,
-                              beat=_enabled(env.get("SIGNALWATCH_CELERY_BEAT")))
-    with _runtime_lock(path):
+    migration_value = env.get("SIGNALWATCH_MIGRATE_SQLITE", "false").strip().lower()
+    if migration_value not in {"0", "1", "true", "false", "yes", "no", "on", "off"}:
+        raise ValueError("SIGNALWATCH_MIGRATE_SQLITE must be true or false")
+    migrate = migration_value in {"1", "true", "yes", "on"}
+    with (_runtime_lock(path) if migrate or env.get("CELERY_BROKER_URL", "").strip() else nullcontext()):
+        if migrate:
+            from .postgres_migrate import migrate_sqlite
+            source = config.get("sqlite_db")
+            if not source or not str(config["db"]).startswith(("postgres://", "postgresql://")):
+                raise ValueError("SQLite migration requires an original SQLite db in config and SIGNALWATCH_DATABASE_URL")
+            log.info("Verifying SQLite snapshot and PostgreSQL migration before starting application processes")
+            manifest = migrate_sqlite(source, config["db"])
+            log.info("PostgreSQL migration verified: %s rows across %s tables; already_migrated=%s",
+                     manifest["total_rows"], len(manifest["tables"]), manifest["already_migrated"])
+        if not env.get("CELERY_BROKER_URL", "").strip():
+            command = [sys.executable, "-m", "signalwatch", "--config", str(path), "serve"]
+            if host is not None:
+                command.extend(["--host", host])
+            if port is not None:
+                command.extend(["--port", str(port)])
+            if no_collect:
+                command.append("--no-collect")
+            os.execvpe(sys.executable, command, env)
+            return 0
+        # Raw wireless archives still use this service's persistent disk. Keep
+        # co-located processes until an external archive store is configured.
+        broker = env["CELERY_BROKER_URL"].strip()
+        try:
+            parsed = urlsplit(broker)
+            valid = parsed.scheme in {"redis", "rediss"} and bool(parsed.hostname)
+            parsed.port
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("CELERY_BROKER_URL must be a Redis or TLS Redis URL with an explicit host")
+        env["CELERY_BROKER_URL"] = broker
+        env["WEB_CONCURRENCY"] = "1"
+        commands = child_commands(config, host=host, port=port, no_collect=no_collect,
+                                  beat=_enabled(env.get("SIGNALWATCH_CELERY_BEAT")))
         return supervise(commands, env)

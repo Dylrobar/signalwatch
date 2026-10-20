@@ -44,6 +44,41 @@ class FingerprintTests(unittest.TestCase):
         self.assertIn(("imperva", "incapsula"), self.direct(self.analyze({"X-CDN": "Incapsula"})))
         self.assertIn(("cloudflare", "cloudflare"), self.direct(self.analyze({"Server": "cloudflare"})))
 
+    def test_reviewed_product_headers_preserve_specific_identity_and_version(self):
+        cases = [("Server", "Jetty(12.0.7)", "eclipse", "jetty", "12.0.7"),
+                 ("Server", "Jetty(9.4.54.v20240208)", "eclipse", "jetty", "9.4.54.v20240208"),
+                 ("Server", "Caddy/v2.8.4", "caddyserver", "caddy", "2.8.4"),
+                 ("X-Jenkins", "2.479.1", "jenkins", "jenkins", "2.479.1")]
+        for header, value, vendor, product, version in cases:
+            with self.subTest(value=value):
+                finding = self.direct(self.analyze({header: value}))[(vendor, product)]
+                self.assertEqual(finding["version"], version)
+                self.assertEqual(cpe_parts(finding["cpe"])["vendor"], vendor)
+                self.assertEqual(cpe_parts(finding["cpe"])["product"], product)
+                self.assertEqual(cpe_parts(finding["cpe"])["version"], version)
+        self.assertEqual(self.direct(self.analyze({"Server": "Caddy"}))[("caddyserver", "caddy")]["version"], "")
+
+    def test_reviewed_headers_reject_mentions_similar_names_and_invalid_versions(self):
+        for headers in ({"Server": "CaddyProxy/2.8.4"}, {"Server": "Gateway with Jetty(12.0.7)"},
+                        {"Server": "Jetty(12.0.7) documentation"}, {"X-Jenkins": "unknown"},
+                        {"X-Jenkins": "2.479.1; admin=secret"}, {"X-Powered-By": "Caddy/v2.8.4"}):
+            self.assertFalse(self.analyze(headers), headers)
+        self.assertFalse(self.analyze(html="<p>We integrate with Jenkins, Caddy and Jetty.</p>"))
+
+    def test_reviewed_jenkins_header_reaches_exact_product_cve_correlation(self):
+        from signalwatch.collectors import _web_fingerprints
+        from signalwatch.store import Store
+        store = Store(":memory:")
+        _, observations, _ = _web_fingerprints("https://ci.example.test", {"X-Jenkins": "2.479.1"}, "")
+        store.ingest({"observations": observations, "advisories": [
+            {"id": "CVE-2026-12345", "affected": [{"vendor": "jenkins", "product": "jenkins", "versionEndExcluding": "2.480"}]},
+            {"id": "CVE-2026-12346", "affected": [{"vendor": "jenkins", "product": "git_plugin", "versionEndExcluding": "9.0"}]}]})
+        self.assertEqual(store.reconcile()["alerts"], 1)
+        self.assertEqual(store.alerts()["items"][0]["advisory_id"], "CVE-2026-12345")
+        _, observations, _ = _web_fingerprints("https://ci.example.test", {"X-Jenkins": "2.480"}, "")
+        store.ingest({"observations": observations})
+        self.assertEqual(store.reconcile()["alerts"], 0)
+
     def test_cookie_names_only_and_no_ambiguous_stack_guesses(self):
         rows = self.analyze({"Set-Cookie": ["JSESSIONID=SESSION-SECRET; Path=/; HttpOnly", "ASP.NET_SessionId=ASP-SECRET",
                                             "XSRF-TOKEN=TOKEN-SECRET", "unrelated=laravel_session"]})

@@ -209,14 +209,15 @@ class TechnographicStoreTests(unittest.TestCase):
         result = self.store.ingest({"entities": [doc]})
         self.assertEqual(result["technographic_unattributed"], 1)
 
-    def test_successful_unchanged_fetch_touches_last_seen_only(self):
+    def test_successful_unchanged_fetch_only_advances_last_checked(self):
         doc = posting("Experience with Okta required.")
         self.store.ingest({"entities": [doc]})
         before = self.store.detail("company:acme")["technographics"]["fingerprints"][0]
         self.assertEqual(self.store.touch_technographic_source(doc["source_url"], {"company_id": "company:acme", "domain": "acme.test"}, "2030-01-01T00:00:00Z"), 1)
         after = self.store.detail("company:acme")["technographics"]["fingerprints"][0]
         self.assertEqual(before["first_seen_at"], after["first_seen_at"])
-        self.assertEqual(after["last_seen_at"], "2030-01-01T00:00:00Z")
+        self.assertEqual(after["last_seen_at"], before["last_seen_at"])
+        self.assertEqual(after["last_checked_at"], "2030-01-01T00:00:00Z")
         self.assertEqual(after["published_at"], "2026-10-01T00:00:00Z")
         self.assertEqual(self.store.detail("company:acme")["observations"], [])
 

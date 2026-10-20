@@ -637,13 +637,26 @@ class Collector:
                 final_url = canonical_url(response.url)
                 final_asset_id, final_host = asset_identity(final_url)
                 html = await asyncio.to_thread(_html_sample, response.path) if is_html else ""
-                findings, observations, diagnostics = await asyncio.to_thread(_web_fingerprints, final_url, response.headers, html, getattr(response, "cookie_names", ()), self.web_catalog)
+                unchanged = response.status == 304
+                if unchanged:
+                    # Cached bytes remain useful for following links, but a
+                    # revalidation is not another direct technology observation.
+                    findings, observations, diagnostics = [], [], []
+                else:
+                    findings, observations, diagnostics = await asyncio.to_thread(_web_fingerprints, final_url, response.headers, html, getattr(response, "cookie_names", ()), self.web_catalog)
                 self.web_catalog_diagnostics = list(dict.fromkeys([*self.web_catalog_diagnostics, *diagnostics]))[:20]
                 timestamp = utcnow()
-                batch = {"observations": observations, "observation_pages": [], "entities": [], "edges": []}
+                if unchanged:
+                    await to_thread(self.store.touch_technographic_source, final_url, {"domain": final_host}, timestamp)
+                batch = {"observations": [{**item, "observed_at": timestamp} for item in observations],
+                         "observation_pages": [], "entities": [], "edges": []}
                 for page in sorted(set([*visited, final_url])):
                     page_asset_id, page_host = asset_identity(page)
                     touched_assets.add(page_asset_id)
+                    if unchanged and page == final_url:
+                        batch["entities"].append({"id": page_asset_id, "kind": "domain", "name": page_host,
+                                                  "value": page_host, "source_url": page, "observed_at": timestamp})
+                        continue
                     # A redirect is also a replacement of any previous evidence
                     # at that URL. Only the actual response host gets findings.
                     evidence = _web_evidence_entity(page, findings if page == final_url else [], timestamp)
@@ -681,7 +694,7 @@ class Collector:
         return {"pages": pages, "observations": observed, "fingerprints": fingerprint_count,
                 "asset_ids": sorted(touched_assets), "error": error}
 
-    async def collect_web(self, *, targets=None):
+    async def collect_web(self, *, targets=None, progress=None):
         scoped = targets is not None
         self.robot_errors.clear()
         self.dns_errors.clear()
@@ -726,9 +739,19 @@ class Collector:
         else:
             targets = await to_thread(self.store.crawl_targets, int(self.config["crawl_batch"]), float(self.config["crawl_interval_hours"]))
         semaphore = asyncio.Semaphore(int(self.config["concurrency"]))
+        completed = 0
+        progress_lock = asyncio.Lock()
+        if progress is not None:
+            await progress("collecting", completed=0, total=len(targets), unit="targets")
         async def crawl(target):
+            nonlocal completed
             async with semaphore:
-                return await self._crawl(target)
+                result = await self._crawl(target)
+                if progress is not None:
+                    async with progress_lock:
+                        completed += 1
+                        await progress("collecting", completed=completed, total=len(targets), unit="targets")
+                return result
         results = await gather(*(crawl(target) for target in targets))
         errors = [row["error"] for row in results if row["error"]]
         if results and not any(row["pages"] for row in results) and errors:

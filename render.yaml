@@ -1,5 +1,7 @@
 # Bind the web entry to the existing SignalWatch service and its existing disk.
-# Do not create a second web service from this file: SQLite must stay on /data.
+# Do not create a second web service: raw wireless archives remain on /data.
+# PostgreSQL credentials and the verified migration flag are managed in the
+# existing service's environment; see docs/recovery.md before a cutover.
 services:
   - type: web
     name: signalwatch

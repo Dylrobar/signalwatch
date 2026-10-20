@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tech_fingerprints (
 CREATE INDEX IF NOT EXISTS tech_fingerprints_org ON tech_fingerprints(organization_id,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_document ON tech_fingerprints(document_id);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_product ON tech_fingerprints(vendor,product,status);
+CREATE INDEX IF NOT EXISTS tech_fingerprints_projection ON tech_fingerprints(document_id,organization_id,vendor,product,status,part,version);
 CREATE TABLE IF NOT EXISTS evidence_resolution (
  source_entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
  organization_id TEXT REFERENCES entities(id) ON DELETE SET NULL, status TEXT NOT NULL,
@@ -67,6 +68,8 @@ _HTTP_DETAILS = ("evidence_type", "implied_by", "csp_directive", "matched_host")
 
 
 def ensure_schema(conn):
+    from .evidence import ensure_schema as ensure_evidence_schema
+    ensure_evidence_schema(conn)
     if "evidence_details" not in {row[1] for row in conn.execute("PRAGMA table_info(tech_fingerprints)")}:
         conn.execute("ALTER TABLE tech_fingerprints ADD COLUMN evidence_details TEXT NOT NULL DEFAULT '{}'")
 
@@ -161,6 +164,11 @@ def organization(conn, context):
 
 
 def persist_resolution(conn, entity_id, result, source_url, context, timestamp):
+    previous = conn.execute("SELECT organization_id,status FROM evidence_resolution WHERE source_entity_id=?", (entity_id,)).fetchone()
+    if previous is None or tuple(previous) != (result.get("organization_id"), result["status"]):
+        from .evidence import bump_revision
+        for organization_id in {previous[0] if previous else None, result.get("organization_id")} - {None}:
+            bump_revision(conn, organization_id)
     conn.execute("""INSERT INTO evidence_resolution VALUES(?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(source_entity_id) DO UPDATE SET organization_id=excluded.organization_id,
      status=excluded.status,method=excluded.method,reason=excluded.reason,candidates=excluded.candidates,
@@ -372,7 +380,7 @@ def reproject_company_identity(store, conn, company_id, old_domains=(), new_doma
         entity = dict(row)
         entity["metadata"] = json.loads(entity["metadata"])
         before = {tuple(item) for item in conn.execute("SELECT organization_id,document_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],))}
-        project(store, conn, entity, entity["updated_at"], affected=affected)
+        project(store, conn, entity, entity["updated_at"], affected=affected, reproject=True)
         after = {tuple(item) for item in conn.execute("SELECT organization_id,document_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],))}
         if before != after:
             affected.update(item[0] for item in before | after)
@@ -401,8 +409,42 @@ def document_seen(conn, context, content_hash):
                                            (company_id, content_hash)).fetchone())
 
 
-def project(store, conn, entity, timestamp, *, affected=None):
+def _recheck_retained_resolution(store, conn, entity_id, timestamp, affected):
+    """Revoke ownership without interpreting an incomplete/older body as a scan."""
+    from .companies import asset_identity
+    rows = conn.execute("""SELECT s.*,d.title,d.raw_excerpt,r.context FROM technographic_sources s
+     JOIN technographic_documents d ON d.id=s.document_id AND d.organization_id=s.organization_id
+     JOIN evidence_resolution r ON r.source_entity_id=s.source_entity_id
+     WHERE s.source_entity_id=?""", (entity_id,)).fetchall()
+    for row in rows:
+        context = json.loads(row["context"])
+        doc = {"organization_context": context.get("company_context") or {}, "source_url": row["source_url"],
+               "endpoint_url": row["endpoint_url"], "source_type": row["source_type"], "text": row["raw_excerpt"]}
+        entity = {"id": entity_id, "metadata": {"source_binding": context.get("source_binding") or {}}}
+        if row["source_type"] == "http_fingerprint":
+            doc["asset_id"] = asset_identity(row["source_url"])[0]
+        elif row["source_type"] == "dns_txt":
+            # The saved domain binding refers to the validated answer owner.
+            domain = doc["organization_context"].get("domain")
+            entity["metadata"].update(target_domain=domain, provider_fields={"name": domain})
+        resolution = _resolve_document(conn, entity, doc)
+        persist_resolution(conn, entity_id, resolution, row["source_url"], context, timestamp)
+        if resolution.get("organization_id") != row["organization_id"]:
+            detached = _detach_sources(store, conn, entity_id, None, None, timestamp)
+            if affected is not None:
+                affected.update(detached)
+    return {"technographic_incomplete": 1}
+
+
+def project(store, conn, entity, timestamp, *, affected=None, reproject=False):
     from .technographics import extract
+    from .evidence import _parse, incomplete_observation, record_source_snapshot
+
+    # Explicitly incomplete captures preserve the last successful projection.
+    if incomplete_observation(entity):
+        if reproject:
+            return _recheck_retained_resolution(store, conn, entity["id"], timestamp, affected)
+        return {"technographic_incomplete": 1}
 
     # Entity updates merge metadata; attribution must use that retained state,
     # not interpret an omitted field in a partial refresh as its removal.
@@ -412,6 +454,15 @@ def project(store, conn, entity, timestamp, *, affected=None):
         if saved is not None:
             entity = dict(saved)
             entity["metadata"] = json.loads(entity["metadata"])
+    captured = _parse(entity.get("observed_at"))
+    if captured is not None:
+        from datetime import timezone
+        timestamp = captured.astimezone(timezone.utc).isoformat()
+    latest = conn.execute("SELECT max(last_seen_at) FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)).fetchone()[0]
+    if latest and captured and _parse(latest) and captured < _parse(latest):
+        if reproject:
+            return _recheck_retained_resolution(store, conn, entity["id"], timestamp, affected)
+        return {"technographic_out_of_order": 1}
     doc = document_input(entity)
     if doc is None:
         detached = set()
@@ -469,7 +520,7 @@ def project(store, conn, entity, timestamp, *, affected=None):
     conn.execute("""INSERT INTO technographic_sources VALUES(?,?,?,?,?,?,?,?,?)
      ON CONFLICT(organization_id,source_entity_id) DO UPDATE SET document_id=excluded.document_id,
      source_url=excluded.source_url,url_hash=excluded.url_hash,endpoint_url=excluded.endpoint_url,
-     source_type=excluded.source_type,last_seen_at=excluded.last_seen_at""",
+     source_type=excluded.source_type,last_seen_at=max(technographic_sources.last_seen_at,excluded.last_seen_at)""",
                  (company_id, entity["id"], document_id, doc["source_url"], doc["url_hash"], doc["endpoint_url"], doc["source_type"], timestamp, timestamp))
     store._edge(conn, {"from_id": company_id, "to_id": entity["id"], "relation": "has_public_evidence",
                        "source_url": doc["source_url"], "confidence": 1.0}, timestamp)
@@ -477,6 +528,7 @@ def project(store, conn, entity, timestamp, *, affected=None):
         conn.execute("UPDATE tech_fingerprints SET last_seen_at=max(last_seen_at,?) WHERE document_id=?", (timestamp, document_id))
         _graph(store, conn, entity["id"], document_id, doc["source_url"], timestamp)
         _observations(store, conn, company_id, document_id, timestamp)
+        record_source_snapshot(conn, entity, doc, company_id, document_id, timestamp)
         return {"technographic_duplicates": 1}
     if doc["source_type"] == "http_fingerprint":
         findings = doc["findings"]
@@ -511,6 +563,7 @@ def project(store, conn, entity, timestamp, *, affected=None):
                       json.dumps(details, sort_keys=True, separators=(",", ":"))))
     _graph(store, conn, entity["id"], document_id, doc["source_url"], timestamp)
     _observations(store, conn, company_id, document_id, timestamp)
+    record_source_snapshot(conn, entity, doc, company_id, document_id, timestamp)
     return {"technographic_documents": 1, "tech_fingerprints": len(findings)}
 
 
@@ -521,6 +574,8 @@ def _detach_sources(store, conn, entity_id, company_id, document_id, timestamp):
         if (old_company, old_document) == (company_id, document_id):
             continue
         affected.add(old_company)
+        from .evidence import bump_revision
+        bump_revision(conn, old_company)
         conn.execute("DELETE FROM technographic_sources WHERE organization_id=? AND source_entity_id=?", (old_company, entity_id))
         if not conn.execute("SELECT 1 FROM technographic_sources WHERE document_id=? AND organization_id=?", (old_document, old_company)).fetchone():
             _clear_projection(store, conn, old_company, old_document, timestamp)
@@ -575,31 +630,25 @@ def touch_source(conn, source_url, context, timestamp):
     company_id = organization(conn, context)
     if company_id is None:
         return 0
-    documents = [row[0] for row in conn.execute("SELECT DISTINCT document_id FROM technographic_sources WHERE endpoint_url=? AND organization_id=?", (source_url, company_id))]
-    conn.execute("UPDATE technographic_sources SET last_seen_at=max(last_seen_at,?) WHERE endpoint_url=? AND organization_id=?", (timestamp, source_url, company_id))
-    for key in documents:
-        conn.execute("UPDATE technographic_documents SET last_seen_at=max(last_seen_at,?) WHERE id=? AND organization_id=?", (timestamp, key, company_id))
-        conn.execute("UPDATE tech_fingerprints SET last_seen_at=max(last_seen_at,?) WHERE document_id=? AND organization_id=?", (timestamp, key, company_id))
-    return len(documents)
+    from .evidence import bump_revision, record_check
+    rows = conn.execute("SELECT source_entity_id,document_id FROM technographic_sources WHERE endpoint_url=? AND organization_id=?", (source_url, company_id)).fetchall()
+    for row in rows:
+        record_check(conn, row["source_entity_id"], timestamp)
+    if rows:
+        bump_revision(conn, company_id)
+    return len({row["document_id"] for row in rows})
 
 
 def company_evidence(conn, company_id, limit=100):
-    rows = conn.execute("""SELECT f.*,d.title AS document_title,d.published_at,
-     (SELECT source_url FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=d.organization_id ORDER BY last_seen_at DESC,source_url LIMIT 1) AS source_url,
-     (SELECT source_type FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=d.organization_id ORDER BY last_seen_at DESC,source_url LIMIT 1) AS source_type
-     FROM tech_fingerprints f JOIN technographic_documents d ON d.id=f.document_id AND d.organization_id=f.organization_id
-     WHERE f.organization_id=? AND EXISTS (SELECT 1 FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=f.organization_id)
-     ORDER BY f.last_seen_at DESC,f.id LIMIT ?""", (company_id, limit + 1)).fetchall()
-    total = conn.execute("""SELECT count(*) FROM tech_fingerprints f WHERE organization_id=?
-     AND EXISTS (SELECT 1 FROM technographic_sources s JOIN technographic_documents d ON d.id=s.document_id AND d.organization_id=s.organization_id
-                 WHERE s.document_id=f.document_id AND s.organization_id=f.organization_id)""", (company_id,)).fetchone()[0]
-    documents = conn.execute("SELECT count(DISTINCT s.document_id) FROM technographic_sources s JOIN technographic_documents d ON d.id=s.document_id AND d.organization_id=s.organization_id WHERE s.organization_id=?", (company_id,)).fetchone()[0]
-    fingerprints = []
-    for row in rows[:limit]:
-        finding = dict(row)
-        details = json.loads(finding.pop("evidence_details"))
-        finding.update({key: details[key] for key in ("asset_id", *_HTTP_DETAILS) if key in details})
-        fingerprints.append(finding)
+    from .evidence import ACTIVE, SELECT, decorate
+    rows = conn.execute(SELECT + " WHERE f.organization_id=? AND " + ACTIVE +
+                        " ORDER BY f.last_seen_at DESC,f.id LIMIT ?", (company_id, limit + 1)).fetchall()
+    total = conn.execute("SELECT count(*) FROM tech_fingerprints f WHERE f.organization_id=? AND " + ACTIVE, (company_id,)).fetchone()[0]
+    documents = conn.execute("""SELECT count(DISTINCT s.document_id) FROM technographic_sources s
+     JOIN technographic_documents d ON d.id=s.document_id AND d.organization_id=s.organization_id
+     JOIN evidence_resolution r ON r.source_entity_id=s.source_entity_id AND r.organization_id=s.organization_id
+     WHERE s.organization_id=? AND r.status='resolved'""", (company_id,)).fetchone()[0]
+    fingerprints = [decorate(row) for row in rows[:limit]]
     decisions = conn.execute("""SELECT * FROM evidence_resolution r WHERE organization_id=?
      OR EXISTS (SELECT 1 FROM json_each(r.candidates) WHERE value=?)
      ORDER BY updated_at DESC,source_entity_id LIMIT ?""", (company_id, company_id, limit + 1)).fetchall()
@@ -611,6 +660,14 @@ def company_evidence(conn, company_id, limit=100):
     resolution["items"] = [{key: json.loads(row[key]) if key == "candidates" else row[key] for key in
                             ("source_entity_id", "organization_id", "status", "method", "reason", "candidates", "source_url", "matched_domain")}
                            for row in decisions[:limit]]
+    for item in resolution["items"]:
+        candidate_ids = item["candidates"]
+        item["candidate_companies"] = []
+        if candidate_ids:
+            marks = ",".join("?" for _ in candidate_ids)
+            item["candidate_companies"] = [dict(row) for row in conn.execute(
+                "SELECT e.id,coalesce(p.name,e.name) AS name,coalesce(p.primary_domain,'') AS primary_domain FROM entities e "
+                "LEFT JOIN company_profiles p ON p.company_id=e.id WHERE e.kind='company' AND e.id IN (" + marks + ") ORDER BY name,e.id", candidate_ids)]
     resolution["truncated"] = len(decisions) > limit
     relationships = [{key: finding[key] for key in ("vendor", "vendor_name", "product", "product_name", "status", "evidence_snippet", "source_url", "organization_id", "method")}
                      for finding in fingerprints]

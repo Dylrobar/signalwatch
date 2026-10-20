@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from .async_utils import gather, to_thread
+from .config import data_directory
 from .ingestion import staging_queue
 from .staging import QueueFull
 
@@ -10,7 +11,7 @@ class WirelessImports:
     def __init__(self, store, config):
         self.store = store
         self.config = config
-        self.directory = Path(config["db"]).parent / "wireless-imports"
+        self.directory = data_directory(config) / "wireless-imports"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tasks = {}
         self.lock = asyncio.Lock()

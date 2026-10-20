@@ -1,0 +1,38 @@
+name: Backend regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: signalwatch_test
+          POSTGRES_USER: signalwatch_test
+          POSTGRES_PASSWORD: signalwatch_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U signalwatch_test -d signalwatch_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-*.txt
+      - run: sudo apt-get update && sudo apt-get install -y redis-server postgresql-client-16
+      - run: python -m pip install -r requirements-test.txt && python -m pip install --no-deps -e .
+      - name: Unit, Redis delivery, and PostgreSQL regression
+        env:
+          SIGNALWATCH_TEST_REDIS_SERVER: /usr/bin/redis-server
+          SIGNALWATCH_TEST_POSTGRES_URL: postgresql://signalwatch_test:signalwatch_test@localhost:5432/signalwatch_test
+        run: python -m unittest discover -s tests -v

@@ -131,6 +131,48 @@ class WebFingerprintCollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.observations()), 1)
         self.assertEqual(self.evidence()[0]["metadata"]["fingerprints"], [direct])
 
+    async def test_304_rechecks_preserve_direct_observation_and_follow_cached_links(self):
+        url = "https://portal.example.test/"
+        self.store.ingest({"entities": [{"id": "company:example", "kind": "company", "name": "Example"},
+                                         {"id": "domain:portal.example.test", "kind": "domain", "value": "portal.example.test"}],
+                           "edges": [{"from_id": "company:example", "to_id": "domain:portal.example.test", "relation": "official_website"}]})
+        body = '<a href="/next">Next page</a>'
+        direct = finding(cpe="cpe:2.3:a:vercel:next.js:15.0.1:*:*:*:*:*:*:*", version="15.0.1")
+        self.collector.http.get = AsyncMock(return_value=self.response(url, body))
+        with patch("signalwatch.collectors.analyze_http_response", return_value=[direct]), patch("signalwatch.collectors.utcnow", return_value="2026-01-01T00:00:00Z"):
+            await self.collector._crawl({"url": url})
+        before = self.store.detail("company:example")["technographics"]["fingerprints"][0]
+        observations = self.observations()
+        self.collector.config.update(crawl_pages=2, crawl_depth=1)
+        self.collector.http.get = AsyncMock(side_effect=[self.response(url, body, status=304), self.response(url + "next", "<html></html>")])
+        with patch("signalwatch.collectors.analyze_http_response", return_value=[]) as analyze, patch("signalwatch.collectors.utcnow", return_value="2026-01-02T00:00:00Z"):
+            result = await self.collector._crawl({"url": url})
+        after = self.store.detail("company:example")["technographics"]["fingerprints"][0]
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["observations"], 0)
+        self.assertEqual(self.observations(), observations)
+        self.assertEqual(after["last_observed_at"], before["last_observed_at"])
+        self.assertEqual(after["last_checked_at"], "2026-01-02T00:00:00Z")
+        self.assertEqual(after["direct_observed_at"], before["direct_observed_at"])
+        self.assertEqual(analyze.call_count, 1)
+        self.assertEqual(analyze.call_args.args[0], url + "next")
+
+    async def test_redirect_to_304_clears_origin_without_refreshing_destination(self):
+        origin, final = "https://company.example.test/", "https://service.example.test/login"
+        direct = finding(cpe="cpe:2.3:a:vercel:next.js:15.0.1:*:*:*:*:*:*:*", version="15.0.1")
+        for url in (origin, final):
+            self.collector.http.get = AsyncMock(return_value=self.response(url, "<html></html>"))
+            with patch("signalwatch.collectors.analyze_http_response", return_value=[direct]):
+                await self.collector._crawl({"url": url})
+        previous = next(row for row in self.observations() if row["asset_id"] == "domain:service.example.test")
+        self.collector.http.get = AsyncMock(side_effect=[self.response(origin, headers={"Location": final}, status=302), self.response(final, "<html></html>", status=304)])
+        with patch("signalwatch.collectors.analyze_http_response", side_effect=AssertionError("Do not parse a 304 as new evidence")):
+            result = await self.collector._crawl({"url": origin})
+        self.assertIsNone(result["error"])
+        self.assertEqual(self.observations(), [previous])
+        self.assertEqual(next(row for row in self.evidence() if row["source_url"] == origin)["metadata"]["fingerprints"], [])
+
     def test_merge_preserves_explicit_version_and_legacy_nginx_alias(self):
         _, observations, _ = _web_fingerprints("https://EXAMPLE.test./", {"Server": "nginx/1.24.0"}, "")
         self.assertEqual({row["vendor"] for row in observations}, {"f5", "nginx"})

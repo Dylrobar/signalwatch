@@ -1,13 +1,11 @@
 import asyncio
 import copy
-import fcntl
 import hashlib
 import importlib
 import logging
 import math
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from urllib.parse import urlsplit
 
 from .async_utils import gather, to_thread
@@ -16,6 +14,7 @@ from .companies import asset_identity, company, company_assets
 from .cve_program import collect_cve_program
 from .csaf import collect_csaf
 from .http import HTTPError, PublicRequestError
+from .jobs import database_lock
 from .network import collect_network
 from .nmap import collect_nmap
 from .osv import collect_osv
@@ -180,6 +179,10 @@ class Engine:
         self.last_result = None
         self.last_error = None
         self._guard = asyncio.Lock()
+        self.progress_callback = None
+        self._progress_guard = asyncio.Lock()
+        self._completed_sources = 0
+        self._total_sources = 0
 
     async def __aenter__(self):
         self.collector = await Collector(self.config, self.store).__aenter__()
@@ -277,6 +280,7 @@ class Engine:
             result = await to_thread(worker.drain, limit, reconcile=False)
             for key in counts:
                 counts[key] += int(result.get(key, 0))
+            await self._progress("staging", completed=counts["claimed"], unit="records")
             claimed = int(result.get("claimed", 0))
             remaining -= claimed
             if claimed < limit:
@@ -286,16 +290,20 @@ class Engine:
     def busy(self):
         if self.running:
             return True
-        path = Path(self.config["db"] + ".collector.lock")
-        if not path.exists():
-            return False
-        with path.open("a") as lock_file:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-        return False
+        with database_lock(self.store, "collector") as acquired:
+            return not acquired
+
+    async def _progress(self, stage, **fields):
+        if self.progress_callback is not None:
+            async with self._progress_guard:
+                await to_thread(self.progress_callback, stage, **fields)
+
+    async def _tracked_source(self, name):
+        result = await self._source(name)
+        self._completed_sources += 1
+        await self._progress("collecting", completed=self._completed_sources,
+                             total=self._total_sources, message="Finished " + name)
+        return result
 
     async def _source(self, name):
         state = await to_thread(self.store.source_state, name)
@@ -354,12 +362,8 @@ class Engine:
         if self._guard.locked():
             return {"busy": True}
         async with self._guard:
-            lock_path = Path(self.config["db"] + ".collector.lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("a") as lock_file:
-                try:
-                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+            with database_lock(self.store, "collector") as acquired:
+                if not acquired:
                     return {"busy": True, "error": "Another process is collecting this database"}
                 self.running = True
                 started = now()
@@ -374,6 +378,9 @@ class Engine:
                             if not names:
                                 return {"scheduled": True, "sources": [], "skipped": True}
                     self.last_error = None
+                    self._completed_sources = 0
+                    self._total_sources = len(years) if years else len(names)
+                    await self._progress("collecting", total=self._total_sources)
                     if years:
                         results = []
                         for year in years:
@@ -389,15 +396,20 @@ class Engine:
                                 raise
                             finally:
                                 self.current_sources.discard(name)
+                            self._completed_sources += 1
+                            await self._progress("collecting", completed=self._completed_sources, total=self._total_sources)
                     else:
                         # A failed status write must not release the process/file
                         # guards while sibling collectors still use the database.
-                        results = await gather(*(self._source(name) for name in names), return_exceptions=True)
+                        results = await gather(*(self._tracked_source(name) for name in names), return_exceptions=True)
                         for result in results:
                             if isinstance(result, BaseException):
                                 raise result
+                    await self._progress("staging", unit="records")
                     staging = await self._drain_staging()
+                    await self._progress("matching", total=1, unit="passes")
                     matched = await to_thread(self.store.reconcile)
+                    await self._progress("matching", completed=1, total=1, unit="passes")
                     await to_thread(self.store.prune_events, int(self.config.get("events_max_rows", 50000)), float(self.config.get("events_retention_days", 90)))
                     self.last_result = {"started_at": started, "finished_at": now(), "sources": results, "matching": matched, "staging": staging}
                     return self.last_result
@@ -407,7 +419,6 @@ class Engine:
                     raise
                 finally:
                     self.running = False
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     async def run_company(self, kind, company_id, primary_domain=None):
         """Run a company job under the same process guard as global collection."""
@@ -416,12 +427,8 @@ class Engine:
         if self._guard.locked():
             return {"busy": True}
         async with self._guard:
-            lock_path = Path(self.config["db"] + ".collector.lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("a") as lock_file:
-                try:
-                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+            with database_lock(self.store, "collector") as acquired:
+                if not acquired:
                     return {"busy": True, "error": "Another process is collecting this database"}
                 self.running = True
                 started = now()
@@ -429,6 +436,7 @@ class Engine:
                 marker = kind + ":" + str(company_id)
                 self.current_sources.add(marker)
                 try:
+                    await self._progress("preparing", unit="targets")
                     scope = await to_thread(company_scope, self.store, company_id, primary_domain,
                                             include_candidates=kind == "web_probe",
                                             limit=self.config.get("crawl_batch", 50))
@@ -439,8 +447,10 @@ class Engine:
                         return {"company_id": company_id, "kind": kind, "sources": [
                             {"source": kind, "ok": False, "skipped": True, "retry_at": state["retry_at"],
                              "error": state.get("error") or "Source is waiting for its retry time"}]}
+                    await self._progress("collecting", total=len(scope["targets"]) if kind == "web_probe" else len(scope["domains"]), unit="targets")
                     if kind == "web_probe":
-                        counts = await self.collector.collect_web(targets=scope["targets"])
+                        kwargs = {"progress": self._progress} if self.progress_callback is not None else {}
+                        counts = await self.collector.collect_web(targets=scope["targets"], **kwargs)
                         staging = None
                     else:
                         from .extension_network import SOURCE_DEFINITIONS, collect_network_sources
@@ -457,10 +467,14 @@ class Engine:
                                 settings.setdefault(definition["id"], {})["enabled"] = False
                         scoped_store = _CompanyProviderStore(self.store, company_id)
                         counts = await collect_network_sources(scoped_config, scoped_store, self.collector.http)
+                        await self._progress("collecting", completed=len(scope["domains"]), total=len(scope["domains"]), unit="targets")
+                        await self._progress("staging", unit="records")
                         staging = await self._drain_staging()
                     _, errors, succeeded = source_outcome(counts)
                     assets = sorted(set(scope["asset_ids"]) | set(counts.get("asset_ids", [])))
+                    await self._progress("matching", total=len(assets), unit="assets")
                     matched = await to_thread(self.store.reconcile, asset_ids=assets)
+                    await self._progress("matching", completed=len(assets), total=len(assets), unit="assets")
                     self.last_result = {"started_at": started, "finished_at": now(), "kind": kind,
                                         "company_id": company_id, "scope": scope,
                                         "sources": [{"source": kind, "ok": succeeded, "counts": counts,
@@ -475,7 +489,6 @@ class Engine:
                 finally:
                     self.current_sources.discard(marker)
                     self.running = False
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     async def schedule(self, startup_sources=None):
         if startup_sources:

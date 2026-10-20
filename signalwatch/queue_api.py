@@ -35,8 +35,13 @@ def register_job_routes(app, config, engine, jobs, enabled):
             raise HTTPException(503, "Background jobs require the Redis broker and SignalWatch queue runtime")
 
     @app.get("/api/jobs")
-    def list_jobs(limit: int = Query(30, ge=1, le=100)):
-        return {"enabled": enabled, "jobs": jobs.list(limit=limit)}
+    def list_jobs(limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0, le=100000),
+                  company_id: str = Query("", max_length=300),
+                  status: Literal["", "queued", "running", "retrying", "succeeded", "failed"] = "",
+                  kind: Literal["", "collect", "passive_scan", "web_probe", "cve_match"] = ""):
+        filters = {"company_id": company_id, "status": status, "kind": kind}
+        return {"enabled": enabled, "jobs": jobs.list(limit=limit, offset=offset, **filters),
+                "total": jobs.count(**filters), "offset": offset, "limit": limit}
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str):

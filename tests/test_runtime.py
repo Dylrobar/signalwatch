@@ -89,6 +89,31 @@ class RuntimeConfigurationTests(unittest.TestCase):
             run(self.path)
         self.assertEqual(supervise.call_args.args[1]["CELERY_BROKER_URL"], "rediss://queue.example:6379/0")
 
+    def test_postgres_activation_waits_for_verified_migration(self):
+        env = {'CELERY_BROKER_URL': 'redis://localhost/0', 'SIGNALWATCH_DATABASE_URL': 'postgresql://localhost/target',
+               'SIGNALWATCH_MIGRATE_SQLITE': 'true'}
+        manifest = {'total_rows': 12, 'tables': {'entities': {}}, 'already_migrated': False, 'verified': True}
+        with patch.dict(os.environ, env, clear=True), patch('signalwatch.postgres_migrate.migrate_sqlite', return_value=manifest) as migrate, \
+                patch('signalwatch.runtime.supervise', return_value=0) as supervise:
+            run(self.path)
+            self.assertEqual(migrate.call_args.args[1], env['SIGNALWATCH_DATABASE_URL'])
+            self.assertTrue(migrate.call_args.args[0].startswith(self.temp.name))
+            supervise.assert_called_once()
+        with patch.dict(os.environ, env, clear=True), patch('signalwatch.postgres_migrate.migrate_sqlite', side_effect=RuntimeError('verification failed')), \
+                patch('signalwatch.runtime.supervise') as supervise, self.assertRaisesRegex(RuntimeError, 'verification failed'):
+            run(self.path)
+        supervise.assert_not_called()
+
+    def test_migration_flag_cannot_create_an_empty_database_without_a_source(self):
+        with patch.dict(os.environ, {'SIGNALWATCH_MIGRATE_SQLITE': 'true'}, clear=True), \
+                patch('signalwatch.runtime.os.execvpe') as execute, self.assertRaisesRegex(ValueError, 'original SQLite'):
+            run(self.path)
+        execute.assert_not_called()
+        with patch.dict(os.environ, {'SIGNALWATCH_MIGRATE_SQLITE': 'typo'}, clear=True), \
+                patch('signalwatch.runtime.os.execvpe') as execute, self.assertRaisesRegex(ValueError, 'true or false'):
+            run(self.path)
+        execute.assert_not_called()
+
 
 class RuntimeProcessTests(unittest.TestCase):
     def setUp(self):
