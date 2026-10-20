@@ -86,6 +86,38 @@ class EvidenceIsolationTests(unittest.TestCase):
         self.store.ingest({"entities": [item]})
         self.assertEqual(self.store.detail("company:alpha")["observations"], [])
 
+    def test_greenhouse_equivalent_job_hosts_share_the_api_board_binding(self):
+        item = self.article("alpha", key="job:greenhouse-hosts")
+        item.update(kind="job_posting", source_url="https://boards-api.greenhouse.io/v1/boards/alpha/jobs")
+        item["metadata"].update(provider="greenhouse", source_binding={
+            "kind": "configured", "provider": "greenhouse", "endpoint_url": item["source_url"],
+        })
+        for host, slug, accepted in (("boards.greenhouse.io", "alpha", True),
+                                     ("job-boards.greenhouse.io", "alpha", True),
+                                     ("boards.eu.greenhouse.io", "alpha", True),
+                                     ("boards.eu.greenhouse.io", "beta", False),
+                                     ("boards.eu.greenhouse.io.evil.example", "alpha", False)):
+            with self.subTest(host=host, slug=slug):
+                item["metadata"]["fields"]["url"] = "https://" + host + "/" + slug + "/jobs/1"
+                self.store.ingest({"entities": [item]})
+                self.assertEqual(len(self.store.detail("company:alpha")["observations"]), int(accepted))
+
+    def test_lever_job_and_api_regions_must_agree(self):
+        item = self.article("alpha", key="job:lever-regions")
+        item.update(kind="job_posting")
+        for endpoint_host, job_host, accepted in (("api.lever.co", "jobs.lever.co", True),
+                                                  ("api.lever.co", "jobs.eu.lever.co", False),
+                                                  ("api.eu.lever.co", "jobs.eu.lever.co", True),
+                                                  ("api.eu.lever.co", "jobs.lever.co", False)):
+            with self.subTest(endpoint=endpoint_host, job=job_host):
+                item["source_url"] = "https://" + endpoint_host + "/v0/postings/alpha"
+                item["metadata"].update(provider="lever", source_binding={
+                    "kind": "configured", "provider": "lever", "endpoint_url": item["source_url"],
+                })
+                item["metadata"]["fields"]["url"] = "https://" + job_host + "/alpha/1"
+                self.store.ingest({"entities": [item]})
+                self.assertEqual(len(self.store.detail("company:alpha")["observations"]), int(accepted))
+
     def test_same_job_entity_cannot_reassign_a_bound_board_to_another_company(self):
         item = self.article("alpha")
         item.update(kind="job_posting", source_url="https://api.lever.co/v0/postings/alpha")

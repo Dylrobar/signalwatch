@@ -197,7 +197,9 @@ def _board(url, provider, *, endpoint=False):
     match = re.fullmatch(pattern, path)
     if host not in hosts or not match:
         return None
-    region = "eu:" if ".eu." in host else "global:"
+    # Greenhouse's supported public job hosts share its boards API namespace.
+    # Lever has separate EU and global API endpoints and must retain that fence.
+    region = "eu:" if provider == "lever" and ".eu." in host else "global:"
     return region + unquote(match.group(1)).casefold()
 
 
@@ -310,6 +312,7 @@ def _http_organization(conn, asset_id):
 
 
 def enrichment_targets(conn, limit):
+    limit = max(1, int(limit))
     rows = conn.execute("""WITH associations AS (
       SELECT e.from_id AS company_id,e.to_id AS asset_id FROM edges e WHERE e.relation IN ('official_website','primary_domain_anchor')
       UNION SELECT company_id,asset_id FROM company_asset_decisions WHERE status='confirmed' AND role='owned'
@@ -329,7 +332,7 @@ def enrichment_targets(conn, limit):
        CASE WHEN count(DISTINCT company_id)=1 THEN min(name) ELSE '' END AS name
       FROM included GROUP BY canonical_domain
      ) SELECT DISTINCT i.domain,o.company_id,o.name FROM included i
-      JOIN owners o ON o.canonical_domain=i.canonical_domain ORDER BY i.domain LIMIT ?""", (max(1, int(limit)),))
+      JOIN owners o ON o.canonical_domain=i.canonical_domain ORDER BY i.domain""")
     from .entity_resolution import resolve
     targets = []
     for row in rows:
@@ -341,6 +344,10 @@ def enrichment_targets(conn, limit):
                                  (target["company_id"],)).fetchone()
             target["name"] = owner[0] if owner else ""
             targets.append(target)
+            # Stream candidates until the accepted-target budget is filled;
+            # earlier ambiguous domains must not starve later valid owners.
+            if len(targets) >= limit:
+                break
     return targets
 
 
