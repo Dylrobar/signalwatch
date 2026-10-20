@@ -1,7 +1,7 @@
 """Verified, atomic SQLite-to-PostgreSQL migration.
 
-Run with writers stopped. SQLite's backup API captures a consistent source
-snapshot without changing the original database. The destination must be empty
+Run with writers stopped. A read-only SQLite transaction pins a consistent source
+snapshot without copying or changing the original database. The destination must be empty
 (or have the matching completed manifest). Copy, byte-for-byte logical content
 verification, sequence repair and the activation manifest commit together.
 """
@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
-import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from .postgres import MIGRATION_LOCK, ROWID_TABLES, WRITER_LOCK, connect
 
 SEED_TABLES = frozenset({'company_identity_migrations', 'technographic_integrity_migrations', 'evidence_resolution_migrations'})
 MANIFEST_TABLE = 'postgres_migration_manifest'
+log = logging.getLogger(__name__)
 
 
 def _quote(name):
@@ -91,23 +93,29 @@ def migrate_sqlite(source_path, target_dsn):
         raise ValueError('SQLite migration source does not exist')
     if not str(target_dsn).startswith(('postgres://', 'postgresql://')):
         raise ValueError('Migration target must be a PostgreSQL connection URL')
-    with tempfile.TemporaryDirectory(prefix='signalwatch-migration-') as directory:
-        snapshot_path = Path(directory) / 'snapshot.sqlite3'
-        original = sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True)
-        snapshot = sqlite3.connect(snapshot_path)
+    # Keep every source read in one transaction. This avoids duplicating a
+    # multi-gigabyte database and leaves no scratch snapshot after SIGKILL.
+    # mode=ro prevents any source writes; BEGIN plus the first SELECT pins the
+    # same WAL snapshot for integrity checks, checksums and all table copies.
+    with closing(sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True)) as snapshot:
+        snapshot.execute('BEGIN')
+        snapshot.execute('SELECT count(*) FROM sqlite_master').fetchone()
+        log.info('Pinned consistent read-only SQLite snapshot; no temporary database copy')
         try:
-            original.backup(snapshot)
-        finally:
-            original.close()
-        try:
+            log.info('Checking SQLite snapshot integrity and foreign keys')
             if snapshot.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise RuntimeError('Source SQLite integrity check failed')
             foreign_keys = snapshot.execute('PRAGMA foreign_key_check').fetchall()
             if foreign_keys:
                 raise RuntimeError('Source SQLite has foreign-key violations; repair before migration')
             tables = _source_inventory(snapshot)
-            checks = {table['name']: {'columns': table['columns'], **_digest(snapshot.execute(_select(table)))} for table in tables}
+            checks = {}
+            for table in tables:
+                name = table['name']
+                log.info('Checking source table %s', name)
+                checks[name] = {'columns': table['columns'], **_digest(snapshot.execute(_select(table)))}
             source_fingerprint = hashlib.sha256(json.dumps(checks, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            log.info('Source snapshot verified; connecting to PostgreSQL')
             conn = connect(target_dsn)
             try:
                 # Inspect and lock the destination before Store can install or
@@ -144,6 +152,7 @@ def migrate_sqlite(source_path, target_dsn):
                         conn.raw.execute('DELETE FROM ' + _quote(table['name']))
                 for table in _order(tables, conn):
                     name = table['name']
+                    log.info('Copying table %s (%s rows)', name, checks[name]['rows'])
                     columns = ','.join(map(_quote, table['columns']))
                     with conn.raw.cursor().copy(f'COPY {_quote(name)} ({columns}) FROM STDIN') as copy:
                         for row in snapshot.execute(_select(table)):
@@ -153,6 +162,7 @@ def migrate_sqlite(source_path, target_dsn):
                 # wireless inventories; ordinary psycopg cursors buffer results.
                 for index, table in enumerate(tables):
                     name = table['name']
+                    log.info('Verifying PostgreSQL table %s', name)
                     with conn.raw.cursor(name='verify_' + str(index)) as cursor:
                         cursor.itersize = 100
                         cursor.execute(_select(table))
@@ -178,4 +188,4 @@ def migrate_sqlite(source_path, target_dsn):
             finally:
                 conn.close()
         finally:
-            snapshot.close()
+            snapshot.rollback()

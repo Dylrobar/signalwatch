@@ -1,4 +1,7 @@
 import os
+import http.client
+import json
+import socket
 import signal
 import subprocess
 import sys
@@ -9,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from signalwatch.cli import parser
-from signalwatch.runtime import _runtime_lock, run
+from signalwatch.runtime import _migration_listener, _runtime_lock, run
 
 
 class RuntimeConfigurationTests(unittest.TestCase):
@@ -95,14 +98,43 @@ class RuntimeConfigurationTests(unittest.TestCase):
         manifest = {'total_rows': 12, 'tables': {'entities': {}}, 'already_migrated': False, 'verified': True}
         with patch.dict(os.environ, env, clear=True), patch('signalwatch.postgres_migrate.migrate_sqlite', return_value=manifest) as migrate, \
                 patch('signalwatch.runtime.supervise', return_value=0) as supervise:
-            run(self.path)
+            run(self.path, port=0)
             self.assertEqual(migrate.call_args.args[1], env['SIGNALWATCH_DATABASE_URL'])
             self.assertTrue(migrate.call_args.args[0].startswith(self.temp.name))
             supervise.assert_called_once()
         with patch.dict(os.environ, env, clear=True), patch('signalwatch.postgres_migrate.migrate_sqlite', side_effect=RuntimeError('verification failed')), \
                 patch('signalwatch.runtime.supervise') as supervise, self.assertRaisesRegex(RuntimeError, 'verification failed'):
-            run(self.path)
+            run(self.path, port=0)
         supervise.assert_not_called()
+
+    def test_migration_listener_never_serves_application_data_or_readiness(self):
+        with _migration_listener('127.0.0.1', 0) as address:
+            for method, path in [('GET', '/health'), ('HEAD', '/'), ('GET', '/api/companies'),
+                                 ('POST', '/api/reviews'), ('OPTIONS', '/api/credentials')]:
+                with self.subTest(method=method, path=path):
+                    conn = http.client.HTTPConnection(*address, timeout=3)
+                    conn.request(method, path)
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 503)
+                    self.assertEqual(response.getheader('Cache-Control'), 'no-store')
+                    self.assertEqual(response.getheader('Retry-After'), '30')
+                    body = response.read()
+                    if method == 'HEAD':
+                        self.assertEqual(body, b'')
+                    else:
+                        self.assertEqual(json.loads(body), {'service': 'SignalWatch', 'status': 'migrating', 'ready': False})
+                    conn.close()
+        with socket.socket() as replacement:
+            replacement.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            replacement.bind(address)
+
+    def test_failed_migration_releases_the_port(self):
+        with self.assertRaisesRegex(RuntimeError, 'failed'):
+            with _migration_listener('127.0.0.1', 0) as address:
+                raise RuntimeError('failed')
+        with socket.socket() as replacement:
+            replacement.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            replacement.bind(address)
 
     def test_migration_flag_cannot_create_an_empty_database_without_a_source(self):
         with patch.dict(os.environ, {'SIGNALWATCH_MIGRATE_SQLITE': 'true'}, clear=True), \

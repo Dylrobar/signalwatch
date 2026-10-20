@@ -129,6 +129,26 @@ class PostgresMigrationTests(unittest.TestCase):
         self.assertEqual(target.detail('existing')['name'], 'Existing')
         self.assertEqual(self.source.detail('company:acme')['name'], 'Acme')
 
+    def test_read_snapshot_stays_consistent_without_a_temporary_copy(self):
+        self.fixture()
+        from signalwatch import postgres_migrate
+        original_connect = postgres_migrate.connect
+
+        def change_after_source_checks(dsn):
+            # A stray WAL writer must not make checksums and copied rows see
+            # different database versions. Cutover still requires writers off.
+            with sqlite3.connect(self.source_path) as writer:
+                self.assertEqual(writer.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+                writer.execute("UPDATE entities SET name='Later name' WHERE id='company:acme'")
+            return original_connect(dsn)
+
+        with patch.object(postgres_migrate, 'connect', side_effect=change_after_source_checks), \
+                patch('tempfile.TemporaryDirectory', side_effect=AssertionError('No scratch database is allowed')):
+            report = migrate_sqlite(self.source_path, self.target)
+        self.assertTrue(report['verified'])
+        self.assertEqual(Store(self.target).detail('company:acme')['name'], 'Acme')
+        self.assertEqual(self.source.detail('company:acme')['name'], 'Later name')
+
     def test_refusal_and_completed_manifest_never_initialize_destination(self):
         self.fixture()
         target = Store(self.target)

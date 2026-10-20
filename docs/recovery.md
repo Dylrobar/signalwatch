@@ -52,6 +52,25 @@ The migration tool copies real rows, raw bytes, IDs, and scoped relationships in
 
 If startup migration fails, fix the reported integrity/target problem before starting collection. A populated database from another source is never overwritten. Once PostgreSQL has accepted new production writes, rolling back to the old SQLite file would lose those writes; first stop writes and plan a controlled data reconciliation.
 
+Migration pins a single read-only SQLite transaction across integrity checks,
+source checksums and table copies. It creates no temporary database copy, so
+there is no extra snapshot-space requirement or abandoned snapshot after a killed
+migration. Writers must remain stopped until cutover; a consistent read snapshot
+does not include writes made after it starts. During runtime migration, a
+maintenance listener binds the configured application port
+and returns HTTP 503 with `ready: false` on every route, including `/health`.
+This permits port discovery without exposing application data or reporting
+readiness. Keep HTTP readiness checks pointed at `/health`. A TCP-only deployment
+status is not evidence that migration completed: check the verified migration
+log and the application's normal HTTP 200 health response. Snapshot establishment,
+integrity checks, source checksums, table copies and verification are logged
+without credentials or row contents. After a verified cutover, set
+`SIGNALWATCH_MIGRATE_SQLITE=false` while retaining the PostgreSQL URL, so later
+restarts do not recheck the preserved SQLite database. Older, failed versions may
+have left `signalwatch-migration-*` scratch directories; these are not reused or
+automatically deleted because they lack ownership markers. Only remove such a
+directory after confirming no migration uses it; retain the original SQLite file.
+
 ## Reproducible checks
 
 Production and CI install `requirements-deploy.txt`; tests add `requirements-test.txt`. Update the pins intentionally and run the regression workflow before deployment. Backend CI runs SQLite tests, a genuine Redis/prefork integration, and PostgreSQL migration/contracts against PostgreSQL 16. The local PostgreSQL tests require `SIGNALWATCH_TEST_POSTGRES_URL`; backup roundtrips also require `pg_dump` and `pg_restore` on `PATH`. The dedicated test database role needs permission to create temporary databases. Redis integration uses `SIGNALWATCH_TEST_REDIS_SERVER=/path/to/redis-server` and temporary local data without live feeds.
