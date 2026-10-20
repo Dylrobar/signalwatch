@@ -111,11 +111,13 @@ def _record(item, provider, identity, name, fields, *, kind="corporate_record", 
               "source_url": source_url, "observed_at": provenance["observed_at"], "confidence": 1.0}
     if metadata.get("discovered_from"):
         entity["metadata"]["discovered_from"] = metadata["discovered_from"]
+    if isinstance(metadata.get("source_binding"), dict):
+        entity["metadata"]["source_binding"] = metadata["source_binding"]
     if "source_record_offset" in metadata:
         entity["metadata"]["source_selection"] = {"offset": metadata["source_record_offset"], "total_records": metadata["source_total_records"]}
     edge = None
     if context.get("company_id"):
-        edge = {"from_id": context["company_id"], "to_id": entity_id, "relation": "has_public_evidence",
+        edge = {"from_id": context["company_id"], "to_id": entity_id, "relation": "candidate_evidence",
                 "source_url": source_url, "observed_at": provenance["observed_at"], "confidence": 1.0}
     return entity, edge
 
@@ -764,8 +766,12 @@ async def collect_corporate_sources(config, store, http):
             metadata["discovered_from"] = target["_discovered_from"]
         if target.get("_gleif_child_lei"):
             metadata.update(gleif_child_lei=target["_gleif_child_lei"], gleif_relation=target["_gleif_relation"])
-        identity = hashlib.sha256(json.dumps([provider, url, public_params, metadata], sort_keys=True).encode()).hexdigest()
         job_provider = provider in {"greenhouse", "lever", "ashby"}
+        if job_provider:
+            metadata["source_binding"] = {"kind": "discovered" if target.get("_discovered_from") else "configured",
+                                          "provider": provider, "endpoint_url": url,
+                                          "discovered_from": target.get("_discovered_from") or ""}
+        identity = hashlib.sha256(json.dumps([provider, url, public_params, metadata], sort_keys=True).encode()).hexdigest()
         phase = "request"
         staged = 0
         try:
@@ -790,8 +796,8 @@ async def collect_corporate_sources(config, store, http):
                                           cache=not private, allow_redirects=not private, max_attempts=1)
                 if response.status not in (200, 304):
                     raise ValueError("Provider returned a non-success HTTP status")
+                source_url = _public_url(getattr(response, "url", source_url))
                 if provider == "importyeti_public":
-                    source_url = _public_url(getattr(response, "url", source_url))
                     final = urlsplit(source_url)
                     if final.scheme != "https" or final.hostname != "www.importyeti.com" or not re.fullmatch(r"/company/[a-z0-9-]+/?", final.path):
                         raise ValueError("ImportYeti response redirects outside a public company report")

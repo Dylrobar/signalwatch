@@ -35,7 +35,8 @@ class TechnographicVerifierTests(unittest.TestCase):
     def entity(self, body, number=1, company="company:acme"):
         return {"id": f"job_posting:{number}", "kind": "job_posting", "name": "Platform Engineer",
                 "source_url": "https://boards-api.greenhouse.io/v1/boards/acme/jobs",
-                "metadata": {"provider": "greenhouse", "company_context": {"company_id": company},
+                "metadata": {"provider": "greenhouse", "company_context": {"company_id": company, "domain": "acme.test"},
+                             "source_binding": {"kind": "configured", "provider": "greenhouse", "endpoint_url": "https://boards-api.greenhouse.io/v1/boards/acme/jobs"},
                              "fields": {"title": "Platform Engineer", "description": body,
                                         "url": f"https://boards.greenhouse.io/acme/jobs/{number}"}}}
 
@@ -192,6 +193,7 @@ class TechnographicVerifierTests(unittest.TestCase):
             config.update(copy.deepcopy(self.config))
             store = Store(config["db"])
             store.ingest({"entities": [{"id": "company:acme", "kind": "company", "name": "Acme"}]})
+            store.set_company_asset("company:acme", "https://acme.test", evidence="Approved company website", source_url="https://acme.test/about")
             queue = staging_queue(store, config)
             for number in (1, 2):
                 queue.enqueue(json.dumps({"entities": [self.entity("We use PAN-OS 11.2 in production.", number)]}).encode(),

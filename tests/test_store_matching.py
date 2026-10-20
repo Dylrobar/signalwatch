@@ -227,6 +227,12 @@ class StoreTests(unittest.TestCase):
         observation = self.observation()
         self.store.ingest({"observations": [observation]})
         with self.store.connection(write=True) as conn:
+            # Simulate the schema before both origin and its dependent evidence
+            # invariants existed; reopening must reinstall the current guards.
+            triggers = conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'technographic_*'").fetchall()
+            for trigger in triggers:
+                conn.execute('DROP TRIGGER "' + trigger[0].replace('"', '""') + '"')
+            conn.execute("DROP TABLE technographic_integrity_migrations")
             conn.execute("DROP INDEX observations_page_origin")
             conn.execute("ALTER TABLE observations DROP COLUMN origin")
         reopened = Store(self.path)

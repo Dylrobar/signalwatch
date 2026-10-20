@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 from .companies import company, company_assets
 
+SOFTWARE_LABEL_KINDS = {'technology', 'product', 'device', 'os', 'package'}
+
 
 def edge(from_id, to_id, relation, source_url='', confidence=None, observed_at=None, status='context', evidence=None):
     key = '\0'.join((from_id,to_id,relation,source_url or ''))
@@ -127,6 +129,95 @@ class KnowledgeGraph:
                 result.append(edge(row['asset_id'],key,'observed_version',row['source_url'],row['confidence'],row['observed_at'],'observation'))
         return sorted({e['id']:e for e in result}.values(), key=lambda e:(e['from_id'],e['to_id'],e['relation'],e['id']))
 
+    def company_scope(self, conn, company_id, coverage):
+        """Build a bounded company view without traversing shared infrastructure."""
+        from .entity_resolution import resolve
+        from .technographic_store import document_input, _resolve_document
+
+        assets, truncated = company_assets(conn, company_id)
+        coverage['truncated'] |= truncated
+        evidence, documents = set(), set()
+        rows = conn.execute("""SELECT DISTINCT e.* FROM entities e WHERE e.id IN (
+         SELECT source_entity_id FROM technographic_sources WHERE organization_id=?
+         UNION SELECT to_id FROM edges WHERE from_id=? AND relation IN ('has_public_evidence','candidate_evidence','registry_candidate'))
+         ORDER BY e.id LIMIT 1001""", (company_id, company_id)).fetchall()
+        coverage['truncated'] |= len(rows) > 1000
+        for row in rows[:1000]:
+            entity = dict(row)
+            entity['metadata'] = json.loads(entity['metadata'])
+            doc = document_input(entity)
+            if doc is not None:
+                resolution = _resolve_document(conn, entity, doc)
+            else:
+                context = entity['metadata'].get('company_context') or {}
+                resolution = resolve(conn, context=context, source_url=entity.get('source_url') or '')
+            if resolution.get('organization_id') != company_id:
+                continue
+            evidence.add(entity['id'])
+            documents.update(item[0] for item in conn.execute(
+                'SELECT document_id FROM technographic_sources WHERE source_entity_id=? AND organization_id=?',
+                (entity['id'], company_id)))
+        return {'root': company_id, 'assets': {item['id']: item for item in assets},
+                'included': {item['id'] for item in assets if item['included']},
+                'evidence': evidence, 'documents': documents, 'technology_sources': {}}
+
+    def company_node_scope(self, conn, node, scope):
+        key = node['id']
+        if key == scope['root']:
+            return 'company'
+        if key in scope['assets']:
+            return 'company_asset'
+        if key in scope['evidence']:
+            return 'company_evidence'
+        if node['kind'] == 'software_version':
+            row = conn.execute('SELECT asset_id,origin FROM observations WHERE id=?', (key[12:],)).fetchone()
+            if row and (row['asset_id'] in scope['included'] or row['asset_id'] == scope['root']
+                        and row['origin'].removeprefix('technographic:') in scope['documents']):
+                return 'company_evidence'
+        if node['kind'] == 'alert':
+            if node['metadata']['asset_id'] in scope['included']:
+                return 'company_evidence'
+            if node['metadata']['asset_id'] == scope['root']:
+                # A company-level match must retain the same validated source
+                # as its reconciled observation. The root ID alone cannot make
+                # an old or incorrectly attributed match company evidence.
+                alert = node['alert']
+                rows = conn.execute("""SELECT origin FROM observations WHERE asset_id=?
+                 AND vendor=? AND product=? AND version=? AND source_url=?""",
+                                    (scope['root'], alert['vendor'], alert['product'],
+                                     alert['version'], alert['source_url']))
+                if any(row['origin'].startswith('technographic:') and
+                       row['origin'][14:] in scope['documents'] for row in rows):
+                    return 'company_evidence'
+        return 'shared_context'
+
+    def company_edge_allowed(self, conn, source, target, item, scope):
+        key, other, relation = source['id'], target['id'], item['relation']
+        target_scope = self.company_node_scope(conn, target, scope)
+        if source['scope'] == 'shared_context':
+            # A technology's vendor is useful context. Its other observations,
+            # advisories and customers are outside this company's evidence.
+            return (source['kind'] in SOFTWARE_LABEL_KINDS and target['kind'] == 'vendor'
+                    and (relation == 'vendor_label' and item['from_id'] == key
+                         or relation == 'publishes' and item['to_id'] == key)
+                    and item['source_url'] in scope['technology_sources'].get(key, set()))
+        if key == scope['root']:
+            if relation in {'company_asset', 'official_website', 'primary_domain_anchor'}:
+                return other in scope['assets']
+            if relation == 'verified_asn':
+                return bool(conn.execute("SELECT 1 FROM company_asn_anchors WHERE company_id=? AND 'asn:AS'||asn=?",
+                                         (key, other)).fetchone())
+            if relation == 'subsidiary':
+                return target['kind'] == 'company'
+            return target_scope == 'company_evidence'
+        if target['kind'] == 'company':
+            return other == scope['root'] and relation in {'company_asset', 'has_public_evidence'}
+        if target_scope != 'shared_context':
+            return True
+        # Never introduce another host, source or match through a generic edge.
+        # Shared infrastructure and software labels are retained as leaves.
+        return target['kind'] in SOFTWARE_LABEL_KINDS | {'ip', 'prefix', 'asn', 'vendor', 'vulnerability'}
+
     def graph(self, root_id, depth=2, max_nodes=120, max_edges=300, include_wireless=False):
         if not root_id or not 1<=depth<=5 or not 1<=max_nodes<=300 or not 1<=max_edges<=800:
             raise ValueError('Invalid graph limits')
@@ -138,11 +229,19 @@ class KnowledgeGraph:
             nodes, edges, visited = {root_id:root}, {}, set()
             queue = deque([(root_id,0)])
             coverage = {'truncated':False,'companies_expanded':0,'wireless':'not_requested','risk_basis':'reconciled alerts only','extraction_method':'deterministic-catalog-v1'}
+            scope = self.company_scope(conn, root_id, coverage) if root['kind'] == 'company' else None
+            if scope:
+                root['scope'] = 'company'
+                coverage.update(scope='company', shared_context_expansion=False,
+                                vendor_context='technology-to-vendor labels only; no legal-company ownership inferred')
             while queue:
                 key, level = queue.popleft()
                 if key in visited:
                     continue
                 visited.add(key)
+                if scope and (key in scope['assets'] and key not in scope['included']
+                              or nodes[key]['scope'] == 'shared_context' and nodes[key]['kind'] not in SOFTWARE_LABEL_KINDS):
+                    continue
                 if level>=depth:
                     if conn.execute('SELECT 1 FROM edges WHERE from_id=? OR to_id=? LIMIT 1',(key,key)).fetchone() or nodes[key]['kind'] in ('company','alert','software_version'):
                         coverage['truncated']=True
@@ -158,6 +257,29 @@ class KnowledgeGraph:
                     if target is None:
                         coverage['missing_endpoints'] = coverage.get('missing_endpoints',0)+1
                         continue
+                    if scope:
+                        if not self.company_edge_allowed(conn, nodes[key], target, item, scope):
+                            continue
+                        target['scope'] = self.company_node_scope(conn, target, scope)
+                        if target['scope'] == 'shared_context':
+                            # Shared nodes can have a last-updated source URL
+                            # from another company. Only this view's edges carry
+                            # the relevant provenance.
+                            target['source_url'] = ''
+                            target['observed_at'] = None
+                            target['confidence'] = None
+                        if item['relation'] == 'verified_asn' and item['from_id'] == root_id:
+                            anchor = conn.execute("SELECT evidence,source_url,verified_at FROM company_asn_anchors WHERE company_id=? AND 'asn:AS'||asn=?",
+                                                  (root_id, item['to_id'])).fetchone()
+                            if anchor:
+                                item.update(status='verified_affiliation', evidence_role='verified_affiliation',
+                                            evidence={'note': anchor['evidence'], 'risk_propagation': False},
+                                            source_url=anchor['source_url'], observed_at=anchor['verified_at'])
+                        if other in scope['assets']:
+                            asset = scope['assets'][other]
+                            target['ownership'] = {field: asset[field] for field in ('included', 'status', 'role', 'reasons')}
+                        if target['kind'] in SOFTWARE_LABEL_KINDS:
+                            scope['technology_sources'].setdefault(other, set()).add(item['source_url'])
                     if len(edges)>=max_edges or other not in nodes and len(nodes)>=max_nodes:
                         coverage['truncated']=True
                         continue
@@ -168,7 +290,7 @@ class KnowledgeGraph:
             if include_wireless:
                 from .wireless_attribution import company_wireless_summary
                 for node in nodes.values():
-                    if node['kind']=='company':
+                    if node['kind']=='company' and (not scope or node['id'] == root_id):
                         summary=company_wireless_summary(conn,node['id'],limit=3)
                         node['metadata']['wireless_summary']={k:v for k,v in summary.items() if k!='devices'}
                         node['metadata']['wireless_summary']['links']=[{k:d[k] for k in ('id','role','status','attribution_source_url') if k in d} for d in summary['devices']]

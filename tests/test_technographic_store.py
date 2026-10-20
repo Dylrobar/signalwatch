@@ -9,9 +9,13 @@ from signalwatch.store import Store
 from signalwatch.technographic_store import document_input
 
 
-def posting(text, key="job:1", company_id="company:acme", url="https://jobs.acme.test/1"):
-    return {"id": key, "kind": "job_posting", "name": "Infrastructure engineer", "source_url": "https://boards-api.greenhouse.io/v1/boards/acme/jobs?content=true",
-            "metadata": {"provider": "greenhouse", "company_context": {"company_id": company_id, "domain": "acme.test"},
+def posting(text, key="job:1", company_id="company:acme", url=None):
+    board = "other" if company_id == "company:other" else "acme"
+    endpoint = "https://boards-api.greenhouse.io/v1/boards/" + board + "/jobs?content=true"
+    url = url or "https://boards.greenhouse.io/" + board + "/jobs/1"
+    return {"id": key, "kind": "job_posting", "name": "Infrastructure engineer", "source_url": endpoint,
+            "metadata": {"provider": "greenhouse", "company_context": {"company_id": company_id, "domain": board + ".test"},
+                         "source_binding": {"kind": "configured", "provider": "greenhouse", "endpoint_url": endpoint},
                          "fields": {"title": "Infrastructure engineer", "description": text, "url": url, "published_at": "2026-10-01T00:00:00Z"}}}
 
 
@@ -41,7 +45,7 @@ class TechnographicStoreTests(unittest.TestCase):
         doc = posting("We use Terraform for our infrastructure.")
         self.store.ingest({"entities": [doc]})
         with patch("signalwatch.technographics.extract", side_effect=AssertionError("duplicate extraction")):
-            counts = self.store.ingest({"entities": [posting("We use Terraform for our infrastructure.", key="job:2", url="https://careers.acme.test/1")]})
+            counts = self.store.ingest({"entities": [posting("We use Terraform for our infrastructure.", key="job:2", url="https://boards.greenhouse.io/acme/jobs/2")]})
         self.assertEqual(counts["technographic_duplicates"], 1)
         with self.store.connection() as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM technographic_documents").fetchone()[0], 1)
@@ -50,6 +54,7 @@ class TechnographicStoreTests(unittest.TestCase):
 
     def test_duplicate_content_never_drops_second_company(self):
         self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"}, posting("We use Kafka.")]})
+        self.store.set_company_asset("company:other", "https://other.test", evidence="Reviewed ownership", source_url="https://other.test/about")
         self.store.ingest({"entities": [posting("We use Kafka.", key="job:other", company_id="company:other")]})
         self.assertEqual(self.store.detail("company:other")["technographics"]["total"], 1)
         self.assertEqual(self.store.detail("company:acme")["technographics"]["total"], 1)
@@ -102,8 +107,8 @@ class TechnographicStoreTests(unittest.TestCase):
         self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"}]})
         self.store.set_company_asset("company:other", "https://other.test", evidence="Reviewed ownership",
                                     source_url="https://other.test/about")
-        doc = posting("We use Kafka.", company_id="")
-        doc["metadata"]["company_context"]["domain"] = "other.test"
+        doc = posting("We use Kafka.", company_id="company:other")
+        doc["metadata"]["company_context"]["company_id"] = ""
         self.store.ingest({"entities": [doc]})
         self.assertEqual(self.store.detail("company:other")["technographics"]["documents"], 1)
         self.assertIn({"domain": "other.test", "company_id": "company:other", "name": "Other"}, self.store.company_enrichment_targets())
@@ -156,12 +161,13 @@ class TechnographicStoreTests(unittest.TestCase):
 
     def test_context_change_moves_projection_without_losing_shared_evidence(self):
         self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"},
-                                        posting("We use Kafka."), posting("We use Kafka.", key="job:2", url="https://jobs.acme.test/2")]})
+                                        posting("We use Kafka."), posting("We use Kafka.", key="job:2", url="https://acme.test/2")]})
+        self.store.set_company_asset("company:other", "https://other.test", evidence="Reviewed ownership", source_url="https://other.test/about")
         self.store.ingest({"entities": [posting("We use Kafka.", company_id="company:other")]})
         self.assertEqual(self.store.detail("company:acme")["technographics"]["documents"], 1)
         self.assertEqual(self.store.detail("company:other")["technographics"]["documents"], 1)
         self.assertEqual(len(self.store.detail("company:acme")["observations"]), 1)
-        self.assertEqual(self.store.detail("company:acme")["observations"][0]["source_url"], "https://jobs.acme.test/2")
+        self.assertEqual(self.store.detail("company:acme")["observations"][0]["source_url"], "https://acme.test/2")
         links = [edge for edge in self.store.detail("job:1")["relationships"] if edge["relation"] == "has_public_evidence"]
         self.assertEqual({edge["from_id"] for edge in links}, {"company:other"})
         self.store.ingest({"entities": [posting("We use Kafka.", key="job:2", company_id="company:other")]})
@@ -187,7 +193,7 @@ class TechnographicStoreTests(unittest.TestCase):
     def test_rejected_owner_resolves_domain_ambiguity_in_targets_and_evidence(self):
         self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"}],
                            "edges": [{"from_id": "company:other", "to_id": "domain:acme.test", "relation": "official_website"}]})
-        self.assertEqual(self.store.company_enrichment_targets()[0]["company_id"], "")
+        self.assertEqual(self.store.company_enrichment_targets(), [])
         self.store.set_company_asset("company:other", "https://acme.test", status="rejected",
                                     evidence="Wrong company", source_url="https://acme.test/about")
         self.assertEqual(self.store.company_enrichment_targets()[0]["company_id"], "company:acme")
@@ -207,7 +213,7 @@ class TechnographicStoreTests(unittest.TestCase):
         doc = posting("Experience with Okta required.")
         self.store.ingest({"entities": [doc]})
         before = self.store.detail("company:acme")["technographics"]["fingerprints"][0]
-        self.assertEqual(self.store.touch_technographic_source(doc["source_url"], {"company_id": "company:acme"}, "2030-01-01T00:00:00Z"), 1)
+        self.assertEqual(self.store.touch_technographic_source(doc["source_url"], {"company_id": "company:acme", "domain": "acme.test"}, "2030-01-01T00:00:00Z"), 1)
         after = self.store.detail("company:acme")["technographics"]["fingerprints"][0]
         self.assertEqual(before["first_seen_at"], after["first_seen_at"])
         self.assertEqual(after["last_seen_at"], "2030-01-01T00:00:00Z")
@@ -223,15 +229,16 @@ class TechnographicStoreTests(unittest.TestCase):
 
     def test_raw_staging_to_company_evidence_and_reconciliation(self):
         queue = StagingQueue(self.store)
-        payload = {"jobs": [{"id": 99, "title": "SRE", "absolute_url": "https://jobs.acme.test/99", "content": "<p>We operate our PostgreSQL clusters.</p>"}]}
+        payload = {"jobs": [{"id": 99, "title": "SRE", "absolute_url": "https://acme.test/99", "content": "<p>We operate our PostgreSQL clusters.</p>"}]}
         queue.enqueue(json.dumps(payload).encode(), source="public:greenhouse", adapter="public_source", source_url="https://boards-api.greenhouse.io/v1/boards/acme/jobs?content=true",
-                      metadata={"provider": "greenhouse", "target": {"company_id": "company:acme", "domain": "acme.test"}})
+                      metadata={"provider": "greenhouse", "target": {"company_id": "company:acme", "domain": "acme.test"},
+                                "source_binding": {"kind": "configured", "provider": "greenhouse", "endpoint_url": "https://boards-api.greenhouse.io/v1/boards/acme/jobs"}})
         result = StagingWorker(self.store, {}, queue).drain()
         self.assertEqual(result["processed"], 1)
         self.assertEqual(result["dead"], 0)
         row = self.store.detail("company:acme")["technographics"]["fingerprints"][0]
         self.assertEqual(row["status"], "asserted_use")
-        self.assertEqual(row["source_url"], "https://jobs.acme.test/99")
+        self.assertEqual(row["source_url"], "https://acme.test/99")
         self.assertIsNone(row["cpe"])
 
     def test_dns_verification_identifies_provider_without_asserting_deployed_product(self):

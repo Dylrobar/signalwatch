@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import re
+from urllib.parse import urlsplit, unquote
 
 from bs4 import BeautifulSoup
 
@@ -36,6 +37,15 @@ CREATE TABLE IF NOT EXISTS tech_fingerprints (
 CREATE INDEX IF NOT EXISTS tech_fingerprints_org ON tech_fingerprints(organization_id,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_document ON tech_fingerprints(document_id);
 CREATE INDEX IF NOT EXISTS tech_fingerprints_product ON tech_fingerprints(vendor,product,status);
+CREATE TABLE IF NOT EXISTS evidence_resolution (
+ source_entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+ organization_id TEXT REFERENCES entities(id) ON DELETE SET NULL, status TEXT NOT NULL,
+ method TEXT NOT NULL, reason TEXT NOT NULL, candidates TEXT NOT NULL DEFAULT '[]',
+ source_url TEXT NOT NULL DEFAULT '', context TEXT NOT NULL DEFAULT '{}',
+ matched_domain TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS evidence_resolution_org ON evidence_resolution(organization_id,status);
+CREATE INDEX IF NOT EXISTS evidence_resolution_binding ON evidence_resolution(json_extract(context,'$.binding_key'));
 """
 
 _DNS_PROVIDERS = (
@@ -141,34 +151,127 @@ def document_input(entity):
             "published_at": fields.get("published_at"), "content_hash": hashlib.sha256(text.encode()).hexdigest()}
 
 
-def _domain(context):
-    return str(context.get("domain") or "").strip().lower().rstrip(".").removeprefix("www.")
-
-
-def _excluded(conn, company_id, domain):
-    return bool(domain and conn.execute("""SELECT 1 FROM company_asset_decisions
-     WHERE company_id=? AND asset_id IN (?,?) AND (status!='confirmed' OR role!='owned') LIMIT 1""",
-     (company_id, "domain:" + domain, "domain:www." + domain)).fetchone())
-
-
 def organization(conn, context):
-    domain = _domain(context)
-    key = context.get("company_id")
-    if key:
-        row = conn.execute("SELECT id FROM entities WHERE id=? AND kind='company'", (key,)).fetchone()
-        return row[0] if row and not _excluded(conn, key, domain) else None
-    if not domain:
+    from .entity_resolution import resolve
+    return resolve(conn, context=context).get("organization_id")
+
+
+def persist_resolution(conn, entity_id, result, source_url, context, timestamp):
+    conn.execute("""INSERT INTO evidence_resolution VALUES(?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(source_entity_id) DO UPDATE SET organization_id=excluded.organization_id,
+     status=excluded.status,method=excluded.method,reason=excluded.reason,candidates=excluded.candidates,
+     source_url=excluded.source_url,context=excluded.context,matched_domain=excluded.matched_domain,updated_at=excluded.updated_at""",
+     (entity_id, result.get("organization_id"), result["status"], result.get("method") or "none",
+      result.get("reason") or "", json.dumps(result.get("candidates") or []), source_url or "",
+      json.dumps(context or {}, sort_keys=True), result.get("matched_domain") or "", timestamp))
+
+
+def _unresolved(result, reason, *, conflict=False):
+    candidates = sorted(set(result.get("candidates") or []) | ({result["organization_id"]} if result.get("organization_id") else set()))
+    return {**result, "organization_id": None, "status": "conflict" if conflict or result.get("status") == "conflict" else "candidate" if candidates else "unattributed",
+            "candidates": candidates, "reason": reason}
+
+
+def _board(url, provider, *, endpoint=False):
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+    except (TypeError, ValueError):
         return None
-    rows = conn.execute("""SELECT DISTINCT c.id FROM entities c JOIN (
-      SELECT from_id AS company_id FROM edges WHERE relation='official_website' AND to_id IN (?,?)
-      UNION SELECT company_id FROM company_asset_decisions
-       WHERE asset_id IN (?,?) AND status='confirmed' AND role='owned'
-     ) association ON association.company_id=c.id
-     WHERE c.kind='company' AND NOT EXISTS (SELECT 1 FROM company_asset_decisions rejected
-      WHERE rejected.company_id=c.id AND rejected.asset_id IN (?,?)
-       AND (rejected.status!='confirmed' OR rejected.role!='owned')) LIMIT 2""",
-     ("domain:" + domain, "domain:www." + domain) * 3).fetchall()
-    return rows[0][0] if len(rows) == 1 else None
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return None
+    host, path = (parsed.hostname or "").lower(), parsed.path.rstrip("/")
+    patterns = {
+        "greenhouse": ({"boards-api.greenhouse.io"}, r"/v1/boards/([^/]+)/jobs") if endpoint else
+                       ({"boards.greenhouse.io", "job-boards.greenhouse.io", "boards.eu.greenhouse.io"}, r"/([^/]+)(?:/.*)?"),
+        "lever": ({"api.lever.co", "api.eu.lever.co"}, r"/v0/postings/([^/]+)") if endpoint else
+                 ({"jobs.lever.co", "jobs.eu.lever.co"}, r"/([^/]+)(?:/.*)?"),
+        "ashby": ({"api.ashbyhq.com"}, r"/posting-api/job-board/([^/]+)") if endpoint else
+                 ({"jobs.ashbyhq.com"}, r"/([^/]+)(?:/.*)?"),
+    }
+    hosts, pattern = patterns.get(provider, (set(), r"(?!)"))
+    match = re.fullmatch(pattern, path)
+    if host not in hosts or not match:
+        return None
+    region = "eu:" if ".eu." in host else "global:"
+    return region + unquote(match.group(1)).casefold()
+
+
+def _resolve_document(conn, entity, doc):
+    from .companies import asset_identity
+    from .entity_resolution import resolve
+
+    context, metadata = doc["organization_context"], entity.get("metadata") or {}
+    result = resolve(conn, context=context, source_url=doc["source_url"], text=doc["text"])
+    if doc["source_type"] == "dns_txt":
+        record = metadata.get("provider_fields") or {}
+        try:
+            actual = asset_identity("https://" + str(record.get("name") or ""))[1]
+            requested = asset_identity("https://" + str(metadata.get("target_domain") or ""))[1]
+        except ValueError:
+            return _unresolved(result, "DNS answer has no valid queried domain")
+        if actual != requested:
+            return _unresolved(result, "DNS answer owner differs from the queried domain", conflict=True)
+        return resolve(conn, context={"domain": actual}, text=doc["text"])
+    if doc["source_type"] == "http_fingerprint":
+        # Primary roots identify evidence on child hosts. Legacy asset decisions
+        # retain their exact-host semantics and never widen the risk inventory.
+        if result.get("method") == "legacy_domain" and result.get("organization_id") != _http_organization(conn, doc["asset_id"]):
+            return _unresolved(result, "HTTP host has no unique approved legacy owner")
+        return result
+    provider = doc["source_type"]
+    binding = metadata.get("source_binding") or {}
+    if provider in {"greenhouse", "lever", "ashby"}:
+        endpoint = _board(doc["endpoint_url"], provider, endpoint=True)
+        bound = _board(str(binding.get("endpoint_url") or ""), provider, endpoint=True)
+        if not endpoint or endpoint != bound or binding.get("provider") != provider or binding.get("kind") not in {"configured", "discovered"}:
+            return _unresolved(result, "Shared job board has no validated company endpoint binding")
+        owner = resolve(conn, context=context)
+        if owner.get("status") != "resolved":
+            return owner
+        if binding["kind"] == "discovered":
+            discovery = resolve(conn, source_url=str(binding.get("discovered_from") or ""))
+            if discovery.get("organization_id") != owner["organization_id"]:
+                return _unresolved(owner, "Job board discovery page is outside the approved company scope", conflict=True)
+        job_board = _board(doc["source_url"], provider)
+        if job_board is not None:
+            if job_board != endpoint:
+                return _unresolved(owner, "Job URL belongs to a different board", conflict=True)
+        else:
+            job_owner = resolve(conn, source_url=doc["source_url"])
+            if job_owner.get("organization_id") != owner["organization_id"]:
+                return _unresolved(owner, "Job URL has no matching approved company owner", conflict=True)
+        binding_key = provider + "/" + endpoint
+        owners = {owner["organization_id"]}
+        claims = {(owner["organization_id"], str(context.get("domain") or ""))}
+        for saved in conn.execute("""SELECT DISTINCT json_extract(e.metadata,'$.source_binding') AS source_binding,e.source_url,r.context
+         FROM evidence_resolution r JOIN entities e ON e.id=r.source_entity_id
+         WHERE json_extract(r.context,'$.binding_key')=?""", (binding_key,)):
+            other_binding = json.loads(saved["source_binding"] or "{}")
+            if (_board(str(other_binding.get("endpoint_url") or ""), provider, endpoint=True) != endpoint
+                    or _board(saved["source_url"], provider, endpoint=True) != endpoint):
+                continue
+            recorded = json.loads(saved["context"])
+            prior_claims = recorded.get("binding_claims") or [recorded.get("company_context") or {}]
+            for claim in prior_claims:
+                current_owner = resolve(conn, context=claim)
+                if current_owner.get("organization_id"):
+                    owners.add(current_owner["organization_id"])
+                    claims.add((current_owner["organization_id"], str(claim.get("domain") or "")))
+        binding_claims = [{"company_id": company, "domain": domain} for company, domain in sorted(claims)]
+        if len(owners) > 1:
+            return {**owner, "organization_id": None, "status": "conflict", "method": "ats_board_conflict",
+                    "binding_key": binding_key, "binding_claims": binding_claims,
+                    "candidates": sorted(owners), "reason": "The same shared job board is bound to different companies"}
+        return {**owner, "method": "ats_binding", "binding_key": binding_key,
+                "binding_claims": binding_claims,
+                "reason": "Approved company domain and validated job board binding agree"}
+    source = resolve(conn, source_url=doc["source_url"])
+    endpoint = resolve(conn, source_url=doc["endpoint_url"])
+    if not source.get("organization_id") or source.get("organization_id") != endpoint.get("organization_id"):
+        return _unresolved(result, "Document and fetched source do not share an approved company owner",
+                           conflict=bool(source.get("organization_id") and endpoint.get("organization_id")))
+    return result
 
 
 def _http_organization(conn, asset_id):
@@ -204,14 +307,14 @@ def _http_organization(conn, asset_id):
 
 def enrichment_targets(conn, limit):
     rows = conn.execute("""WITH associations AS (
-      SELECT e.from_id AS company_id,e.to_id AS asset_id FROM edges e WHERE e.relation='official_website'
+      SELECT e.from_id AS company_id,e.to_id AS asset_id FROM edges e WHERE e.relation IN ('official_website','primary_domain_anchor')
       UNION SELECT company_id,asset_id FROM company_asset_decisions WHERE status='confirmed' AND role='owned'
      ), domains AS (
-      SELECT c.id AS company_id,c.name,lower(rtrim(d.value,'.')) AS domain,
-       CASE WHEN lower(d.value) LIKE 'www.%' THEN substr(lower(rtrim(d.value,'.')),5)
-        ELSE lower(rtrim(d.value,'.')) END AS canonical_domain
+      SELECT c.id AS company_id,c.name,lower(rtrim(substr(d.id,8),'.')) AS domain,
+       CASE WHEN lower(substr(d.id,8)) LIKE 'www.%' THEN substr(lower(rtrim(substr(d.id,8),'.')),5)
+        ELSE lower(rtrim(substr(d.id,8),'.')) END AS canonical_domain
       FROM associations a JOIN entities c ON c.id=a.company_id AND c.kind='company'
-      JOIN entities d ON d.id=a.asset_id AND d.kind='domain'
+      JOIN entities d ON d.id=a.asset_id AND d.id LIKE 'domain:%' AND d.kind IN ('domain','asset')
      ), included AS (
       SELECT * FROM domains d WHERE NOT EXISTS (SELECT 1 FROM company_asset_decisions rejected
        WHERE rejected.company_id=d.company_id
@@ -223,23 +326,58 @@ def enrichment_targets(conn, limit):
       FROM included GROUP BY canonical_domain
      ) SELECT DISTINCT i.domain,o.company_id,o.name FROM included i
       JOIN owners o ON o.canonical_domain=i.canonical_domain ORDER BY i.domain LIMIT ?""", (max(1, int(limit)),))
-    return [dict(row) for row in rows]
+    from .entity_resolution import resolve
+    targets = []
+    for row in rows:
+        target = dict(row)
+        decision = resolve(conn, context={"domain": target["domain"]})
+        if decision.get("organization_id"):
+            target["company_id"] = decision["organization_id"]
+            owner = conn.execute("SELECT coalesce(p.name,e.name) FROM entities e LEFT JOIN company_profiles p ON p.company_id=e.id WHERE e.id=?",
+                                 (target["company_id"],)).fetchone()
+            target["name"] = owner[0] if owner else ""
+            targets.append(target)
+    return targets
 
 
 def reproject_domain(store, conn, asset_id):
     """Apply a manual decision to retained evidence without changing its source record."""
-    domain = asset_id.removeprefix("domain:").removeprefix("www.")
-    rows = conn.execute("""SELECT * FROM entities WHERE kind IN ('job_posting','company_article','source_record','web_fingerprint')
-     AND lower(rtrim(coalesce(json_extract(metadata,'$.company_context.domain'),
-      json_extract(metadata,'$.target_domain'),''),'.')) IN (?,?)""", (domain, "www." + domain)).fetchall()
-    affected = set()
+    # A root decision affects descendants and final-URL-derived HTTP evidence,
+    # including records whose supplied context was originally absent or wrong.
+    return reproject_company_identity(store, conn, "") - {""}
+
+
+def reproject_company_identity(store, conn, company_id, old_domains=(), new_domains=()):
+    """Re-evaluate retained evidence after identity decisions, in the caller's transaction."""
+    affected = {company_id}
+    # Conflicts and aliases can involve a company outside the previous owner.
+    # Stream the retained source catalogue instead of trusting stale attribution.
+    rows = conn.execute("""SELECT * FROM entities WHERE kind IN ('job_posting','company_article','web_fingerprint')
+     OR (kind='source_record' AND json_extract(metadata,'$.provider')='dns_txt')
+     OR (kind IN ('corporate_record','document','procurement_record','freight_record')
+         AND json_type(metadata,'$.company_context')='object')
+     OR EXISTS(SELECT 1 FROM technographic_sources s WHERE s.source_entity_id=entities.id)""")
     for row in rows:
         entity = dict(row)
         entity["metadata"] = json.loads(entity["metadata"])
-        affected.update(item[0] for item in conn.execute("SELECT organization_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)))
-        project(store, conn, entity, entity["updated_at"])
-        affected.update(item[0] for item in conn.execute("SELECT organization_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)))
+        before = {tuple(item) for item in conn.execute("SELECT organization_id,document_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],))}
+        project(store, conn, entity, entity["updated_at"], affected=affected)
+        after = {tuple(item) for item in conn.execute("SELECT organization_id,document_id FROM technographic_sources WHERE source_entity_id=?", (entity["id"],))}
+        if before != after:
+            affected.update(item[0] for item in before | after)
+    from .text_signals import refresh_company_resolution
+    refresh_company_resolution(store, conn, company_id)
     return affected
+
+
+def backfill_resolution(store, conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS evidence_resolution_migrations(version TEXT PRIMARY KEY)")
+    if conn.execute("SELECT 1 FROM evidence_resolution_migrations WHERE version='company-isolation-v1'").fetchone():
+        return
+    affected = reproject_company_identity(store, conn, "") - {""}
+    if affected:
+        store.reconcile(asset_ids=affected, conn=conn)
+    conn.execute("INSERT INTO evidence_resolution_migrations VALUES('company-isolation-v1')")
 
 
 def document_seen(conn, context, content_hash):
@@ -248,7 +386,7 @@ def document_seen(conn, context, content_hash):
                                            (company_id, content_hash)).fetchone())
 
 
-def project(store, conn, entity, timestamp):
+def project(store, conn, entity, timestamp, *, affected=None):
     from .technographics import extract
 
     # Entity updates merge metadata; attribution must use that retained state,
@@ -260,13 +398,45 @@ def project(store, conn, entity, timestamp):
             entity["metadata"] = json.loads(entity["metadata"])
     doc = document_input(entity)
     if doc is None:
+        context = (entity.get("metadata") or {}).get("company_context")
+        if isinstance(context, dict):
+            from .entity_resolution import resolve
+            result = resolve(conn, context=context, source_url=entity.get("source_url") or "", text=entity.get("name") or "")
+            # Search results and corporate metadata are related records, not a
+            # first-party document merely because they carry a target context.
+            source = resolve(conn, source_url=entity.get("source_url") or "")
+            if source.get("organization_id") != result.get("organization_id"):
+                result = _unresolved(result, "Third-party record requires an approved identity binding")
+            persist_resolution(conn, entity["id"], result, entity.get("source_url"), context, timestamp)
+            _detach_sources(store, conn, entity["id"], None, None, timestamp)
+            if result.get("organization_id"):
+                store._edge(conn, {"from_id": result["organization_id"], "to_id": entity["id"], "relation": "has_public_evidence",
+                                   "source_url": entity.get("source_url") or ""}, timestamp)
         if conn.execute("SELECT 1 FROM technographic_sources WHERE source_entity_id=?", (entity["id"],)).fetchone():
             _detach_sources(store, conn, entity["id"], None, None, timestamp)
         return {}
-    company_id = (_http_organization(conn, doc["asset_id"]) if doc["source_type"] == "http_fingerprint"
-                  else organization(conn, doc["organization_context"]))
+    resolution = _resolve_document(conn, entity, doc)
+    provenance = {"company_context": doc["organization_context"],
+                  "endpoint_url": doc["endpoint_url"], "source_binding": (entity.get("metadata") or {}).get("source_binding"),
+                  "binding_key": resolution.get("binding_key"), "binding_claims": resolution.get("binding_claims")}
+    persist_resolution(conn, entity["id"], resolution, doc["source_url"], provenance, timestamp)
+    detached = set()
+    if resolution.get("method") == "ats_board_conflict":
+        for previous in conn.execute("SELECT * FROM evidence_resolution WHERE json_extract(context,'$.binding_key')=? AND source_entity_id!=?",
+                                     (resolution["binding_key"], entity["id"])).fetchall():
+            detached.update(_detach_sources(store, conn, previous["source_entity_id"], None, None, timestamp))
+            previous_context = json.loads(previous["context"])
+            previous_context["binding_claims"] = resolution.get("binding_claims")
+            persist_resolution(conn, previous["source_entity_id"], resolution, previous["source_url"], previous_context, timestamp)
+    company_id = resolution.get("organization_id")
     document_id = ("technographic_document:" + hashlib.sha256((company_id + "\0" + doc["content_hash"]).encode()).hexdigest()) if company_id else None
-    _detach_sources(store, conn, entity["id"], company_id, document_id, timestamp)
+    detached.update(_detach_sources(store, conn, entity["id"], company_id, document_id, timestamp))
+    if affected is not None:
+        affected.update(detached)
+    elif detached and resolution.get("method") == "ats_board_conflict":
+        # Shared-board invalidation can clear sources processed earlier in this
+        # batch. Withdraw their alerts in the same ingestion transaction.
+        store.reconcile(asset_ids=detached, conn=conn)
     if company_id is None:
         return {"technographic_unattributed": 1}
     duplicate = conn.execute("SELECT 1 FROM technographic_documents WHERE id=?", (document_id,)).fetchone() is not None
@@ -322,25 +492,29 @@ def project(store, conn, entity, timestamp):
 
 
 def _detach_sources(store, conn, entity_id, company_id, document_id, timestamp):
+    affected = set()
     previous = conn.execute("SELECT organization_id,document_id FROM technographic_sources WHERE source_entity_id=?", (entity_id,)).fetchall()
     for old_company, old_document in previous:
         if (old_company, old_document) == (company_id, document_id):
             continue
+        affected.add(old_company)
         conn.execute("DELETE FROM technographic_sources WHERE organization_id=? AND source_entity_id=?", (old_company, entity_id))
-        if not conn.execute("SELECT 1 FROM technographic_sources WHERE document_id=?", (old_document,)).fetchone():
+        if not conn.execute("SELECT 1 FROM technographic_sources WHERE document_id=? AND organization_id=?", (old_document, old_company)).fetchone():
             _clear_projection(store, conn, old_company, old_document, timestamp)
         else:
             _observations(store, conn, old_company, old_document, timestamp)
-    conn.execute("""DELETE FROM edges WHERE to_id=? AND relation='has_public_evidence'
+    conn.execute("""DELETE FROM edges WHERE to_id=? AND relation IN ('has_public_evidence','candidate_evidence')
      AND from_id IN (SELECT id FROM entities WHERE kind='company') AND (? IS NULL OR from_id!=?)""",
                  (entity_id, company_id, company_id))
     if company_id is None:
         conn.execute("DELETE FROM edges WHERE from_id=? AND relation LIKE 'technology_%'", (entity_id,))
+    return affected
 
 
 def _graph(store, conn, entity_id, document_id, source_url, timestamp):
     conn.execute("DELETE FROM edges WHERE from_id=? AND relation LIKE 'technology_%'", (entity_id,))
-    for finding in conn.execute("SELECT * FROM tech_fingerprints WHERE document_id=?", (document_id,)):
+    for finding in conn.execute("""SELECT f.* FROM tech_fingerprints f JOIN technographic_documents d
+     ON d.id=f.document_id AND d.organization_id=f.organization_id WHERE f.document_id=?""", (document_id,)):
         key = "technographic_product:" + hashlib.sha256((finding["vendor"] + "\0" + finding["product"]).encode()).hexdigest()
         role = "http_technology_label" if finding["status"] in _HTTP_STATUSES else "textual_technology_label"
         store._entity(conn, {"id": key, "kind": "technology", "name": finding["product_name"],
@@ -348,6 +522,11 @@ def _graph(store, conn, entity_id, document_id, source_url, timestamp):
                             "source_url": source_url}, timestamp)
         store._edge(conn, {"from_id": entity_id, "to_id": key, "relation": "technology_" + finding["status"],
                            "source_url": source_url, "confidence": finding["confidence"]}, timestamp)
+        if finding["vendor"] and finding["vendor"] != "unknown":
+            vendor_id = "technographic_vendor:" + hashlib.sha256(finding["vendor"].encode()).hexdigest()
+            store._entity(conn, {"id": vendor_id, "kind": "vendor", "name": finding["vendor_name"] or finding["vendor"],
+                                "metadata": {"evidence_role": "technology_vendor_label", "verified_legal_company": False}}, timestamp)
+            store._edge(conn, {"from_id": key, "to_id": vendor_id, "relation": "vendor_label", "source_url": source_url}, timestamp)
 
 
 def _clear_projection(store, conn, company_id, document_id, timestamp):
@@ -355,11 +534,11 @@ def _clear_projection(store, conn, company_id, document_id, timestamp):
 
 
 def _observations(store, conn, company_id, document_id, timestamp):
-    source = conn.execute("SELECT source_url,last_seen_at FROM technographic_sources WHERE document_id=? ORDER BY last_seen_at DESC,source_url LIMIT 1", (document_id,)).fetchone()
+    source = conn.execute("SELECT source_url,last_seen_at FROM technographic_sources WHERE document_id=? AND organization_id=? ORDER BY last_seen_at DESC,source_url LIMIT 1", (document_id, company_id)).fetchone()
     if source is None:
         return
     observations = []
-    for finding in conn.execute("SELECT * FROM tech_fingerprints WHERE document_id=? AND status='asserted_use'", (document_id,)):
+    for finding in conn.execute("SELECT * FROM tech_fingerprints WHERE document_id=? AND organization_id=? AND status='asserted_use'", (document_id, company_id)):
         observations.append({"asset_id": company_id, "vendor": finding["vendor"], "product": finding["product"],
                              "part": finding["part"], "version": finding["version"], "cpe": finding["cpe"],
                              "origin": "technographic:" + document_id, "source_url": source[0], "observed_at": source[1],
@@ -375,25 +554,41 @@ def touch_source(conn, source_url, context, timestamp):
     documents = [row[0] for row in conn.execute("SELECT DISTINCT document_id FROM technographic_sources WHERE endpoint_url=? AND organization_id=?", (source_url, company_id))]
     conn.execute("UPDATE technographic_sources SET last_seen_at=max(last_seen_at,?) WHERE endpoint_url=? AND organization_id=?", (timestamp, source_url, company_id))
     for key in documents:
-        conn.execute("UPDATE technographic_documents SET last_seen_at=max(last_seen_at,?) WHERE id=?", (timestamp, key))
-        conn.execute("UPDATE tech_fingerprints SET last_seen_at=max(last_seen_at,?) WHERE document_id=?", (timestamp, key))
+        conn.execute("UPDATE technographic_documents SET last_seen_at=max(last_seen_at,?) WHERE id=? AND organization_id=?", (timestamp, key, company_id))
+        conn.execute("UPDATE tech_fingerprints SET last_seen_at=max(last_seen_at,?) WHERE document_id=? AND organization_id=?", (timestamp, key, company_id))
     return len(documents)
 
 
 def company_evidence(conn, company_id, limit=100):
     rows = conn.execute("""SELECT f.*,d.title AS document_title,d.published_at,
-     (SELECT source_url FROM technographic_sources s WHERE s.document_id=d.id ORDER BY last_seen_at DESC,source_url LIMIT 1) AS source_url,
-     (SELECT source_type FROM technographic_sources s WHERE s.document_id=d.id ORDER BY last_seen_at DESC,source_url LIMIT 1) AS source_type
-     FROM tech_fingerprints f JOIN technographic_documents d ON d.id=f.document_id
-     WHERE f.organization_id=? AND EXISTS (SELECT 1 FROM technographic_sources s WHERE s.document_id=d.id)
+     (SELECT source_url FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=d.organization_id ORDER BY last_seen_at DESC,source_url LIMIT 1) AS source_url,
+     (SELECT source_type FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=d.organization_id ORDER BY last_seen_at DESC,source_url LIMIT 1) AS source_type
+     FROM tech_fingerprints f JOIN technographic_documents d ON d.id=f.document_id AND d.organization_id=f.organization_id
+     WHERE f.organization_id=? AND EXISTS (SELECT 1 FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=f.organization_id)
      ORDER BY f.last_seen_at DESC,f.id LIMIT ?""", (company_id, limit + 1)).fetchall()
     total = conn.execute("""SELECT count(*) FROM tech_fingerprints f WHERE organization_id=?
-     AND EXISTS (SELECT 1 FROM technographic_sources s WHERE s.document_id=f.document_id)""", (company_id,)).fetchone()[0]
-    documents = conn.execute("SELECT count(DISTINCT document_id) FROM technographic_sources WHERE organization_id=?", (company_id,)).fetchone()[0]
+     AND EXISTS (SELECT 1 FROM technographic_sources s JOIN technographic_documents d ON d.id=s.document_id AND d.organization_id=s.organization_id
+                 WHERE s.document_id=f.document_id AND s.organization_id=f.organization_id)""", (company_id,)).fetchone()[0]
+    documents = conn.execute("SELECT count(DISTINCT s.document_id) FROM technographic_sources s JOIN technographic_documents d ON d.id=s.document_id AND d.organization_id=s.organization_id WHERE s.organization_id=?", (company_id,)).fetchone()[0]
     fingerprints = []
     for row in rows[:limit]:
         finding = dict(row)
         details = json.loads(finding.pop("evidence_details"))
         finding.update({key: details[key] for key in ("asset_id", *_HTTP_DETAILS) if key in details})
         fingerprints.append(finding)
-    return {"documents": documents, "fingerprints": fingerprints, "total": total, "truncated": len(rows) > limit}
+    decisions = conn.execute("""SELECT * FROM evidence_resolution r WHERE organization_id=?
+     OR EXISTS (SELECT 1 FROM json_each(r.candidates) WHERE value=?)
+     ORDER BY updated_at DESC,source_entity_id LIMIT ?""", (company_id, company_id, limit + 1)).fetchall()
+    resolution = {status: 0 for status in ("resolved", "candidate", "conflict", "unattributed")}
+    for status, count in conn.execute("""SELECT status,count(*) FROM evidence_resolution r WHERE organization_id=?
+     OR EXISTS (SELECT 1 FROM json_each(r.candidates) WHERE value=?) GROUP BY status""", (company_id, company_id)):
+        resolution[status] = count
+    # Decisions expose only identity/provenance, never another company's body.
+    resolution["items"] = [{key: json.loads(row[key]) if key == "candidates" else row[key] for key in
+                            ("source_entity_id", "organization_id", "status", "method", "reason", "candidates", "source_url", "matched_domain")}
+                           for row in decisions[:limit]]
+    resolution["truncated"] = len(decisions) > limit
+    relationships = [{key: finding[key] for key in ("vendor", "vendor_name", "product", "product_name", "status", "evidence_snippet", "source_url", "organization_id", "method")}
+                     for finding in fingerprints]
+    return {"documents": documents, "fingerprints": fingerprints, "total": total, "truncated": len(rows) > limit,
+            "resolution": resolution, "relationships": relationships}

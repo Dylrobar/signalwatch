@@ -93,8 +93,8 @@ class GraphTests(unittest.TestCase):
             self.assertEqual(next(c for c in result['claims'] if c['kind']=='exploit')['status'],'negated')
             self.assertIn('1.0',result['versions'])
             self.assertEqual(next(m for m in result['mentions'] if m['entity_id']=='company:b')['status'],'candidate')
-            self.assertEqual(next(m for m in result['mentions'] if m['entity_id']=='company:a')['status'],'resolved')
-            self.assertEqual(conn.execute("SELECT count(*) FROM edges WHERE relation='candidate_mention'").fetchone()[0],1)
+            self.assertEqual(next(m for m in result['mentions'] if m['entity_id']=='company:a')['status'],'candidate')
+            self.assertEqual(conn.execute("SELECT count(*) FROM edges WHERE relation='candidate_mention'").fetchone()[0],2)
         first=backfill(self.store,0,1)
         self.assertEqual(first['processed'],1)
         self.assertEqual(backfill(self.store,first['next_cursor'],1)['processed'],0)
@@ -126,7 +126,7 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(len({r['id'] for r in result['items']}),len(result['items']))
         self.assertTrue(any(r['kind']=='article' for r in result['items']))
         article=next(r for r in result['items'] if r['kind']=='article')
-        self.assertEqual(self.store.detail(article['id'])['article']['extraction']['method'],'deterministic-catalog-v1')
+        self.assertEqual(self.store.detail(article['id'])['article']['extraction']['method'],'deterministic-catalog-v2')
 
     def test_exact_identifiers_canonicalize_early_reports_and_graph_edges(self):
         ghsa='GHSA-AAAA-BBBB-CCCC'

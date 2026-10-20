@@ -51,6 +51,17 @@ def parse_network(payload, target, source_url, stamp):
     return {"entities": entities, "edges": edges}
 
 
+def ingest_network_snapshot(store, batch, target_id, source_url):
+    """Replace one resource's RIPE evidence atomically, including no-route replies."""
+    with store.connection(write=True) as conn:
+        conn.execute("DELETE FROM edges WHERE from_id=? AND relation='routed_in' AND source_url=?",
+                     (target_id, source_url))
+        # The resource query identifies this IP's provenance even when another
+        # IP shares the same prefix. Preserve the other resource's evidence.
+        conn.execute("DELETE FROM edges WHERE relation='announced_by' AND source_url=?", (source_url,))
+        return store.ingest(batch, conn=conn)
+
+
 async def collect_network(config, store, http):
     limit = int(config.get("network_batch", 20))
     refresh = float(config.get("network_interval_hours", 24))
@@ -66,7 +77,7 @@ async def collect_network(config, store, http):
                 result = await http.get(source_url)
                 payload = await asyncio.to_thread(read_json, result.path)
                 batch = parse_network(payload, target, source_url, utcnow())
-                await to_thread(store.ingest, batch)
+                await to_thread(ingest_network_snapshot, store, batch, target["id"], source_url)
                 return {"routed": bool(payload["data"].get("prefix")), "error": None}
             except Exception as exc:
                 return {"routed": False, "error": f"{target['value']}: {exc}"}
