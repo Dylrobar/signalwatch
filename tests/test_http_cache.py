@@ -14,7 +14,7 @@ class Response:
     def __init__(self, status, body=b"", etag=None):
         self.status = status
         self.headers = {"ETag": etag} if etag else {}
-        self.url = "https://example.test/feed"
+        self.url = "https://example.test/feed?token=synthetic-secret"
         self.content = Mock()
 
         async def chunks(size):

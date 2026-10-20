@@ -155,6 +155,50 @@ class CompanyGraphIsolationTests(unittest.TestCase):
         self.assertFalse(proof['evidence']['risk_propagation'])
         self.assertEqual(self.graph.company_risk('company:acme')['items'], [])
 
+    def test_shared_product_cannot_inherit_other_company_detection_metadata(self):
+        self.anchor('company:acme', 'example.com')
+        self.anchor('company:nebula', 'example.org')
+        self.store.ingest({'entities': [{
+            'id': 'article:acme', 'kind': 'company_article', 'name': 'Engineering',
+            'source_url': 'https://example.com/engineering',
+            'metadata': {'company_context': {'company_id': 'company:acme'},
+                         'fields': {'description': 'PostgreSQL is discussed in this article.'}}
+        }]})
+        self.store.ingest({'entities': [{
+            'id': 'http:nebula', 'kind': 'web_fingerprint', 'name': 'Nebula HTTP evidence',
+            'source_url': 'https://example.org/',
+            'metadata': {'fingerprints': [{'vendor': 'postgresql', 'product': 'postgresql',
+                         'product_name': 'PostgreSQL', 'status': 'http_detected', 'confidence': 0.9,
+                         'evidence_snippet': 'HTTP evidence on Nebula', 'version': '16.1'}]}
+        }]})
+        scoped = self.graph.graph('company:acme', 5, 300, 800)
+        product = next(node for node in scoped['nodes'] if node['kind'] == 'technology')
+        self.assertNotEqual(product['metadata'].get('evidence_role'), 'http_technology_label')
+        self.assertEqual(product['metadata']['evidence_role'], 'shared_context')
+        self.assertTrue(any(item['relation'] == 'technology_mention' for item in scoped['edges']))
+        global_product = self.graph.graph(product['id'], 1)['nodes'][0]
+        self.assertEqual(global_product['metadata']['evidence_role'], 'http_technology_label')
+
+    def test_foreign_vendor_edges_do_not_starve_company_vendor_context(self):
+        self.anchor('company:acme', 'example.com')
+        self.store.ingest({'entities': [{
+            'id': 'article:acme', 'kind': 'company_article', 'name': 'Engineering',
+            'source_url': 'https://example.com/engineering',
+            'metadata': {'company_context': {'company_id': 'company:acme'},
+                         'fields': {'description': 'PostgreSQL is discussed in this article.'}}
+        }]})
+        with self.store.connection() as conn:
+            product, vendor = conn.execute("SELECT from_id,to_id FROM edges WHERE relation='vendor_label'").fetchone()
+        self.store.ingest({'edges': [
+            {'from_id': product, 'to_id': vendor, 'relation': 'vendor_label',
+             'source_url': f'https://aaa.example.org/{index:03}'} for index in range(20)
+        ]})
+        scoped = self.graph.graph('company:acme', 5, 300, 10)
+        self.assertIn(vendor, {node['id'] for node in scoped['nodes']})
+        vendor_edges = [item for item in scoped['edges'] if item['relation'] == 'vendor_label']
+        self.assertEqual([item['source_url'] for item in vendor_edges], ['https://example.com/engineering'])
+        self.assertNotIn('aaa.example.org', str(scoped))
+
     def test_root_company_alert_requires_current_validated_technographic_observation(self):
         self.anchor('company:acme', 'example.com')
         self.anchor('company:nebula', 'example.org')

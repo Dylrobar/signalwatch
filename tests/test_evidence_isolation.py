@@ -144,6 +144,35 @@ class EvidenceIsolationTests(unittest.TestCase):
         self.assertEqual(detail["observations"], [])
         self.assertEqual(detail["technographics"]["relationships"][0]["status"], "domain_verification")
 
+    def test_removed_dns_verification_withdraws_saved_attribution(self):
+        item = {"id": "source_record:dns", "kind": "source_record", "source_url": "https://dns.google/resolve?name=alpha.example.com&type=TXT",
+                "metadata": {"provider": "dns_txt", "target_domain": "alpha.example.com", "provider_fields": {
+                    "name": "alpha.example.com.", "data": "google-site-verification=abc"}}}
+        self.store.ingest({"entities": [item]})
+        self.assertEqual(self.store.detail("company:alpha")["technographics"]["resolution"]["resolved"], 1)
+        item["metadata"]["provider_fields"]["data"] = "v=spf1 -all"
+        self.store.ingest({"entities": [item]})
+        evidence = self.store.detail("company:alpha")["technographics"]
+        self.assertEqual(evidence["resolution"]["items"], [])
+        self.assertEqual(evidence["relationships"], [])
+        self.assertEqual(evidence["documents"], 0)
+        self.assertEqual(self.store.detail(item["id"])["metadata"]["provider_fields"]["data"], "v=spf1 -all")
+
+    def test_generic_evidence_partial_refresh_preserves_context_but_explicit_clear_withdraws_it(self):
+        for kind in ("corporate_record", "document", "procurement_record", "freight_record"):
+            with self.subTest(kind=kind):
+                item = {"id": kind + ":one", "kind": kind, "name": "Alpha evidence", "source_url": "https://alpha.example.com/about",
+                        "metadata": {"company_context": {"company_id": "company:alpha", "domain": "alpha.example.com"}}}
+                self.store.ingest({"entities": [item]})
+                self.store.ingest({"entities": [{"id": item["id"], "kind": kind, "metadata": {"collector_refresh": True}}]})
+                with self.store.connection() as conn:
+                    self.assertEqual(conn.execute("SELECT organization_id FROM evidence_resolution WHERE source_entity_id=?", (item["id"],)).fetchone()[0], "company:alpha")
+                self.store.ingest({"entities": [{"id": item["id"], "kind": kind, "metadata": {"company_context": None}}]})
+                with self.store.connection() as conn:
+                    self.assertIsNone(conn.execute("SELECT 1 FROM evidence_resolution WHERE source_entity_id=?", (item["id"],)).fetchone())
+                    self.assertIsNone(conn.execute("SELECT 1 FROM edges WHERE to_id=? AND relation='has_public_evidence'", (item["id"],)).fetchone())
+                self.assertIsNotNone(self.store.detail(item["id"]))
+
     def test_alias_only_company_mentions_remain_candidates(self):
         with self.store.connection() as conn:
             outside = extract(conn, {"title": "Alpha and Shared Brand announce news", "url": "https://news.test/post"})
