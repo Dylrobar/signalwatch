@@ -7,10 +7,13 @@ never deletes their original entities or shared advisory data.
 
 import hashlib
 import json
+import logging
+import time
 from datetime import datetime, timezone
 
 
 VERSION = "technographic-integrity-v1"
+logger = logging.getLogger(__name__)
 
 
 def _quarantine(conn, table, selection, key, reason):
@@ -55,11 +58,14 @@ def _repair(conn):
     conn.execute("DELETE FROM technographic_documents WHERE id IN (SELECT id FROM tech_bad_documents)")
     # An observation is a projection only while a same-company asserted finding
     # and an active same-company source still support its document/product.
+    # Extract the document key so each observation uses a primary-key lookup.
+    # The exact origin comparison remains necessary: LIKE is case insensitive.
     invalid = """origin LIKE 'technographic:%' AND NOT EXISTS (
      SELECT 1 FROM technographic_documents d JOIN tech_fingerprints f
       ON f.document_id=d.id AND f.organization_id=d.organization_id
      JOIN entities e ON e.id=d.organization_id AND e.kind='company'
-     WHERE observations.asset_id=d.organization_id AND observations.origin='technographic:'||d.id
+     WHERE d.id=substr(observations.origin,length('technographic:')+1)
+      AND observations.asset_id=d.organization_id AND observations.origin='technographic:'||d.id
       AND f.status='asserted_use' AND f.vendor=observations.vendor AND f.product=observations.product
       AND f.part=observations.part AND f.version=observations.version
       AND EXISTS (SELECT 1 FROM technographic_sources s WHERE s.document_id=d.id AND s.organization_id=d.organization_id
@@ -158,6 +164,8 @@ def ensure_constraints(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS technographic_integrity_migrations(version TEXT PRIMARY KEY,applied_at TEXT NOT NULL)")
     if conn.execute("SELECT 1 FROM technographic_integrity_migrations WHERE version=?", (VERSION,)).fetchone():
         return set()
+    started = time.monotonic()
+    logger.info("Technographic integrity migration %s started", VERSION)
     conn.execute("SAVEPOINT technographic_integrity_install")
     try:
         conn.execute("""CREATE TABLE IF NOT EXISTS technographic_integrity_quarantine(
@@ -167,6 +175,8 @@ def ensure_constraints(conn):
         _triggers(conn)
         conn.execute("INSERT INTO technographic_integrity_migrations VALUES(?,?)", (VERSION, datetime.now(timezone.utc).isoformat()))
         conn.execute("RELEASE technographic_integrity_install")
+        logger.info("Technographic integrity migration %s finished in %.3fs; affected assets=%d",
+                    VERSION, time.monotonic() - started, len(affected))
         return affected
     except BaseException:
         conn.execute("ROLLBACK TO technographic_integrity_install")

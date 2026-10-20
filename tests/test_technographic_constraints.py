@@ -157,6 +157,40 @@ class TechnographicConstraintsTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT count(*) FROM technographic_sources WHERE source_entity_id='raw:shared'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT count(*) FROM technographic_sources").fetchone()[0], 2)
 
+    def test_document_lookup_preserves_exact_origin_prefix_validation(self):
+        self.valid_pair()
+        self.observation("valid", "company:a", "doc:a", "raw:a")
+        self.observation("invalid", "company:a", "doc:a", "raw:a")
+        self.conn.execute("UPDATE observations SET origin='Technographic:doc:a' WHERE id='invalid'")
+        self.assertEqual(ensure_constraints(self.conn), {"company:a"})
+        self.assertEqual([row[0] for row in self.conn.execute("SELECT id FROM observations")], ["valid"])
+
+    def test_many_documents_for_one_product_require_bounded_migration_work(self):
+        count = 2000
+        for index in range(count):
+            source, document = f"raw:large:{index}", f"doc:large:{index}"
+            self.conn.execute("INSERT INTO entities(id,kind,name,value,updated_at) VALUES(?,'job_posting','Raw','Raw','now')", (source,))
+            self.document(document, "company:a")
+            self.source(source, "company:a", document)
+            self.fingerprint(f"fp:large:{index}", "company:a", document)
+            self.observation(f"obs:large:{index}", "company:a", document, source)
+        steps = 0
+
+        def progress():
+            nonlocal steps
+            steps += 1000
+            return 0
+
+        self.conn.set_progress_handler(progress, 1000)
+        try:
+            self.assertEqual(ensure_constraints(self.conn), set())
+        finally:
+            self.conn.set_progress_handler(None, 0)
+        # Count SQLite VM instructions rather than timing the test: scanning
+        # every same-product fingerprint per observation grows quadratically.
+        self.assertLess(steps, count * 1000)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM observations").fetchone()[0], count)
+
     def test_migration_is_idempotent_and_rolls_back_with_its_caller(self):
         self.document("bad-doc", "domain:x")
         self.conn.commit()
