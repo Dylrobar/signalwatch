@@ -96,6 +96,32 @@ class PostgresMigrationTests(unittest.TestCase):
             audit(conn, {'id': 'test', 'name': 'Tester'}, 'fixture.created', 'company:acme', after={'raw_id': raw['id']})
         return raw, job
 
+    def test_nul_text_is_normalized_but_source_and_binary_are_preserved(self):
+        import json
+        from signalwatch.postgres import postgres_value
+        self.source.ingest({'entities': [{'id': 'asset:nul', 'kind': 'asset', 'name': 'test'}]})
+        with self.source.connection(write=True) as conn:
+            conn.execute('UPDATE entities SET name=?,value=?,metadata=? WHERE id=?',
+                         ('wire\x00less', 'value\x00', json.dumps({'ssid': 'net\x00work'}), 'asset:nul'))
+        original = self.source_path.read_bytes()
+        report = migrate_sqlite(self.source_path, self.target)
+        self.assertTrue(report['verified'])
+        self.assertEqual(report['tables']['entities']['normalized_values'], 3)
+        self.assertEqual(self.source_path.read_bytes(), original)
+        target = Store(self.target)
+        with target.connection(write=True) as conn:
+            row = conn.execute("SELECT name,value,json_extract(metadata,'$.ssid') FROM entities WHERE id=?", ('asset:nul',)).fetchone()
+            self.assertEqual(tuple(row), ('wire\ufffdless', 'value\ufffd', 'net\ufffdwork'))
+            conn.execute('UPDATE entities SET name=? WHERE id=?', ('new\x00name', 'asset:nul'))
+            conn.executemany('UPDATE entities SET value=? WHERE id=?', [('new\x00value', 'asset:nul')])
+            self.assertEqual(tuple(conn.execute('SELECT name,value FROM entities WHERE id=?', ('asset:nul',)).fetchone()), ('new\ufffdname', 'new\ufffdvalue'))
+        self.assertTrue(migrate_sqlite(self.source_path, self.target)['already_migrated'])
+        self.assertEqual(postgres_value(b'\x00\xff'), b'\x00\xff')
+        literal = json.dumps({'literal': r'\u0000'})
+        self.assertEqual(postgres_value(literal), literal)
+        with self.assertRaises(ValueError):
+            postgres_value(json.dumps({'\x00': 1, '\ufffd': 2}))
+
     def test_long_edge_urls_migrate_and_upsert_without_truncation(self):
         import random
         rng = random.Random(123)
@@ -180,8 +206,8 @@ class PostgresMigrationTests(unittest.TestCase):
         self.fixture()
         from signalwatch import postgres_migrate
         real = postgres_migrate._digest
-        def corrupted(rows):
-            value = real(rows)
+        def corrupted(rows, **kwargs):
+            value = real(rows, **kwargs)
             # SQLite source rows are tuples; target psycopg cursor is distinct.
             if type(rows).__module__.startswith('psycopg'):
                 return {**value, 'rows': value['rows'] + 1}

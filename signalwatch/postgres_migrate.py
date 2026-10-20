@@ -2,7 +2,7 @@
 
 Run with writers stopped. A read-only SQLite transaction pins a consistent source
 snapshot without copying or changing the original database. The destination must be empty
-(or have the matching completed manifest). Copy, byte-for-byte logical content
+(or have the matching completed manifest). Copy, normalized logical content
 verification, sequence repair and the activation manifest commit together.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .postgres import MIGRATION_LOCK, ROWID_TABLES, WRITER_LOCK, connect
+from .postgres import MIGRATION_LOCK, ROWID_TABLES, WRITER_LOCK, connect, postgres_value
 
 SEED_TABLES = frozenset({'company_identity_migrations', 'technographic_integrity_migrations', 'evidence_resolution_migrations'})
 MANIFEST_TABLE = 'postgres_migration_manifest'
@@ -27,17 +27,28 @@ def _quote(name):
     return '"' + name.replace('"', '""') + '"'
 
 
-def _digest(rows):
+def _digest(rows, normalize=False):
     """Order-independent multiset checksum, bounded memory even for raw payloads."""
     count, total, xor = 0, 0, 0
+    original_total, original_xor, normalized_values = 0, 0, 0
     for row in rows:
         values = [({'bytes': bytes(v).hex()} if isinstance(v, (bytes, memoryview)) else v) for v in row]
         encoded = json.dumps(values, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()
+        original = int.from_bytes(hashlib.sha256(encoded).digest(), 'big')
+        original_total = (original_total + original) % (1 << 256)
+        original_xor ^= original
+        if normalize:
+            normalized = [postgres_value(v) for v in values]
+            normalized_values += sum(a != b for a, b in zip(values, normalized))
+            encoded = json.dumps(normalized, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()
         value = int.from_bytes(hashlib.sha256(encoded).digest(), 'big')
         total = (total + value) % (1 << 256)
         xor ^= value
         count += 1
-    return {'rows': count, 'sha256_sum': f'{total:064x}', 'sha256_xor': f'{xor:064x}'}
+    result = {'rows': count, 'sha256_sum': f'{total:064x}', 'sha256_xor': f'{xor:064x}'}
+    if normalize:
+        result.update(source_sha256_sum=f'{original_total:064x}', source_sha256_xor=f'{original_xor:064x}', normalized_values=normalized_values)
+    return result
 
 
 def _source_inventory(source):
@@ -120,8 +131,8 @@ def migrate_sqlite(source_path, target_dsn):
 
         snapshot.set_progress_handler(report_progress, 100000)
         try:
-            log.info('Checking SQLite snapshot integrity')
-            if snapshot.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            log.info('Checking SQLite snapshot structure (indexes are rebuilt in PostgreSQL)')
+            if snapshot.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                 raise RuntimeError('Source SQLite integrity check failed')
             log.info('Checking SQLite snapshot foreign keys')
             foreign_keys = snapshot.execute('PRAGMA foreign_key_check').fetchall()
@@ -132,7 +143,9 @@ def migrate_sqlite(source_path, target_dsn):
             for table in tables:
                 name = table['name']
                 log.info('Checking source table %s', name)
-                checks[name] = {'columns': table['columns'], **_digest(snapshot.execute(_select(table)))}
+                checks[name] = {'columns': table['columns'], **_digest(snapshot.execute(_select(table)), normalize=True)}
+                if checks[name]['normalized_values']:
+                    log.warning('Replacing unsupported NUL characters in %s values in table %s; original source preserved', checks[name]['normalized_values'], name)
             source_fingerprint = hashlib.sha256(json.dumps(checks, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
             log.info('Source snapshot verified; connecting to PostgreSQL')
             conn = connect(target_dsn)
@@ -175,7 +188,7 @@ def migrate_sqlite(source_path, target_dsn):
                     columns = ','.join(map(_quote, table['columns']))
                     with conn.raw.cursor().copy(f'COPY {_quote(name)} ({columns}) FROM STDIN') as copy:
                         for row in snapshot.execute(_select(table)):
-                            copy.write_row(tuple(row))
+                            copy.write_row(tuple(postgres_value(v) for v in row))
                 # Verify the final state, after every insertion trigger has run.
                 # A server-side cursor bounds memory for large BYTEA queues and
                 # wireless inventories; ordinary psycopg cursors buffer results.
@@ -186,7 +199,7 @@ def migrate_sqlite(source_path, target_dsn):
                         cursor.itersize = 100
                         cursor.execute(_select(table))
                         actual = {'columns': table['columns'], **_digest(cursor)}
-                    if actual != checks[name]:
+                    if actual != {k: v for k, v in checks[name].items() if not k.startswith('source_') and k != 'normalized_values'}:
                         raise RuntimeError('PostgreSQL migration verification failed for table ' + name)
                 # Explicit copied IDs must not collide with the next insert.
                 for table, column in conn.raw.execute("SELECT table_name,column_name FROM information_schema.columns WHERE table_schema=current_schema() AND is_identity='YES'").fetchall():
