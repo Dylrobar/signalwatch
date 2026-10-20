@@ -19,6 +19,10 @@ def parser():
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
     serve.add_argument("--no-collect", action="store_true")
+    runtime = commands.add_parser("runtime", help="Supervise API and optional Celery worker on one data disk")
+    runtime.add_argument("--host")
+    runtime.add_argument("--port", type=int)
+    runtime.add_argument("--no-collect", action="store_true", help="Disable automatic collection and Celery Beat")
     collect = commands.add_parser("collect")
     collect.add_argument("--sources", nargs="+")
     bootstrap = commands.add_parser("bootstrap")
@@ -77,6 +81,9 @@ def main():
             output.write("\n")
         print(str(path.resolve()))
         return
+    if args.command == "runtime":
+        from .runtime import run
+        raise SystemExit(run(args.config, host=args.host, port=args.port, no_collect=args.no_collect))
     config = load_config(args.config)
     if args.command == "serve":
         import uvicorn

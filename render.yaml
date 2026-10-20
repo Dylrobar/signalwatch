@@ -1,0 +1,33 @@
+# Bind the web entry to the existing SignalWatch service and its existing disk.
+# Do not create a second web service from this file: SQLite must stay on /data.
+services:
+  - type: web
+    name: signalwatch
+    runtime: docker
+    repo: https://github.com/Dylrobar/signalwatch
+    branch: main
+    region: virginia
+    # Keep the existing web instance plan (currently 1c-2g); do not resize it.
+    healthCheckPath: /health
+    disk:
+      name: signalwatch-data
+      mountPath: /data
+      sizeGB: 50
+    envVars:
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: SIGNALWATCH_CONFIG
+        value: /data/config.json
+      - key: SIGNALWATCH_CELERY_BEAT
+        value: "true"
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: signalwatch-queue
+          property: connectionString
+  - type: keyvalue
+    name: signalwatch-queue
+    region: virginia
+    plan: free
+    maxmemoryPolicy: noeviction
+    ipAllowList: []

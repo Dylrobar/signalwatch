@@ -42,7 +42,8 @@ def public_url(value):
 
 
 class CollectRequest(BaseModel):
-    sources: list[str] | None = None
+    sources: list[str] | None = Field(default=None, max_length=100)
+    idempotency_key: str = Field(default="", max_length=200)
 
 
 class SeedRequest(BaseModel):
@@ -159,6 +160,13 @@ def create_app(config, auto_collect=True):
     startup_sources = parse_startup_sources(os.environ.get("SIGNALWATCH_STARTUP_SOURCES"), config["sources"]) if auto_collect else []
     store = Store(config["db"])
     engine = Engine(config, store)
+    from .jobs import Jobs
+    jobs = Jobs(store)
+    queue_enabled = bool(os.environ.get("CELERY_BROKER_URL", "").strip())
+    dispatcher = None
+    if queue_enabled:
+        from .queue import QueueDispatcher
+        dispatcher = QueueDispatcher(config, store)
     ingress = staging_queue(store, config)
     ingress_worker = StagingWorker(store, config, ingress)
     from .wireless_import import WirelessImports
@@ -177,10 +185,16 @@ def create_app(config, auto_collect=True):
         async with engine:
             tasks.add(asyncio.create_task(ingress_worker.run(), name="staging-worker"))
             await wireless_imports.resume()
-            if auto_collect:
+            if dispatcher is not None:
+                tasks.add(asyncio.create_task(dispatcher.run(), name="collection-outbox"))
+                if startup_sources:
+                    await asyncio.to_thread(jobs.enqueue, "collect", {"sources": startup_sources})
+            elif auto_collect:
                 task = asyncio.create_task(engine.schedule(startup_sources=startup_sources))
                 tasks.add(task)
             yield
+            if dispatcher is not None:
+                await dispatcher.stop()
             await wireless_imports.stop()
             enrichment = getattr(app.state, "wireless_enrichment", {}).get("task")
             if enrichment is not None and not enrichment.done():
@@ -196,6 +210,8 @@ def create_app(config, auto_collect=True):
     app = FastAPI(title="SignalWatch", version=VERSION, lifespan=lifespan)
     app.state.store = store
     app.state.engine = engine
+    app.state.jobs = jobs
+    app.state.queue_enabled = queue_enabled
     app.state.staging = ingress
     api_token = config.get("api_token", "").encode("utf-8")
     @app.middleware("http")
@@ -220,6 +236,8 @@ def create_app(config, auto_collect=True):
     register_graph_routes(app, store)
     from .extension_prerelease import register_prerelease_routes
     register_prerelease_routes(app, store)
+    from .queue_api import register_job_routes
+    register_job_routes(app, config, engine, jobs, queue_enabled)
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 
@@ -242,10 +260,14 @@ def create_app(config, auto_collect=True):
             for row in sources:
                 if row.get("status") == "running":
                     row["status"] = "interrupted"
+        recent_jobs = jobs.list(limit=30) if queue_enabled else []
+        completed_job = next((job for job in recent_jobs if job["status"] in {"succeeded", "failed"}), None)
         return {
             "stats": store.stats(), "running": running, "staging": ingress.stats(),
             "current_sources": (sorted(engine.current_sources) or [row["name"] for row in sources if row.get("status") == "running"]) if running else [], "sources": sources,
-            "last_result": engine.last_result, "error": engine.last_error,
+            "last_result": completed_job.get("result") if completed_job else engine.last_result,
+            "error": completed_job.get("error", "") if completed_job else engine.last_error,
+            "queue_enabled": queue_enabled,
             "config": {key: config[key] for key in ("concurrency", "per_host", "interval_minutes", "crawl_pages", "crawl_batch", "sources", "sbom_max_mb", "events_max_rows", "events_retention_days", "source_intervals", "public_source_batch", "public_source_records")}
         }
 
@@ -477,9 +499,12 @@ def create_app(config, auto_collect=True):
 
     @app.post("/api/collect")
     async def collect(request: CollectRequest):
-        names = request.sources if request.sources is not None else engine.enabled()
+        names = sorted(set(request.sources if request.sources is not None else engine.enabled()))
         if set(names) - set(config["sources"]):
             raise HTTPException(400, "Unknown collector name")
+        if queue_enabled:
+            from .queue_api import enqueue_job
+            return await enqueue_job(jobs, "collect", {"sources": names}, request.idempotency_key)
         if engine.busy() or any(not task.done() and task.get_name() == "manual-collection" for task in tasks):
             return {"running": True, "queued": False}
         task = asyncio.create_task(engine.run(names), name="manual-collection")

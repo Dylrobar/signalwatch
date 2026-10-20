@@ -594,11 +594,14 @@ class Collector:
         return result.graph(host, source_url)
 
     async def _crawl(self, target):
+        manage_queue = target.get("_manage_queue", True)
         seed = canonical_url(target["url"])
         if not seed:
-            await to_thread(self.store.finish_url, target["url"], error="Invalid HTTP URL")
+            if manage_queue:
+                await to_thread(self.store.finish_url, target["url"], error="Invalid HTTP URL")
             return {"pages": 0, "observations": 0, "error": "Invalid HTTP URL"}
         asset_id, host = asset_identity(seed)
+        touched_assets = {asset_id}
         queue = [(seed, 0)]
         seen = set()
         pages = 0
@@ -640,6 +643,7 @@ class Collector:
                 batch = {"observations": observations, "observation_pages": [], "entities": [], "edges": []}
                 for page in sorted(set([*visited, final_url])):
                     page_asset_id, page_host = asset_identity(page)
+                    touched_assets.add(page_asset_id)
                     # A redirect is also a replacement of any previous evidence
                     # at that URL. Only the actual response host gets findings.
                     evidence = _web_evidence_entity(page, findings if page == final_url else [], timestamp)
@@ -672,10 +676,13 @@ class Collector:
             except Exception as error:
                 errors.append(str(error))
         error = "; ".join(dict.fromkeys(errors))[:2000] if errors else None
-        await to_thread(self.store.finish_url, target["url"], error=error)
-        return {"pages": pages, "observations": observed, "fingerprints": fingerprint_count, "error": error}
+        if manage_queue:
+            await to_thread(self.store.finish_url, target["url"], error=error)
+        return {"pages": pages, "observations": observed, "fingerprints": fingerprint_count,
+                "asset_ids": sorted(touched_assets), "error": error}
 
-    async def collect_web(self):
+    async def collect_web(self, *, targets=None):
+        scoped = targets is not None
         self.robot_errors.clear()
         self.dns_errors.clear()
         self.dns_results.clear()
@@ -683,13 +690,15 @@ class Collector:
         self.web_catalog_diagnostics = []
         if self.config.get("web_fingerprint_catalog", True):
             self.web_catalog, self.web_catalog_diagnostics = await load_catalog(self.http, self.config["cache_dir"])
-        for url in self.config.get("seed_urls", []):
-            url = canonical_url(url)
-            if url:
-                await to_thread(self._enqueue, url, source_url=url)
-        candidates = await to_thread(self.store.company_crawl_candidates,
-                                            [target.get("domain") for target in self.config.get("source_targets", [])],
-                                            int(self.config["crawl_batch"]))
+        candidates = []
+        if not scoped:
+            for url in self.config.get("seed_urls", []):
+                url = canonical_url(url)
+                if url:
+                    await to_thread(self._enqueue, url, source_url=url)
+            candidates = await to_thread(self.store.company_crawl_candidates,
+                                                [target.get("domain") for target in self.config.get("source_targets", [])],
+                                                int(self.config["crawl_batch"]))
         discovered = 0
         scope_edges = []
         scope_domains = {}
@@ -705,7 +714,17 @@ class Collector:
                                     "observed_at": candidate["observed_at"], "confidence": 1.0})
         if scope_edges:
             await self.emit({"entities": list(scope_domains.values()), "edges": scope_edges})
-        targets = await to_thread(self.store.crawl_targets, int(self.config["crawl_batch"]), float(self.config["crawl_interval_hours"]))
+        if scoped:
+            if not isinstance(targets, (list, tuple)) or len(targets) > min(100, int(self.config["crawl_batch"])):
+                raise ValueError("Explicit web targets exceed the configured collection batch")
+            selected = []
+            for target in targets:
+                if not isinstance(target, dict) or not isinstance(target.get("url"), str) or not canonical_url(target["url"]):
+                    raise ValueError("Explicit web targets require valid HTTP(S) URLs")
+                selected.append({**target, "_manage_queue": False})
+            targets = selected
+        else:
+            targets = await to_thread(self.store.crawl_targets, int(self.config["crawl_batch"]), float(self.config["crawl_interval_hours"]))
         semaphore = asyncio.Semaphore(int(self.config["concurrency"]))
         async def crawl(target):
             async with semaphore:
@@ -716,6 +735,7 @@ class Collector:
             raise RuntimeError("All crawl targets failed: " + "; ".join(errors)[:2000])
         dns_errors = [message for host in sorted(self.dns_errors) for message in self.dns_errors[host]]
         return {"targets": len(targets), "pages": sum(row["pages"] for row in results), "observations": sum(row["observations"] for row in results),
+                "asset_ids": sorted({asset_id for row in results for asset_id in row.get("asset_ids", [])}),
                 "fingerprints": sum(row.get("fingerprints", 0) for row in results),
                 "fingerprint_catalog": {"enabled": bool(self.config.get("web_fingerprint_catalog", True)),
                                         "loaded": self.web_catalog is not None,
