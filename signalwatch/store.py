@@ -274,6 +274,8 @@ class Store:
             conn.executescript(WIRELESS_SCHEMA)
             conn.executescript(ATTRIBUTION_SCHEMA)
             conn.executescript(TECHNOGRAPHIC_SCHEMA)
+            from .technographic_store import ensure_schema as ensure_technographic_schema
+            ensure_technographic_schema(conn)
             if "superseded_by" not in {row[1] for row in conn.execute("PRAGMA table_info(raw_ingress)")}:
                 conn.execute("ALTER TABLE raw_ingress ADD COLUMN superseded_by INTEGER")
             if not had_advisory_seen:

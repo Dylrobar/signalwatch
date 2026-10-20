@@ -73,7 +73,9 @@ async def stage_payload(config, store, payload, *, provider, source_url="", cont
 
 def definitions():
     rows = [{"id": name, "name": label, "category": category, "family": name, "access": "native",
-             "description": "TCP quick (top 1000), full (all ports), or service_version scans over explicit targets" if name == "nmap" else "Existing native collector",
+             "description": ("TCP quick (top 1000), full (all ports), or service_version scans over explicit targets" if name == "nmap"
+                             else "HTTP technology signatures, versions, cookie names, page metadata and CSP integration hints on queued websites" if name == "web"
+                             else "Existing native collector"),
              "homepage": homepage, "required": ["Scan targets"] if name == "nmap" else []}
             for name, label, category, homepage in NATIVE]
     for module, _ in EXTENSIONS.values():

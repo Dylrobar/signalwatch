@@ -179,7 +179,7 @@ def verify_batch(batch, config, store):
     for entity in batch.get("entities", []):
         try:
             document = document_input(entity)
-            if document is None or document["source_type"] == "dns_txt":
+            if document is None or document["source_type"] in {"dns_txt", "http_fingerprint"}:
                 continue
             content_hash = document["content_hash"]
             context = document["organization_context"]

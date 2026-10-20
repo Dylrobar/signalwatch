@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import hashlib
 import io
 import itertools
 import json
@@ -16,8 +17,11 @@ import ijson
 from bs4 import BeautifulSoup
 
 from .async_utils import gather, to_thread
-from .extract import canonical_url, fingerprint_page, open_payload, parse_feed, parse_nvd, product_entities, read_json, utcnow
+from .companies import asset_identity
+from .extract import canonical_url, open_payload, parse_feed, parse_nvd, product_entities, read_json, utcnow
 from .http import HTTPError, PublicHTTP, PublicRequestError, display_url
+from .web_fingerprints import analyze_http_response
+from .web_fingerprint_catalog import load_catalog
 
 
 NVD_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0/nvdcve-2.0-"
@@ -26,6 +30,62 @@ KEV_MIRROR_URL = "https://raw.githubusercontent.com/cisagov/kev-data/develop/kno
 EPSS_URL = "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
 GITHUB_URL = "https://api.github.com/advisories"
 WIKIDATA_URL = "https://query.wikidata.org/sparql"
+WEB_RESPONSE_BYTES = 1024 * 1024
+WEB_HTML_SAMPLE_BYTES = 250 * 1024
+
+
+def _html_sample(path):
+    with path.open("rb") as stream:
+        return stream.read(WEB_HTML_SAMPLE_BYTES).decode("utf-8", errors="replace")
+
+
+def _web_fingerprints(url, headers, html, cookie_names=(), catalog=None):
+    """Keep direct product observations separate from integration/inference labels."""
+    findings = analyze_http_response(url, headers, html, cookie_names=cookie_names)
+    diagnostics = []
+    if catalog is not None:
+        catalog_findings, diagnostics = catalog.match(url, headers, html, cookie_names=cookie_names)
+        curated = {(finding["product_name"].casefold(), finding["status"]) for finding in findings}
+        findings.extend(finding for finding in catalog_findings
+                        if (finding["product_name"].casefold(), finding["status"]) not in curated)
+        direct_names = {finding["product_name"].casefold() for finding in findings if finding["status"] == "http_detected"}
+        findings = [finding for finding in findings if finding["status"] != "implied_dependency"
+                    or finding["product_name"].casefold() not in direct_names]
+    if len(findings) > 100:
+        diagnostics.append("Combined web fingerprint findings capped at 100 per response.")
+        findings = findings[:100]
+    asset_id, _ = asset_identity(url)
+    observed_at = utcnow()
+    direct = [
+        {**finding, "asset_id": asset_id, "source_url": url,
+         "evidence": finding["evidence_snippet"], "observed_at": observed_at}
+        for finding in findings if finding["status"] == "http_detected" and finding.get("cpe")
+    ]
+    # Keep the historical nginx vendor alias used by older NVD records. The
+    # curated parser is authoritative for actual evidence and safe snippets.
+    for observation in list(direct):
+        if observation["vendor"] == "f5" and observation["product"] == "nginx":
+            direct.append({**observation, "vendor": "nginx",
+                           "cpe": observation["cpe"].replace(":f5:nginx:", ":nginx:nginx:", 1)})
+    observations = {}
+    for observation in direct:
+        part = observation.get("part") or "a"
+        key = observation["vendor"], observation["product"], part
+        previous = observations.get(key)
+        rank = bool(observation.get("version")), observation.get("confidence", 0)
+        if previous and rank < (bool(previous.get("version")), previous.get("confidence", 0)):
+            continue
+        observations[key] = {**observation, "asset_id": asset_id, "part": part, "origin": "web"}
+    return findings, list(observations.values()), diagnostics
+
+
+def _web_evidence_entity(url, findings, observed_at):
+    _, host = asset_identity(url)
+    return {"id": "web_fingerprint:" + hashlib.sha256(url.encode()).hexdigest(),
+            "kind": "web_fingerprint", "name": "HTTP technology evidence: " + host,
+            "value": url, "source_url": url, "observed_at": observed_at, "confidence": 1.0,
+            "metadata": {"provider": "http_fingerprint", "company_context": {"domain": host},
+                         "fingerprints": findings}}
 
 
 def parse_github(item):
@@ -108,6 +168,8 @@ class Collector:
         self.discovered_hosts = set()
         self.nvd_next_request = 0
         self.discovery_dirty = 0
+        self.web_catalog = None
+        self.web_catalog_diagnostics = []
 
     async def __aenter__(self):
         await self.http.__aenter__()
@@ -536,15 +598,16 @@ class Collector:
         if not seed:
             await to_thread(self.store.finish_url, target["url"], error="Invalid HTTP URL")
             return {"pages": 0, "observations": 0, "error": "Invalid HTTP URL"}
-        host = urlsplit(seed).hostname
+        asset_id, host = asset_identity(seed)
         queue = [(seed, 0)]
         seen = set()
         pages = 0
         observed = 0
+        fingerprint_count = 0
         errors = []
         max_pages = int(self.config["crawl_pages"])
         max_depth = int(self.config.get("crawl_depth", 1))
-        domain = {"id": f"domain:{host}", "kind": "domain", "name": host, "value": host, "metadata": {}, "source_url": target.get("source_url") or seed, "observed_at": utcnow(), "confidence": 1.0}
+        domain = {"id": asset_id, "kind": "domain", "name": host, "value": host, "metadata": {}, "source_url": target.get("source_url") or seed, "observed_at": utcnow(), "confidence": 1.0}
         ips, edges = await self._resolve(host, seed)
         await self.emit({"entities": [domain, *ips], "edges": edges})
         while queue and pages < max_pages:
@@ -557,7 +620,7 @@ class Collector:
                 for redirect in range(6):
                     if not await self._can_fetch(url):
                         raise ValueError(f"robots.txt disallows {display_url(url)}")
-                    response = await self.http.get(url, allow_redirects=False)
+                    response = await self.http.get(url, allow_redirects=False, max_bytes=WEB_RESPONSE_BYTES)
                     if response.status not in (301, 302, 303, 307, 308):
                         break
                     url = canonical_url(urljoin(url, response.headers.get("Location", "")))
@@ -567,22 +630,35 @@ class Collector:
                 else:
                     raise ValueError("Too many HTTP redirects")
                 content_type = response.headers.get("Content-Type", "").lower()
-                if content_type and not any(kind in content_type for kind in ("text/html", "application/xhtml")):
-                    continue
+                is_html = not content_type or any(kind in content_type for kind in ("text/html", "application/xhtml"))
                 final_url = canonical_url(response.url)
-                final_host = urlsplit(final_url).hostname
-                html = await asyncio.to_thread(response.path.read_text, encoding="utf-8", errors="replace")
-                observations = await asyncio.to_thread(fingerprint_page, final_url, html, response.headers)
-                for observation in observations:
-                    observation["origin"] = "web"
-                batch = {"observations": observations, "observation_pages": [{"asset_id": f"domain:{urlsplit(page).hostname}", "source_url": page} for page in sorted(set([*visited, final_url]))]}
-                if final_host != host:
-                    batch["entities"] = [{"id": f"domain:{final_host}", "kind": "domain", "name": final_host, "value": final_host, "metadata": {}, "source_url": url, "observed_at": utcnow(), "confidence": 1.0}]
-                    batch["edges"] = [{"from_id": f"domain:{host}", "to_id": f"domain:{final_host}", "relation": "redirects_to", "source_url": url, "observed_at": utcnow(), "confidence": 1.0}]
+                final_asset_id, final_host = asset_identity(final_url)
+                html = await asyncio.to_thread(_html_sample, response.path) if is_html else ""
+                findings, observations, diagnostics = await asyncio.to_thread(_web_fingerprints, final_url, response.headers, html, getattr(response, "cookie_names", ()), self.web_catalog)
+                self.web_catalog_diagnostics = list(dict.fromkeys([*self.web_catalog_diagnostics, *diagnostics]))[:20]
+                timestamp = utcnow()
+                batch = {"observations": observations, "observation_pages": [], "entities": [], "edges": []}
+                for page in sorted(set([*visited, final_url])):
+                    page_asset_id, page_host = asset_identity(page)
+                    # A redirect is also a replacement of any previous evidence
+                    # at that URL. Only the actual response host gets findings.
+                    evidence = _web_evidence_entity(page, findings if page == final_url else [], timestamp)
+                    batch["observation_pages"].append({"asset_id": page_asset_id, "source_url": page})
+                    batch["entities"].extend([
+                        {"id": page_asset_id, "kind": "domain", "name": page_host, "value": page_host,
+                         "metadata": {}, "source_url": page, "observed_at": timestamp, "confidence": 1.0},
+                        evidence,
+                    ])
+                    batch["edges"].append({"from_id": page_asset_id, "to_id": evidence["id"],
+                                           "relation": "has_public_evidence", "source_url": page,
+                                           "observed_at": timestamp, "confidence": 1.0})
+                if final_asset_id != asset_id:
+                    batch["edges"].append({"from_id": asset_id, "to_id": final_asset_id, "relation": "redirects_to", "source_url": url, "observed_at": timestamp, "confidence": 1.0})
                 await self.emit(batch)
                 pages += 1
                 observed += len(observations)
-                if depth < max_depth:
+                fingerprint_count += len(findings)
+                if is_html and depth < max_depth:
                     soup = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
                     links = []
                     for link in soup.find_all("a", href=True, limit=1000):
@@ -597,12 +673,16 @@ class Collector:
                 errors.append(str(error))
         error = "; ".join(dict.fromkeys(errors))[:2000] if errors else None
         await to_thread(self.store.finish_url, target["url"], error=error)
-        return {"pages": pages, "observations": observed, "error": error}
+        return {"pages": pages, "observations": observed, "fingerprints": fingerprint_count, "error": error}
 
     async def collect_web(self):
         self.robot_errors.clear()
         self.dns_errors.clear()
         self.dns_results.clear()
+        self.web_catalog = None
+        self.web_catalog_diagnostics = []
+        if self.config.get("web_fingerprint_catalog", True):
+            self.web_catalog, self.web_catalog_diagnostics = await load_catalog(self.http, self.config["cache_dir"])
         for url in self.config.get("seed_urls", []):
             url = canonical_url(url)
             if url:
@@ -636,6 +716,11 @@ class Collector:
             raise RuntimeError("All crawl targets failed: " + "; ".join(errors)[:2000])
         dns_errors = [message for host in sorted(self.dns_errors) for message in self.dns_errors[host]]
         return {"targets": len(targets), "pages": sum(row["pages"] for row in results), "observations": sum(row["observations"] for row in results),
+                "fingerprints": sum(row.get("fingerprints", 0) for row in results),
+                "fingerprint_catalog": {"enabled": bool(self.config.get("web_fingerprint_catalog", True)),
+                                        "loaded": self.web_catalog is not None,
+                                        **(self.web_catalog.metadata if self.web_catalog is not None else {}),
+                                        "diagnostics": list(dict.fromkeys(self.web_catalog_diagnostics))[:20]},
                 "company_hosts_considered": len(candidates), "company_hosts_queued": discovered,
                 "dns_hosts": len(self.dns_results), "dns_records": sum(record["type"] in {"A", "AAAA"} for result in self.dns_results.values() for record in result.records),
                 "dns_failed": len(self.dns_errors), "dns_fallbacks": sum(result.mode == "doh" and bool(result.system_error) for result in self.dns_results.values()), "errors": [*errors, *dns_errors]}
