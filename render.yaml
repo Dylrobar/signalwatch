@@ -16,6 +16,8 @@ services:
       mountPath: /data
       sizeGB: 50
     envVars:
+      - key: TMPDIR
+        value: /data
       - key: WEB_CONCURRENCY
         value: "1"
       - key: SIGNALWATCH_CONFIG

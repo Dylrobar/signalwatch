@@ -7,6 +7,8 @@ import signal
 import subprocess
 import sys
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -16,6 +18,46 @@ from .config import load_config
 
 log = logging.getLogger("signalwatch.runtime")
 SHUTDOWN_SECONDS = 20
+
+
+@contextmanager
+def _migration_listener(host, port):
+    """Bind the deployment port while keeping every application route unavailable."""
+    class MaintenanceHandler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(2)
+
+        def respond(self):
+            body = b'{"service":"SignalWatch","status":"migrating","ready":false}'
+            self.send_response(503)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Retry-After', '30')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+            self.close_connection = True
+
+        do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = respond
+
+        def log_message(self, *_args):
+            # Request paths and headers can contain secrets; this listener has
+            # no application routes and deliberately logs neither.
+            pass
+
+    server = ThreadingHTTPServer((host, port), MaintenanceHandler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+    thread.start()
+    log.info('Migration maintenance listener started; application readiness remains HTTP 503')
+    try:
+        yield server.server_address
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
 
 
 def _enabled(value, *, default=True):
@@ -140,7 +182,8 @@ def run(config_path, *, host=None, port=None, no_collect=False):
             if not source or not str(config["db"]).startswith(("postgres://", "postgresql://")):
                 raise ValueError("SQLite migration requires an original SQLite db in config and SIGNALWATCH_DATABASE_URL")
             log.info("Verifying SQLite snapshot and PostgreSQL migration before starting application processes")
-            manifest = migrate_sqlite(source, config["db"])
+            with _migration_listener(host or config['host'], port if port is not None else config['port']):
+                manifest = migrate_sqlite(source, config["db"])
             log.info("PostgreSQL migration verified: %s rows across %s tables; already_migrated=%s",
                      manifest["total_rows"], len(manifest["tables"]), manifest["already_migrated"])
         if not env.get("CELERY_BROKER_URL", "").strip():
