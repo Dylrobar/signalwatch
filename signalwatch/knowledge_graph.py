@@ -379,7 +379,9 @@ class KnowledgeGraph:
                 selection = 'asset_id IN (' + ','.join('?' for _ in ids) + ')' if ids else '0=1'
                 where = '(' + selection + ') AND ' + self.active_alert_filter()
                 total+=conn.execute('SELECT count(*) FROM alerts WHERE '+where,ids).fetchone()[0]
-                priority_order = """EXISTS (SELECT 1 FROM exposure_verifications v JOIN company_asset_decisions d
+                priority_order = """EXISTS (SELECT 1 FROM analyst_reviews r WHERE r.subject_id=alerts.id AND r.company_id=?
+                  AND r.state IN ('not_applicable','remediated','accepted_risk') AND (r.review_due_at IS NULL OR r.review_due_at>?)) ASC,
+                  EXISTS (SELECT 1 FROM exposure_verifications v JOIN company_asset_decisions d
                   ON d.company_id=v.company_id AND d.asset_id=alerts.asset_id
                   WHERE v.subject_id=alerts.id AND v.company_id=? AND v.version=alerts.version
                   AND v.source_url=alerts.source_url AND v.alert_first_seen=alerts.first_seen AND v.expires_at>? AND d.status='confirmed' AND d.role='owned') DESC,
@@ -387,7 +389,7 @@ class KnowledgeGraph:
                   AND d.status='confirmed' AND d.role='owned') DESC,
                   (coalesce(severity,0)+(CASE WHEN kev=1 THEN 8 ELSE 0 END)+coalesce(epss,0)*6) DESC,id"""
                 rows=conn.execute('SELECT * FROM alerts WHERE '+where+' ORDER BY '+priority_order+' LIMIT ?',
-                                  (*ids,cid,datetime.now(timezone.utc).isoformat(),cid,limit+1)).fetchall()
+                                  (*ids,cid,datetime.now(timezone.utc).isoformat(),cid,datetime.now(timezone.utc).isoformat(),cid,limit+1)).fetchall()
                 truncated |= len(rows)>limit
                 by_id={a['id']:a for a in included}
                 for row in rows[:limit]:

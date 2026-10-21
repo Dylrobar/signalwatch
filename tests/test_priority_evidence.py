@@ -72,6 +72,19 @@ class VerifiedPriorityTests(unittest.TestCase):
         self.store.reconcile()
         self.assertLess(KnowledgeGraph(self.store).company_risk(company)['score'], 85)
 
+    def test_reviewed_not_applicable_is_retained_without_active_priority_until_review_due(self):
+        company, _, warning = self.fixture()
+        payload = {'subject_id': warning, 'company_id': company, 'state': 'not_applicable',
+                   'reason': 'Required runtime component is disabled; configuration evidence reviewed', 'expected_revision': 0}
+        self.assertEqual(self.client.post('/api/reviews', json=payload).status_code, 200)
+        risk = KnowledgeGraph(self.store).company_risk(company)['items'][0]['risk']
+        self.assertEqual(risk['score'], 0)
+        self.assertEqual(risk['tier'], 'reviewed_context')
+        self.assertIn('component is disabled', risk['why_this_matters'])
+        with self.store.connection(write=True) as conn:
+            conn.execute("UPDATE analyst_reviews SET review_due_at='2000-01-01T00:00:00+00:00'")
+        self.assertGreater(KnowledgeGraph(self.store).company_risk(company)['score'], 0)
+
     def test_review_transition_revokes_verification(self):
         company, _, warning = self.fixture()
         self.assertEqual(self.client.post('/api/reviews', json=self.payload(company, warning)).status_code, 200)

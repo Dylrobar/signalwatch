@@ -8,6 +8,10 @@ def assess_priority(conn, alert, company_id='', owned=False):
     if isinstance(assessment, str):
         assessment = json.loads(assessment)
     exposure = assessment.get('exposure', {})
+    review = conn.execute('SELECT state,reason,review_due_at FROM analyst_reviews WHERE subject_id=? AND company_id=?',
+                          (alert['id'], company_id)).fetchone() if company_id else None
+    reviewed = bool(review and review['state'] in {'not_applicable', 'remediated', 'accepted_risk'}
+                    and (not review['review_due_at'] or review['review_due_at'] > datetime.now(timezone.utc).isoformat()))
     verification = conn.execute('SELECT * FROM exposure_verifications WHERE subject_id=? AND company_id=?',
                                 (alert['id'], company_id)).fetchone() if company_id and owned else None
     confirmed = bool(verification and verification['version'] == alert['version']
@@ -17,10 +21,10 @@ def assess_priority(conn, alert, company_id='', owned=False):
                      and not assessment.get('evidence', {}).get('contradicting')
                      and assessment.get('applicability', {}).get('state') != 'false')
     supported = alert['version_state'] in ('exact', 'affected_range')
-    confirmed &= supported
+    confirmed &= supported and not reviewed
     # Nonoverlapping tiers prevent a popular unverified CVE outranking a verified exposure.
-    tier = 'confirmed_exposure' if confirmed else 'owned_version_candidate' if owned and supported else 'version_candidate' if supported else 'inventory_context'
-    base, ceiling = {'confirmed_exposure': (85, 100), 'owned_version_candidate': (50, 79),
+    tier = 'reviewed_context' if reviewed else 'confirmed_exposure' if confirmed else 'owned_version_candidate' if owned and supported else 'version_candidate' if supported else 'inventory_context'
+    base, ceiling = {'reviewed_context': (0, 0), 'confirmed_exposure': (85, 100), 'owned_version_candidate': (50, 79),
                      'version_candidate': (20, 49), 'inventory_context': (0, 19)}[tier]
     severity = max(0, min(10, float(alert.get('severity') or 0)))
     epss = max(0, min(1, float(alert.get('epss') or 0)))
@@ -44,6 +48,9 @@ def assess_priority(conn, alert, company_id='', owned=False):
     if confirmed:
         steps.append(verification['remediation'])
     steps += ['Apply the vendor-supported fixed release or mitigation from the linked advisory, then re-inventory this asset and verify the vulnerable path is removed.']
+    if reviewed:
+        why = 'Analyst disposition: ' + review['state'] + '. ' + review['reason']
+        steps = ['Retained for audit; not active remediation priority. Revalidate the decision by ' + (review['review_due_at'] or 'the next scheduled analyst review') + '.']
     return {'score': score, 'status': tier, 'tier': tier,
             'drivers': {'cvss': alert.get('severity'), 'kev': bool(alert.get('kev')), 'epss': alert.get('epss'),
                         'version_state': alert['version_state'], 'version_uncertain': not supported,

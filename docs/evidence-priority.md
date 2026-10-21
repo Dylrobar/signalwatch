@@ -30,9 +30,12 @@ Priority is a triage ordering, not an exploitation probability:
 | Affected-version candidate on explicitly confirmed owned asset | 50–79 |
 | Affected-version candidate without confirmed ownership | 20–49 |
 | Inventory context (no warning generated) | 0–19 |
+| Current not-applicable, remediated or accepted-risk analyst disposition | 0 |
 
 Within each band: base + CVSS (0–10) + KEV (8) + EPSS × 6, capped at
 that band's ceiling. A KEV listing alone never invokes an 85-point floor.
+Current analyst dispositions remain visible for audit at score zero until their
+review-due date; expired decisions return to candidate triage.
 Linked reporting stays searchable evidence and adds zero points. Removing its
 per-alert COUNT DISTINCT query also removes an expensive polling amplification.
 Company shortlists order verification and ownership before CVE signals, then
