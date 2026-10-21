@@ -160,9 +160,9 @@ class RemoteApiTests(unittest.TestCase):
         for changed in ({"Origin": "https://signalwatch.example.attacker.test"}, {"Access-Control-Request-Method": "DELETE"}, {"Access-Control-Request-Headers": "X-Not-Allowed"}):
             with self.subTest(changed=changed):
                 status, _, _ = self.server.request("/api/import/sbom", headers={**headers, **changed}, method="OPTIONS")
-                self.assertEqual(status, 400)
+                self.assertEqual(status, 403)
         status, response_headers, _ = self.server.request("/api/status", headers={**self.headers(), "Origin": "https://file.example"})
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 403)
         self.assertNotIn("Access-Control-Allow-Origin", response_headers)
 
     def test_authorized_client_errors_keep_cors_headers(self):

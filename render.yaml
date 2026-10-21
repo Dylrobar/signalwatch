@@ -16,6 +16,9 @@ services:
       mountPath: /data
       sizeGB: 50
     envVars:
+      # Preview patterns are HTTPS only; add exact custom domains separated by commas.
+      - key: SIGNALWATCH_CORS_ORIGINS
+        value: "https://*.lovable.app,https://*.lovableproject.com"
       - key: WEB_CONCURRENCY
         value: "1"
       - key: SIGNALWATCH_CONFIG

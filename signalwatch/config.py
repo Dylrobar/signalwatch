@@ -2,10 +2,11 @@ import json
 import math
 import os
 from pathlib import Path
+from .cors import PREVIEW_ORIGINS
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.20.8"
+VERSION = "0.20.9"
 
 
 DEFAULTS = {
@@ -179,8 +180,15 @@ def load_config(path="config.json"):
         raise ValueError("api_token must be a string")
     if not isinstance(config["cors_origins"], list):
         raise ValueError("cors_origins must be an array of exact HTTP(S) origins")
+    if "PORT" in os.environ:
+        config["port"] = int(os.environ["PORT"])
+        if not 1 <= config["port"] <= 65535:
+            raise ValueError("PORT must be between 1 and 65535")
     origins = []
     for origin in config["cors_origins"]:
+        if isinstance(origin, str) and origin.strip().lower() in PREVIEW_ORIGINS:
+            origins.append(origin.strip().lower())
+            continue
         if not isinstance(origin, str) or "*" in origin:
             raise ValueError("cors_origins must contain exact HTTP(S) origins without wildcards")
         parsed = urlsplit(origin.strip())

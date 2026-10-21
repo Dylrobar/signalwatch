@@ -14,7 +14,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
+from .cors import SignalWatchCORS as CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -251,7 +251,7 @@ def create_app(config, auto_collect=True):
         if path == "/api" or path.startswith("/api/"):
             actor = await asyncio.to_thread(access.authenticate, request.headers.get("authorization", ""))
             if actor is None:
-                return JSONResponse({"detail": "Bearer authentication required"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+                return JSONResponse({"error": "authentication_required", "detail": "Bearer authentication required"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
             if not access.allowed(actor, request.method, path.rstrip("/")):
                 return JSONResponse({"detail": "This credential does not have permission for this action"}, status_code=403)
             request.state.actor = actor
