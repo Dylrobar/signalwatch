@@ -61,6 +61,8 @@ def version_match(observed, affected):
     observed = str(observed or "").strip()
     if not observed or observed in {"*", "-", "unknown"}:
         return True, "unknown", "Observed version is unknown."
+    if "cve_versions" in affected:
+        return cve_version_match(observed, affected)
     if affected.get("version_unverified"):
         return True, "version_unverified", "Native version/status rules require verification before affected versions can be established."
     version = str(affected.get("version") or cpe_fields(affected.get("criteria")).get("version") or "*")
@@ -190,6 +192,18 @@ def osv_version_match(observed, affected):
 
 
 def github_version_match(observed, affected):
+    expression = str(affected.get("version_range") or "")
+    if "||" in expression:
+        alternatives = expression.split("||")
+        if len(alternatives) > 32 or any(not part.strip() for part in alternatives):
+            return True, "version_unverified", "GitHub alternative version ranges are incomplete or exceed the evaluation limit."
+        results = [github_version_match(observed, {**affected, "version_range": part}) for part in alternatives]
+        verified = next((result for result in results if result[0] and result[1] == "affected_range"), None)
+        if verified:
+            return verified
+        if any(result[0] for result in results):
+            return True, "version_unverified", "A GitHub alternative range requires ecosystem-specific verification."
+        return False, "unaffected", "Observed package version falls outside every GitHub affected range."
     ecosystem = ecosystem_identity(affected.get("ecosystem"))
     observed = str(observed or "").strip()
     if ecosystem not in {"pypi", "npm", "crates.io", "go"}:
@@ -222,3 +236,83 @@ def github_version_match(observed, affected):
     if not all(evaluated):
         return False, "unaffected", "Observed package version falls outside GitHub's affected range."
     return True, "affected_range", "Observed package version matches GitHub's affected range."
+
+
+def cve_version_match(observed, affected):
+    """Evaluate CVE JSON 5 statuses without guessing ecosystem version order."""
+    unverified = (True, "version_unverified", "Native CVE version rules are unsupported, incomplete, or conflicting; verify the installed version.")
+    versions = affected.get("cve_versions")
+    if not isinstance(versions, list) or len(versions) > 256:
+        return unverified
+    results, uncertain = [], False
+    for rule in versions:
+        if not isinstance(rule, dict) or not isinstance(rule.get("status"), str) or rule.get("status") not in {"affected", "unaffected", "unknown"}:
+            uncertain = True
+            continue
+        lower_text = rule.get("version")
+        if not isinstance(lower_text, str) or not lower_text:
+            uncertain = True
+            continue
+        bounds = [key for key in ("lessThan", "lessThanOrEqual") if key in rule]
+        changes = rule.get("changes", [])
+        if len(bounds) > 1 or not isinstance(changes, list) or len(changes) > 256 or (changes and not bounds):
+            uncertain = True
+            continue
+        version_type = rule.get("versionType")
+        compare = {"semver": semver, "python": pep440}.get(version_type) if isinstance(version_type, str) else None
+        if not bounds and observed == lower_text and not any(char in lower_text for char in "*?"):
+            results.append((rule["status"], "exact"))
+            continue
+        if compare is None:
+            uncertain = True
+            continue
+        current, lower = compare(observed), compare(lower_text)
+        if current is None or lower is None:
+            uncertain = True
+            continue
+        if not bounds:
+            if current == lower:
+                results.append((rule["status"], "exact"))
+            continue
+        upper_text = rule[bounds[0]]
+        upper = None if upper_text == "*" else compare(upper_text)
+        if (upper is None and upper_text != "*") or (upper is not None and
+                (upper < lower or (upper == lower and bounds[0] == "lessThan"))):
+            uncertain = True
+            continue
+        transitions = []
+        valid = True
+        for change in changes:
+            if not isinstance(change, dict) or not isinstance(change.get("status"), str) or change.get("status") not in {"affected", "unaffected", "unknown"}:
+                valid = False
+                break
+            at = compare(change.get("at"))
+            if at is None or at < lower or (upper is not None and
+                    (at > upper or (at == upper and bounds[0] == "lessThan"))):
+                valid = False
+                break
+            transitions.append((at, change["status"]))
+        transitions.sort(key=lambda item: item[0])
+        if any(a[0] == b[0] and a[1] != b[1] for a, b in zip(transitions, transitions[1:])):
+            valid = False
+        if not valid:
+            uncertain = True
+            continue
+        if current < lower or (upper is not None and
+                (current > upper or (current == upper and bounds[0] == "lessThan"))):
+            continue
+        status = rule["status"]
+        for at, changed_status in transitions:
+            if at <= current:
+                status = changed_status
+        results.append((status, "affected_range"))
+    statuses = {status for status, _ in results}
+    if uncertain or len(statuses) > 1:
+        return unverified
+    status = next(iter(statuses), affected.get("cve_default_status", "unknown"))
+    if status == "unaffected":
+        return False, "unaffected", "CVE published version/status rules identify this version as unaffected."
+    if status != "affected":
+        return unverified
+    state = "exact" if any(kind == "exact" for _, kind in results) else "affected_range"
+    return True, state, "Observed version matches CVE published affected version/status rules."

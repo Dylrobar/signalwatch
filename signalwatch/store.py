@@ -1169,6 +1169,24 @@ class Store:
         with self.connection() as conn:
             return [{"name": row["name"], **json.loads(row["state"])} for row in conn.execute("SELECT * FROM sources ORDER BY name")]
 
+    def nvd_product_targets(self):
+        """Versioned observations with explicit CPE identities, never name guesses."""
+        with self.connection() as conn:
+            rows = conn.execute("""SELECT vendor,product,part,min(cpe) AS cpe FROM observations
+                WHERE cpe IS NOT NULL AND cpe!='' AND part IN ('a','o','h')
+                AND version NOT IN ('','*','-') AND lower(version)!='unknown'
+                GROUP BY vendor,product,part ORDER BY vendor,product,part LIMIT 1000""").fetchall()
+        targets = set()
+        for row in rows:
+            fields = cpe_fields(row["cpe"])
+            if (normalize(fields.get("vendor")), normalize(fields.get("product")), fields.get("part")) != (row["vendor"], row["product"], row["part"]):
+                continue
+            if any(not fields.get(key) or fields[key] == "-" or any(c in fields[key] for c in "*?") for key in ("vendor", "product")):
+                continue
+            tokens = [re.sub(r"([^a-zA-Z0-9_.-])", r"\\\1", fields[key]) for key in ("vendor", "product")]
+            targets.add(":".join(["cpe", "2.3", fields["part"], *tokens, *(["*"] * 8)]))
+        return sorted(targets)
+
     def source_state(self, name):
         with self.connection() as conn:
             row = conn.execute("SELECT state FROM sources WHERE name=?", (name,)).fetchone()

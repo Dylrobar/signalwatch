@@ -68,6 +68,17 @@ class CVEParserTests(unittest.TestCase):
         self.assertEqual(parsed["references"], ["https://vendor.example/advisory", "https://cve.example/reference"])
         self.assertEqual(parsed["severity"], 9.8)
 
+    def test_affected_status_transition_is_not_dropped(self):
+        original = cve_record()
+        product = original["containers"]["cna"]["affected"][0]
+        product["versions"] = [{"version": "1.0.0", "lessThan": "2.0.0", "versionType": "semver", "status": "unaffected",
+                                "changes": [{"at": "1.5.0", "status": "affected"}]}]
+        parsed = parse_cve5(original)
+        self.assertEqual(len(parsed["affected"]), 1)
+        from signalwatch.matching import version_match
+        self.assertFalse(version_match("1.4.0", parsed["affected"][0])[0])
+        self.assertEqual(version_match("1.5.0", parsed["affected"][0])[1], "affected_range")
+
     def test_free_text_product_is_retained_without_fabricated_cpe_match(self):
         original = cve_record()
         product = original["containers"]["cna"]["affected"][0]

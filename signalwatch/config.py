@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.20.5"
+VERSION = "0.20.6"
 
 
 DEFAULTS = {
@@ -30,6 +30,7 @@ DEFAULTS = {
     "interval_minutes": 30,
     "bootstrap_days": 30,
     "nvd_api_key": "",
+    "nvd_inventory_requests": 4,
     "github_token": "",
     "osv_max_records": 500,
     "osv_index_chunk_mb": 1,
@@ -203,6 +204,8 @@ def load_config(path="config.json"):
         if not str(config["db"]).startswith(("postgres://", "postgresql://")):
             config["sqlite_db"] = config["db"]
         config["db"] = database_url
+    if not 0 <= int(config["nvd_inventory_requests"]) <= 20:
+        raise ValueError("nvd_inventory_requests must be between 0 and 20")
     for name in ("concurrency", "per_host", "timeout", "crawl_pages", "crawl_batch", "interval_minutes",
                  "osv_max_records", "osv_index_chunk_mb", "osv_index_chunks", "osv_index_max_chunks", "cve_max_records",
                  "staging_max_records", "staging_batch", "staging_max_completed",
