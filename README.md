@@ -461,3 +461,6 @@ the collection checkpoint. NVD API pages contain at most 200 records and have a
 lookup cursor. Bulk NVD feeds are checked against their published SHA-256 before
 ingestion. Historical inventory lookups rotate by last attempt so a large or failing
 product does not monopolize the per-collection request budget.
+The prefork worker recycles a child after 100 tasks or after a completed task
+exceeds 768 MiB RSS. This releases retained memory between tasks; it is not an
+in-flight hard memory limit and does not replace the bounded ingestion paths.
