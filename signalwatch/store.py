@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 import weakref
 from contextlib import contextmanager, nullcontext
@@ -388,7 +389,11 @@ class Store:
                 self.reconcile(asset_ids=affected, conn=conn)
 
     @contextmanager
-    def connection(self, write=False):
+    def connection(self, write=False, read_timeout=None):
+        from .query_budget import BudgetConnection
+        if read_timeout is not None and (write or read_timeout <= 0):
+            raise ValueError("Read timeout must be positive and cannot apply to writes")
+        deadline = time.monotonic() + read_timeout if read_timeout is not None else None
         if self.is_postgres:
             from .postgres import connect, WRITER_LOCK
             conn = connect(self.path)
@@ -397,10 +402,14 @@ class Store:
                     # Serialize legacy multi-statement read/modify/write flows
                     # across API and worker processes, without disk affinity.
                     conn.raw.execute("SELECT pg_advisory_xact_lock(%s)", (WRITER_LOCK,))
-                yield conn
+                if deadline is not None:
+                    conn.raw.execute("SELECT set_config('statement_timeout', %s, true)", (str(max(1, int(read_timeout * 1000))),))
+                yield BudgetConnection(conn, deadline) if deadline is not None else conn
                 conn.commit()
-            except BaseException:
+            except BaseException as error:
                 conn.rollback()
+                if deadline is not None and isinstance(error, (sqlite3.OperationalError, TimeoutError)) and (time.monotonic() >= deadline or getattr(error.__cause__, 'sqlstate', None) == '57014'):
+                    raise TimeoutError("Intelligence query exceeded its read budget") from error
                 raise
             finally:
                 conn.close()
@@ -417,10 +426,15 @@ class Store:
                 conn.execute("PRAGMA synchronous=NORMAL")
                 if write:
                     conn.execute("BEGIN IMMEDIATE")
-                yield conn
+                if deadline is not None:
+                    conn.execute("PRAGMA busy_timeout=" + str(max(1, int(read_timeout * 1000))))
+                    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                yield BudgetConnection(conn, deadline) if deadline is not None else conn
                 conn.commit()
-            except BaseException:
+            except BaseException as error:
                 conn.rollback()
+                if deadline is not None and isinstance(error, (sqlite3.OperationalError, TimeoutError)) and time.monotonic() >= deadline:
+                    raise TimeoutError("Intelligence query exceeded its read budget") from error
                 raise
             finally:
                 conn.close()
@@ -730,6 +744,9 @@ class Store:
             evidence_index, applicability_cache = EvidenceIndex(conn), {}
             for row in getattr(conn, "stream", conn.execute)(query, values):
                 evaluated += 1
+                if row['vendor'] in {'', '*', '-', 'unknown'} or row['product'] in {'', '*', '-', 'unknown'}:
+                    evidence_index.add(row, False, 'identity_unverified', 'A concrete vendor/ecosystem and product identity are required.')
+                    continue
                 affected = json.loads(row["affected_raw"])
                 matcher = osv_version_match if affected.get("ecosystem") or affected.get("package") else version_match
                 matches, state, reason = matcher(row["version"], affected)
@@ -738,7 +755,7 @@ class Store:
                     continue
                 # Passive product presence or ambiguous banners are inventory
                 # evidence, not enough to open a CVE warning on a remote host.
-                if row["origin"] == "web" and state not in {"exact", "affected_range"}:
+                if row["origin"].startswith("technographic:") or state not in {"exact", "affected_range"}:
                     evidence_index.add(row, True, state, "Inventory context only: " + reason)
                     continue
                 applicability_key = (row["asset_id"], row["source_advisory_id"], row["vendor"], row["product"], row["part"])
@@ -797,6 +814,7 @@ class Store:
                 updates = ",".join(f"{column}=excluded.{column}" for column in columns if column not in {"id", "asset_id", "advisory_id", "first_seen"})
                 sql = "INSERT INTO alerts(" + ",".join(columns) + ") VALUES(" + ",".join("?" for _ in columns) + ") ON CONFLICT(asset_id,advisory_id) DO UPDATE SET " + updates
                 conn.executemany(sql, (tuple(record[column] for column in columns) for record in candidates.values()))
+            conn.execute("DELETE FROM exposure_verifications WHERE subject_id IN (SELECT id FROM alerts WHERE checked_token!=? AND " + scope + ")", (token, *values))
             removed = conn.execute("DELETE FROM alerts WHERE checked_token!=? AND " + scope, (token, *values)).rowcount
             conn.execute("DROP TABLE alert_current")
         return {"evaluated": evaluated, "alerts": len(candidates), "removed": removed, "previous": before}
@@ -959,7 +977,7 @@ class Store:
             raise ValueError("Invalid version state")
         if group_by not in {"", "advisory"}:
             raise ValueError("Invalid alert grouping")
-        filters, values = [], []
+        filters, values = ["a.version_state IN ('exact','affected_range')", "coalesce(e.kind,'')!='company'"], []
         if advisory_id:
             filters.append("a.advisory_id=?")
             values.append(identifier(advisory_id))

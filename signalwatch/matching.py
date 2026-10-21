@@ -82,11 +82,18 @@ def version_match(observed, affected):
             if current is not None and expected is not None:
                 if current != expected:
                     return False, "unaffected", "Observed version differs from the specified affected version."
-                checks += 1
+                if re.fullmatch(r"\d+(?:\.\d+)*", observed) and re.fullmatch(r"\d+(?:\.\d+)*", version) and len(observed.split('.')) != len(version.split('.')):
+                    uncertain = True
+                else:
+                    checks += 1
             else:
                 uncertain = True
     for key, operator in (("versionStartIncluding", "ge"), ("versionStartExcluding", "gt"), ("versionEndIncluding", "le"), ("versionEndExcluding", "lt")):
         if affected.get(key) in (None, ""):
+            continue
+        bound_text = str(affected[key])
+        if re.fullmatch(r"\d+(?:\.\d+)*", observed) and re.fullmatch(r"\d+(?:\.\d+)*", bound_text) and len(observed.split('.')) < len(bound_text.split('.')):
+            uncertain = True
             continue
         bound = comparable(affected[key])
         if current is None or bound is None:

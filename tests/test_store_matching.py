@@ -96,14 +96,11 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.reconcile()["alerts"], 0)
         self.assertEqual(normalize("Edge_Router"), normalize("edge-router"))
 
-    def test_unknown_version_is_potential_and_has_context(self):
-        self.store.ingest({"advisories": [self.advisory(configurations={"nodes": []})], "observations": [self.observation(version=None)]})
+    def test_unknown_version_stays_inventory_without_warning(self):
+        self.store.ingest({"advisories": [self.advisory()], "observations": [self.observation(version=None)]})
         self.store.reconcile()
-        alert = self.store.alerts()["items"][0]
-        self.assertEqual(alert["status"], "potential")
-        self.assertEqual(alert["version_state"], "unknown")
-        self.assertEqual(alert["confidence"], .8)
-        self.assertTrue(any("configuration" in reason for reason in alert["reasons"]))
+        self.assertEqual(self.store.alerts()["items"], [])
+        self.assertEqual(self.store.stats()["observations"], 1)
 
     def test_verified_version_wins_over_higher_confidence_unknown(self):
         self.store.ingest({"advisories": [self.advisory()], "observations": [
@@ -154,14 +151,14 @@ class StoreTests(unittest.TestCase):
 
     def test_alert_groups_paginate_advisories_and_preserve_asset_drilldown(self):
         self.store.ingest({"advisories": [self.advisory(), self.advisory(id="CVE-2025-123456")],
-                           "observations": [self.observation(asset_id="asset:" + str(i), version="1.5" if i == 0 else None)
+                           "observations": [self.observation(asset_id="asset:" + str(i), version="1.5")
                                             for i in range(105)]})
         self.store.reconcile()
         page = self.store.alerts(group_by="advisory", limit=1)
         self.assertEqual(page["total"], 2)
         group = page["items"][0]
         self.assertEqual(group["asset_count"], 105)
-        self.assertEqual(group["version_matched_assets"], 1)
+        self.assertEqual(group["version_matched_assets"], 105)
         self.assertEqual(group["version_state"], "affected_range")
         next_page = self.store.alerts(group_by="advisory", limit=1, offset=1)
         self.assertNotEqual(group["advisory_id"], next_page["items"][0]["advisory_id"])
@@ -169,7 +166,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(detail["total"], 105)
         self.assertTrue(all(row["advisory_id"] == "CVE-2025-12345" for row in detail["items"]))
         filtered = self.store.alerts(group_by="advisory", version_state="affected_range")
-        self.assertTrue(all(row["asset_count"] == 1 for row in filtered["items"]))
+        self.assertTrue(all(row["asset_count"] == 105 for row in filtered["items"]))
         self.assertEqual(self.store.alerts(q="asset:0", group_by="advisory")["items"][0]["asset_count"], 1)
 
     def test_nvd_lookup_targets_require_matching_explicit_cpe_identity(self):
@@ -211,7 +208,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.stats()["observations"], 1)
 
     def test_cpe_part_discrimination(self):
-        self.store.ingest({"advisories": [self.advisory(affected=[{"vendor": "acme", "product": "edge_router", "part": "h"}])], "observations": [self.observation()]})
+        self.store.ingest({"advisories": [self.advisory(affected=[{"vendor": "acme", "product": "edge_router", "part": "h", "version": "1.5"}])], "observations": [self.observation()]})
         self.assertEqual(self.store.reconcile()["alerts"], 0)
         self.store.ingest({"observations": [self.observation(asset_id="device:a", part="h")]})
         self.assertEqual(self.store.reconcile()["alerts"], 1)
@@ -443,22 +440,24 @@ class StoreTests(unittest.TestCase):
         ]
         self.store.ingest({"advisories": records, "observations": observations, "kev": [{"cveID": records[0]["id"]}]})
         self.store.reconcile()
-        self.assertEqual(self.store.alerts()["total"], 4)
-        for state, asset in (("exact", "asset:exact"), ("unknown", "asset:unknown"), ("affected_range", "asset:range"), ("version_unverified", "asset:unverified")):
+        self.assertEqual(self.store.alerts()["total"], 2)
+        self.assertEqual(self.store.alerts(version_state="unknown")["total"], 0)
+        self.assertEqual(self.store.alerts(version_state="version_unverified")["total"], 0)
+        for state, asset in (("exact", "asset:exact"), ("affected_range", "asset:range")):
             matches = self.store.alerts(version_state=state)
             self.assertEqual(matches["total"], 1)
             self.assertEqual(matches["items"][0]["asset_id"], asset)
-        self.assertEqual(self.store.alerts(kev=True)["total"], 2)
+        self.assertEqual(self.store.alerts(kev=True)["total"], 1)
         self.assertEqual(self.store.alerts(kev=True, version_state="exact")["items"][0]["asset_id"], "asset:exact")
         self.assertEqual(self.store.alerts(kev=True, version_state="affected_range")["total"], 0)
         self.assertEqual(self.store.alerts("range", kev=True)["total"], 0)
         with self.store.connection(write=True) as conn:
             conn.execute("UPDATE alerts SET first_seen='2025-01-01T00:00:00Z',last_seen='2025-03-01T00:00:00Z'")
-            conn.execute("UPDATE alerts SET first_seen='2025-02-01T00:00:00Z',last_seen='2025-01-01T00:00:00Z' WHERE asset_id='asset:unverified'")
+            conn.execute("UPDATE alerts SET first_seen='2025-02-01T00:00:00Z',last_seen='2025-01-01T00:00:00Z' WHERE asset_id='asset:range'")
         self.assertTrue(self.store.alerts()["items"][0]["kev"])
-        self.assertEqual(self.store.alerts(sort="newest")["items"][0]["asset_id"], "asset:unverified")
+        self.assertEqual(self.store.alerts(sort="newest")["items"][0]["asset_id"], "asset:range")
         ordered = [item["id"] for item in self.store.alerts(sort="newest")["items"]]
-        pages = [self.store.alerts("", 1, offset, sort="newest")["items"][0]["id"] for offset in range(4)]
+        pages = [self.store.alerts("", 1, offset, sort="newest")["items"][0]["id"] for offset in range(2)]
         self.assertEqual(pages, ordered)
         with self.assertRaises(ValueError):
             self.store.alerts(sort="unknown")

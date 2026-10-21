@@ -23,6 +23,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS raw_idempotency ON raw_ingress(source,stream_k
  WHERE idempotency_key!='';
 CREATE INDEX IF NOT EXISTS raw_available ON raw_ingress(status,available_at,id);
 CREATE INDEX IF NOT EXISTS raw_stream ON raw_ingress(source,stream_key,id,status);
+CREATE INDEX IF NOT EXISTS raw_expired_lease ON raw_ingress(status,lease_until,id);
 CREATE INDEX IF NOT EXISTS raw_completed ON raw_ingress(status,completed_at,id);
 """
 
@@ -194,8 +195,8 @@ class StagingQueue:
             clock = time.time()
             conn.execute("""UPDATE raw_ingress SET status=CASE WHEN attempts>=? THEN 'dead' ELSE 'pending' END,
              available_at=?,lease_until=NULL,lease_token=NULL,error='Worker lease expired'
-             WHERE status='processing' AND lease_until<=?""", (MAX_ATTEMPTS, clock, clock))
-            row = conn.execute("""SELECT r.* FROM raw_ingress r WHERE r.status='pending' AND r.available_at<=?
+             WHERE id IN (SELECT id FROM raw_ingress WHERE status='processing' AND lease_until<=? ORDER BY lease_until,id LIMIT 100)""", (MAX_ATTEMPTS, clock, clock))
+            row = conn.execute("""SELECT r.id FROM raw_ingress r WHERE r.status='pending' AND r.available_at<=?
              AND NOT EXISTS (SELECT 1 FROM raw_ingress earlier WHERE earlier.source=r.source AND earlier.stream_key=r.stream_key
               AND earlier.id<r.id AND earlier.status IN ('pending','processing'))
              AND NOT EXISTS (SELECT 1 FROM raw_ingress active WHERE active.source=r.source AND active.stream_key=r.stream_key

@@ -257,6 +257,8 @@ def create_app(config, auto_collect=True):
             request.state.actor = actor
         try:
             response = await call_next(request)
+            if request.method not in {"GET", "HEAD", "OPTIONS"} and hasattr(app.state, "intelligence_snapshots"):
+                app.state.intelligence_snapshots.clear()
             # Detailed decisions audit in their own transaction. Other actions
             # retain actor and outcome without storing payloads or credentials.
             if path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"} and path not in {"/api/companies/resolve", "/api/companies/preview"}:

@@ -25,7 +25,7 @@ class TechnographicStoreTests(unittest.TestCase):
         self.store.ingest({"entities": [{"id": "company:acme", "kind": "company", "name": "Acme"}, {"id": "domain:acme.test", "kind": "domain", "value": "acme.test"}],
                            "edges": [{"from_id": "company:acme", "to_id": "domain:acme.test", "relation": "official_website"}]})
 
-    def test_assertion_matches_cve_with_unknown_version_and_kev(self):
+    def test_assertion_remains_inventory_even_when_product_is_in_kev(self):
         self.store.ingest({"entities": [posting("We use PostgreSQL in production. Experience with Okta is preferred.")],
                            "advisories": [{"id": "CVE-2026-12345", "title": "Postgres issue", "affected": [{"vendor": "postgresql", "product": "postgresql", "version": "*", "part": "a"}]}],
                            "kev": [{"cveID": "CVE-2026-12345"}]})
@@ -35,11 +35,7 @@ class TechnographicStoreTests(unittest.TestCase):
         self.assertEqual({row["status"] for row in detail["technographics"]["fingerprints"]}, {"asserted_use", "requirement"})
         self.assertEqual(len(detail["observations"]), 1)
         self.assertEqual(detail["observations"][0]["product"], "postgresql")
-        alert = detail["alerts"][0]
-        self.assertEqual(alert["version_state"], "unknown")
-        self.assertTrue(alert["kev"])
-        self.assertIn("public company text", " ".join(alert["reasons"]))
-        self.assertEqual(alert["status"], "potential")
+        self.assertEqual(detail["alerts"], [])
 
     def test_duplicate_content_across_urls_skips_extraction_preserves_both_sources(self):
         doc = posting("We use Terraform for our infrastructure.")
@@ -62,7 +58,8 @@ class TechnographicStoreTests(unittest.TestCase):
     def test_changed_source_removes_prior_assertion_and_alert_but_retains_history(self):
         self.store.ingest({"entities": [posting("We use Terraform.")], "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}]})
         self.store.reconcile()
-        self.assertEqual(len(self.store.detail("company:acme")["alerts"]), 1)
+        self.assertEqual(self.store.detail("company:acme")["alerts"], [])
+        self.assertTrue(self.store.detail("company:acme")["observations"])
         self.store.ingest({"entities": [posting("We no longer use Terraform.")]})
         self.store.reconcile()
         detail = self.store.detail("company:acme")
@@ -117,7 +114,8 @@ class TechnographicStoreTests(unittest.TestCase):
         doc = posting("We use Terraform.")
         self.store.ingest({"entities": [doc], "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}]})
         self.store.reconcile()
-        self.assertEqual(len(self.store.detail("company:acme")["alerts"]), 1)
+        self.assertEqual(self.store.detail("company:acme")["alerts"], [])
+        self.assertTrue(self.store.detail("company:acme")["observations"])
         rejected = self.store.set_company_asset("company:acme", "https://acme.test", status="rejected",
                                                 evidence="Wrong company", source_url="https://acme.test/about")
         self.assertEqual(rejected["technographics"]["documents"], 0)
@@ -131,14 +129,15 @@ class TechnographicStoreTests(unittest.TestCase):
         restored = self.store.set_company_asset("company:acme", "https://acme.test", status="automatic")
         self.assertEqual(restored["technographics"]["documents"], 1)
         self.assertEqual(len(restored["observations"]), 1)
-        self.assertEqual(len(restored["alerts"]), 1)
+        self.assertEqual(restored["alerts"], [])
 
     def test_manual_decision_reconciles_only_affected_companies_in_same_transaction(self):
         self.store.ingest({"entities": [{"id": "company:other", "kind": "company", "name": "Other"},
                                         posting("We use Terraform.")],
-                           "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}],
-                           "observations": [{"asset_id": "company:other", "vendor": "hashicorp", "product": "terraform",
-                                             "origin": "manual", "source_url": "https://other.test"}]})
+                           "advisories": [{"id": "CVE-2026-23456", "affected": [{"vendor": "hashicorp", "product": "terraform", "version": "1.0"}]}],
+                           "observations": [{"asset_id": "domain:other.test", "vendor": "hashicorp", "product": "terraform",
+                                             "version": "1.0", "origin": "manual", "source_url": "https://other.test"}]})
+        self.store.set_company_asset("company:other", "https://other.test", evidence="Owned host", source_url="https://other.test/about")
         self.store.reconcile()
         before = self.store.detail("company:other")["alerts"]
         self.assertEqual(len(before), 1)

@@ -166,16 +166,18 @@ class AlertAssessmentTests(unittest.TestCase):
             posting("We never use Terraform.", key="other", company_id="company:other", url="https://secret.test/job")],
             "advisories": [{"id": "CVE-2026-54321", "affected": [{"vendor": "hashicorp", "product": "terraform"}]}]})
         self.store.reconcile()
-        evidence = self.alert()["assessment"]["evidence"]
-        self.assertEqual(len(evidence["supporting"]), 1)
-        self.assertEqual(evidence["independent_sources"], 1)
-        self.assertEqual([row["status"] for row in evidence["contradicting"]], ["historical"])
-        self.assertNotIn("secret.test", json.dumps(evidence))
-        # Retained document history must not bypass current attribution fences.
+        self.assertEqual(self.store.alerts()["items"], [])
+        self.assertEqual(len(self.store.detail("company:acme")["observations"]), 1)
+        from signalwatch.alert_evidence import EvidenceIndex
+        with self.store.connection() as conn:
+            contrary = EvidenceIndex(conn).contradictions("company:acme", "hashicorp", "terraform", "a")
+        self.assertEqual([row["status"] for row in contrary], ["historical"])
+        self.assertNotIn("secret.test", json.dumps(contrary))
         with self.store.connection(write=True) as conn:
             conn.execute("UPDATE evidence_resolution SET status='conflict' WHERE source_entity_id='old'")
-        self.store.reconcile()
-        self.assertEqual(self.alert()["assessment"]["evidence"]["contradicting"], [])
+        with self.store.connection() as conn:
+            self.assertEqual(EvidenceIndex(conn).contradictions("company:acme", "hashicorp", "terraform", "a"), [])
+
 
 
 if __name__ == "__main__":

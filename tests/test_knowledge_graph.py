@@ -65,7 +65,8 @@ class GraphTests(unittest.TestCase):
         risk=self.kg.company_risk('company:a')
         self.assertEqual(len(risk['items']),1)
         self.assertEqual(risk['items'][0]['version_state'],'exact')
-        self.assertGreaterEqual(risk['score'],85)
+        self.assertLess(risk['score'],85)
+        self.assertEqual(risk['items'][0]['risk']['tier'], 'owned_version_candidate')
         path=risk['items'][0]['paths'][0]
         self.assertEqual(path[-2]['confidence'],0)
         self.assertEqual(path[-1]['to_id'],'CVE-2026-12345')

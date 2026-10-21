@@ -33,7 +33,7 @@ class KnowledgeGraph:
 
     def active_alert_filter(self):
         from .store import ACTIVE_CVE_STATE
-        return 'EXISTS (SELECT 1 FROM advisories a WHERE a.canonical_id=alerts.advisory_id AND a.rejected=0 AND '+ACTIVE_CVE_STATE+')'
+        return "alerts.version_state IN ('exact','affected_range') AND NOT EXISTS (SELECT 1 FROM entities e WHERE e.id=alerts.asset_id AND e.kind='company') AND EXISTS (SELECT 1 FROM advisories a WHERE a.canonical_id=alerts.advisory_id AND a.rejected=0 AND "+ACTIVE_CVE_STATE+')'
 
     def node(self, conn, key):
         key = self.canonical(conn,key)
@@ -240,7 +240,7 @@ class KnowledgeGraph:
     def graph(self, root_id, depth=2, max_nodes=120, max_edges=300, include_wireless=False, focus_id='', *, _conn=None):
         if not root_id or not 1<=depth<=5 or not 1<=max_nodes<=300 or not 1<=max_edges<=800:
             raise ValueError('Invalid graph limits')
-        with (self.store.connection() if _conn is None else nullcontext(_conn)) as conn:
+        with (self.store.connection(read_timeout=10) if _conn is None else nullcontext(_conn)) as conn:
             root = self.node(conn,root_id)
             if root is None:
                 raise LookupError('Graph root not found')
@@ -327,6 +327,12 @@ class KnowledgeGraph:
                     if other not in nodes:
                         nodes[other]=target
                         queue.append((other,level+1))
+            if scope:
+                for node in nodes.values():
+                    if node['kind'] == 'alert':
+                        asset = scope['assets'].get(node['alert']['asset_id'], {})
+                        node['risk'] = self.driver(conn, node['alert'], root_id,
+                            asset.get('included', False) and asset.get('status') == 'confirmed' and asset.get('role') == 'owned')
             if include_wireless:
                 from .wireless_attribution import company_wireless_summary
                 for node in nodes.values():
@@ -338,21 +344,14 @@ class KnowledgeGraph:
             return {'root_id':root_id,'requested_root_id':requested_root_id,'nodes':list(nodes.values()),'edges':list(edges.values()),'truncated':coverage['truncated'],
                     'limits':{'depth':depth,'max_nodes':max_nodes,'max_edges':max_edges},'coverage':coverage}
 
-    def driver(self, conn, alert):
-        since = (datetime.now(timezone.utc)-timedelta(days=30)).isoformat()
-        chatter = conn.execute('SELECT count(DISTINCT a.url) FROM article_links l JOIN articles a ON a.id=l.article_id WHERE l.advisory_id IN (SELECT alias FROM advisory_aliases WHERE canonical_id=? UNION SELECT ?) AND julianday(a.published)>=julianday(?)', (alert['advisory_id'],alert['advisory_id'],since)).fetchone()[0]
-        severity, epss = alert['severity'], alert['epss']
-        score = min(100, max(0,severity or 0)*5 + (40 if alert['kev'] else 0) + max(0,min(1,epss or 0))*10 + min(5,chatter))
-        if alert['kev']:
-            score=max(85,score)
-        return {'score':round(score,2),'status':'potential','drivers':{'cvss':severity,'kev':bool(alert['kev']),'epss':epss,
-                'version_state':alert['version_state'],'version_uncertain':alert['version_state'] not in ('exact','affected_range'),
-                'recent_distinct_reporting':chatter},'method':'heuristic-alert-v1; KEV floor 85; reporting is context, not proof'}
+    def driver(self, conn, alert, company_id='', owned=False):
+        from .priority import assess_priority
+        return assess_priority(conn, alert, company_id, owned)
 
     def company_risk(self, company_id, include_subsidiaries=False, limit=50):
         if not 1<=limit<=100:
             raise ValueError('Invalid risk limit')
-        with self.store.connection() as conn:
+        with self.store.connection(read_timeout=10) as conn:
             company(conn,company_id)
             groups = [(company_id,[])]
             visited = {company_id}
@@ -380,15 +379,17 @@ class KnowledgeGraph:
                 contexts.extend({'company_id':cid,**a} for a in assets if not a['included'])
                 ids=[a['id'] for a in included]
                 selection = 'asset_id IN (' + ','.join('?' for _ in ids) + ')' if ids else '0=1'
-                documents = sorted('technographic:' + document for document in scope['documents'])
-                if documents:
-                    selection += ''' OR (asset_id=? AND EXISTS (SELECT 1 FROM observations o WHERE
-                      o.asset_id=alerts.asset_id AND o.vendor=alerts.vendor AND o.product=alerts.product
-                      AND o.version=alerts.version AND o.source_url=alerts.source_url AND o.origin IN (''' + ','.join('?' for _ in documents) + ')))'
-                    ids.extend([cid, *documents])
                 where = '(' + selection + ') AND ' + self.active_alert_filter()
                 total+=conn.execute('SELECT count(*) FROM alerts WHERE '+where,ids).fetchone()[0]
-                rows=conn.execute('SELECT * FROM alerts WHERE '+where+' ORDER BY kev DESC,rank DESC,id LIMIT ?',(*ids,limit+1)).fetchall()
+                priority_order = """EXISTS (SELECT 1 FROM exposure_verifications v JOIN company_asset_decisions d
+                  ON d.company_id=v.company_id AND d.asset_id=alerts.asset_id
+                  WHERE v.subject_id=alerts.id AND v.company_id=? AND v.version=alerts.version
+                  AND v.source_url=alerts.source_url AND v.alert_first_seen=alerts.first_seen AND v.expires_at>? AND d.status='confirmed' AND d.role='owned') DESC,
+                  EXISTS (SELECT 1 FROM company_asset_decisions d WHERE d.company_id=? AND d.asset_id=alerts.asset_id
+                  AND d.status='confirmed' AND d.role='owned') DESC,
+                  (coalesce(severity,0)+(CASE WHEN kev=1 THEN 8 ELSE 0 END)+coalesce(epss,0)*6) DESC,id"""
+                rows=conn.execute('SELECT * FROM alerts WHERE '+where+' ORDER BY '+priority_order+' LIMIT ?',
+                                  (*ids,cid,datetime.now(timezone.utc).isoformat(),cid,limit+1)).fetchall()
                 truncated |= len(rows)>limit
                 by_id={a['id']:a for a in included}
                 for row in rows[:limit]:
@@ -396,7 +397,7 @@ class KnowledgeGraph:
                     public_text = row['asset_id'] == cid
                     proof = [] if public_text else by_id[row['asset_id']]['evidence']
                     result={'id':row['id'],'company_id':cid,'asset_id':row['asset_id'],'advisory_id':row['advisory_id'],
-                            'risk':self.driver(conn,alert),'version_state':row['version_state'],'version':row['version'],
+                            'risk':self.driver(conn,alert,company_id=cid,owned=by_id[row['asset_id']]['status']=='confirmed' and by_id[row['asset_id']]['role']=='owned'),'version_state':row['version_state'],'version':row['version'],
                             'observed_at':row['observed_at'],'last_matched':row['last_seen'],'reasons':json.loads(row['reasons']),
                             'assessment':json.loads(alert.get('assessment') or '{}'),
                             'evidence_basis':'company_public_text' if public_text else 'owned_asset',
@@ -409,15 +410,15 @@ class KnowledgeGraph:
             ordered=sorted(results.values(),key=lambda r:(-r['risk']['score'],r['id']))
             return {'company_id':company_id,'group':include_subsidiaries,'items':ordered[:limit], 'score':max((r['risk']['score'] for r in ordered),default=None),
                     'total':len(results) if not truncated else None,'truncated':truncated or len(ordered)>limit or len(contexts)>limit,
-                    'context_assets':contexts[:limit],'coverage':{'companies':len(groups),'company_limit':50,'hierarchy_depth':5,'matches_considered':total,'per_company_alert_limit':limit,'selection':'bounded per-company KEV/rank shortlist, then heuristic score; not a global exhaustive ranking',
-                    'risk_basis':'included company assets and validated company public-text matches; no network or catalog propagation'}}
+                    'context_assets':contexts[:limit],'coverage':{'companies':len(groups),'company_limit':50,'hierarchy_depth':5,'matches_considered':total,'per_company_alert_limit':limit,'selection':'bounded per-company verification/ownership shortlist, then evidence-tier score; not a global exhaustive ranking',
+                    'risk_basis':'version-supported asset matches; public text, shared network and catalog links cannot establish exposure'}}
 
     def intelligence(self, q='', limit=25, offset=0):
         from .store import fts_query
         if len(q)>300 or not 1<=limit<=100 or not 0<=offset<=10000:
             raise ValueError('Invalid intelligence bounds')
         candidate_limit, expansion_limit, company_limit = 1000, 3000, 20
-        with self.store.connection() as conn:
+        with self.store.connection(read_timeout=10) as conn:
             results, entities, assets = {}, {}, set()
             partial = False
 
@@ -563,19 +564,24 @@ def register_graph_routes(app, store):
     def call(fn,*args):
         try:
             return fn(*args)
+        except TimeoutError as error:
+            raise HTTPException(503, str(error), headers={'Retry-After': '3'}) from error
         except LookupError as error:
             raise HTTPException(404,str(error)) from error
         except ValueError as error:
             raise HTTPException(422,str(error)) from error
+    from .read_cache import ReadSnapshots
+    snapshots = app.state.intelligence_snapshots = ReadSnapshots()
+
     @app.get('/api/graph')
     def graph(root_id: str=Query(...,min_length=1,max_length=2048),depth: int=Query(2,ge=1,le=5),max_nodes: int=Query(120,ge=1,le=300),max_edges: int=Query(300,ge=1,le=800),include_wireless: bool=False,focus_id: str=Query('',max_length=2048)):
-        return call(service.graph,root_id,depth,max_nodes,max_edges,include_wireless,focus_id)
+        return call(snapshots.read,service.graph,root_id,depth,max_nodes,max_edges,include_wireless,focus_id)
     @app.get('/api/company-risk')
     def risk(id: str=Query(...,min_length=1,max_length=2048),include_subsidiaries: bool=False,limit: int=Query(50,ge=1,le=100)):
-        return call(service.company_risk,id,include_subsidiaries,limit)
+        return call(snapshots.read,service.company_risk,id,include_subsidiaries,limit)
     @app.get('/api/intelligence')
     def intelligence(q: str=Query('',max_length=300),limit: int=Query(25,ge=1,le=100),offset: int=Query(0,ge=0,le=10000)):
-        return call(service.intelligence,q,limit,offset)
+        return call(snapshots.read,service.intelligence,q,limit,offset)
     @app.post('/api/intelligence/extract')
     def extraction(after: int=Query(0,ge=0),limit: int=Query(25,ge=1,le=100)):
         from .text_signals import backfill
