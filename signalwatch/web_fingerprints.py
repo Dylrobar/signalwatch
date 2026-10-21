@@ -319,6 +319,13 @@ def analyze_http_response(url, headers, html, *, cookie_names=()):
             and any(tag == "form" and str(attrs.get("action") or "").split("?")[0] == "/remote/login" for tag, attrs in page.tags)):
         add("fortios", "dom", "Fortinet page title and /remote/login form")
 
+    if "php" in direct:
+        php_versions = sorted({match.group(1) for name in ("server", "x-powered-by")
+                               for value in lower.get(name, ())
+                               for match in re.finditer(rf"\bPHP/({VERSION})(?=[\s;,()]|$)", value, re.I)})
+        if len(php_versions) > 1:
+            direct["php"] = _finding("php", "header", "Conflicting PHP HTTP banners: " + ", ".join(php_versions),
+                                     confidence=0.6, conflicting_versions=php_versions)
     result = list(direct.values()) + _implied(direct)
     csp_seen = set()
     for policy in lower.get("content-security-policy", ()):

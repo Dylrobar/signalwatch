@@ -464,3 +464,10 @@ product does not monopolize the per-collection request budget.
 The prefork worker recycles a child after 100 tasks or after a completed task
 exceeds 768 MiB RSS. This releases retained memory between tasks; it is not an
 in-flight hard memory limit and does not replace the bounded ingestion paths.
+
+HTTP observations open CVE candidates only when a supported version comparison
+matches. Missing, incomplete or conflicting versions remain inventory evidence.
+PHP major/minor banners are never padded to patch zero. Candidate assessments
+separate version criteria from package/backport status and runtime reachability.
+Reviewed prerequisites for CVE-2025-14180 cite the PHP publisher advisory; CMS
+fingerprints do not establish presence or absence of a PostgreSQL driver.
