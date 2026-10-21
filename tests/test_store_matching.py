@@ -105,6 +105,53 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(alert["confidence"], .8)
         self.assertTrue(any("configuration" in reason for reason in alert["reasons"]))
 
+    def test_verified_version_wins_over_higher_confidence_unknown(self):
+        self.store.ingest({"advisories": [self.advisory()], "observations": [
+            self.observation(version=None, confidence=1, source_url="https://example.org/about"),
+            self.observation(version="1.5", confidence=.8)]})
+        self.store.reconcile()
+        alert = self.store.alerts()["items"][0]
+        self.assertEqual(alert["version_state"], "affected_range")
+        self.assertEqual(alert["version"], "1.5")
+        self.assertEqual(alert["confidence"], .8)
+
+    def test_reconcile_releases_evidence_between_assets_and_clears_orphans(self):
+        from unittest.mock import patch
+        from signalwatch.alert_evidence import EvidenceIndex
+        self.store.ingest({"advisories": [self.advisory()], "observations": [
+            self.observation(asset_id="asset:" + str(i)) for i in range(105)]})
+        seen = []
+        original = EvidenceIndex.assessment
+        def assessment(index, key, record):
+            seen.append({asset for asset, _ in index.groups})
+            return original(index, key, record)
+        with patch.object(EvidenceIndex, "assessment", assessment):
+            self.assertEqual(self.store.reconcile()["alerts"], 105)
+        self.assertEqual(len(seen), 105)
+        self.assertTrue(all(len(assets) == 1 for assets in seen))
+        with self.store.connection(write=True) as conn:
+            conn.execute("DELETE FROM observations WHERE asset_id=?", ("asset:0",))
+        result = self.store.reconcile()
+        self.assertEqual(result["previous"], 105)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["alerts"], 104)
+
+    def test_reconcile_asset_failure_rolls_back_entire_run(self):
+        from unittest.mock import patch
+        self.store.ingest({"advisories": [self.advisory()], "observations": [
+            self.observation(asset_id="asset:a"), self.observation(asset_id="asset:b")]})
+        original = self.store._reconcile_asset
+        def reconcile_asset(*, asset_ids, conn):
+            if asset_ids == ("asset:b",):
+                raise RuntimeError("interrupted")
+            return original(asset_ids=asset_ids, conn=conn)
+        with patch.object(self.store, "_reconcile_asset", reconcile_asset):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                self.store.reconcile()
+        self.assertEqual(self.store.alerts()["total"], 0)
+        self.assertEqual(self.store.events(kind="warning_opened")["total"], 0)
+        self.assertEqual(self.store.reconcile()["alerts"], 2)
+
     def test_patched_observation_removes_alert(self):
         self.store.ingest({"advisories": [self.advisory()], "observations": [self.observation()]})
         self.store.reconcile()

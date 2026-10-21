@@ -678,6 +678,34 @@ class Store:
         return counts
 
     def reconcile(self, *, asset_ids=None, conn=None):
+        """Reconcile one asset at a time, atomically across the requested scope.
+
+        Include existing alert assets so removing the last observation still
+        clears its warnings. Page IDs rather than retaining all joined evidence.
+        """
+        totals = dict(evaluated=0, alerts=0, removed=0, previous=0)
+        with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
+            if asset_ids is None:
+                def all_asset_ids():
+                    after = None
+                    while True:
+                        query = "SELECT asset_id FROM (SELECT asset_id FROM observations UNION SELECT asset_id FROM alerts) assets"
+                        rows = conn.execute(query + (" WHERE asset_id>?" if after is not None else "") +
+                                            " ORDER BY asset_id LIMIT 100", (() if after is None else (after,))).fetchall()
+                        if not rows:
+                            return
+                        yield from (row["asset_id"] for row in rows)
+                        after = rows[-1]["asset_id"]
+                ids = all_asset_ids()
+            else:
+                ids = iter(sorted(set(asset_ids)))
+            for asset_id in ids:
+                result = self._reconcile_asset(asset_ids=(asset_id,), conn=conn)
+                for key in totals:
+                    totals[key] += result[key]
+        return totals
+
+    def _reconcile_asset(self, *, asset_ids, conn):
         from .alert_evidence import EvidenceIndex
         from .applicability import ensure_schema, evaluate
 
@@ -740,7 +768,7 @@ class Store:
                 key = (row["asset_id"], row["canonical_id"])
                 previous = candidates.get(key)
                 strengths = {"exact": 3, "affected_range": 2, "version_unverified": 1, "unknown": 0}
-                if previous is None or (record["confidence"], strengths[state], record["rank"], record["observed_at"]) > (previous["confidence"], strengths[previous["version_state"]], previous["rank"], previous["observed_at"]):
+                if previous is None or (strengths[state], record["confidence"], record["rank"], record["observed_at"]) > (strengths[previous["version_state"]], previous["confidence"], previous["rank"], previous["observed_at"]):
                     candidates[key] = record
             for key, record in candidates.items():
                 record["assessment"]["evidence"] = evidence_index.assessment(key, record)
