@@ -739,7 +739,7 @@ class Store:
                 # Passive product presence or ambiguous banners are inventory
                 # evidence, not enough to open a CVE warning on a remote host.
                 if row["origin"] == "web" and state not in {"exact", "affected_range"}:
-                    evidence_index.add(row, False, state, reason)
+                    evidence_index.add(row, True, state, "Inventory context only: " + reason)
                     continue
                 applicability_key = (row["asset_id"], row["source_advisory_id"], row["vendor"], row["product"], row["part"])
                 if applicability_key not in applicability_cache:

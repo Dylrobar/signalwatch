@@ -74,3 +74,9 @@ class ExposureAccuracyTests(unittest.TestCase):
         self.store.ingest({"observations": [{"asset_id": self.asset, "vendor": "php", "product": "php",
                            "version": "", "origin": "web", "source_url": self.url + "about"}]})
         self.assertEqual(self.observe({"X-Powered-By": "PHP/8.4.24"}), [])
+
+    def test_unknown_inventory_context_is_not_falsely_marked_contradictory(self):
+        self.store.ingest({"observations": [{"asset_id": self.asset, "vendor": "php", "product": "php",
+                           "version": "", "origin": "web", "source_url": self.url + "about"}]})
+        row = self.observe({"X-Powered-By": "PHP/8.2.29"})[0]
+        self.assertEqual(row["assessment"]["evidence"]["contradicting"], [])
