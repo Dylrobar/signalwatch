@@ -736,6 +736,11 @@ class Store:
                 if not matches:
                     evidence_index.add(row, False, state, reason)
                     continue
+                # Passive product presence or ambiguous banners are inventory
+                # evidence, not enough to open a CVE warning on a remote host.
+                if row["origin"] == "web" and state not in {"exact", "affected_range"}:
+                    evidence_index.add(row, False, state, reason)
+                    continue
                 applicability_key = (row["asset_id"], row["source_advisory_id"], row["vendor"], row["product"], row["part"])
                 if applicability_key not in applicability_cache:
                     applicability_cache[applicability_key] = evaluate(json.loads(row["configurations"] or "null"),
@@ -770,8 +775,10 @@ class Store:
                 strengths = {"exact": 3, "affected_range": 2, "version_unverified": 1, "unknown": 0}
                 if previous is None or (strengths[state], record["confidence"], record["rank"], record["observed_at"]) > (strengths[previous["version_state"]], previous["confidence"], previous["rank"], previous["observed_at"]):
                     candidates[key] = record
+            from .exposure import assess as assess_exposure
             for key, record in candidates.items():
                 record["assessment"]["evidence"] = evidence_index.assessment(key, record)
+                record["assessment"]["exposure"] = assess_exposure(record, record["assessment"]["evidence"])
                 record["assessment"] = encode(record["assessment"])
                 for field in ("vendor_identity", "product_identity", "part_identity"):
                     record.pop(field)

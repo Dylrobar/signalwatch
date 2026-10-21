@@ -61,6 +61,9 @@ def version_match(observed, affected):
     observed = str(observed or "").strip()
     if not observed or observed in {"*", "-", "unknown"}:
         return True, "unknown", "Observed version is unknown."
+    product = normalize(affected.get("product") or cpe_fields(affected.get("criteria")).get("product"))
+    if product == "php" and re.fullmatch(r"\d+(?:\.\d+)?", observed):
+        return True, "version_unverified", "PHP patch level is missing; a major/minor banner must not be treated as a .0 build."
     if "cve_versions" in affected:
         return cve_version_match(observed, affected)
     if affected.get("version_unverified"):
