@@ -32,6 +32,9 @@ class PreviewCorsTests(unittest.TestCase):
         self.assertEqual(response.json()['error'], 'cors_denied')
         self.assertEqual(int(response.headers['content-length']), len(response.content))
 
+    def test_same_origin_dashboard_is_not_blocked(self):
+        self.assertEqual(self.client.get("/api/status", headers={"Origin": "http://testserver"}).status_code, 401)
+
     def test_non_browser_client(self):
         self.assertEqual(self.client.get('/api/status').status_code, 401)
 

@@ -23,8 +23,10 @@ class SignalWatchCORS(CORSMiddleware):
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             from starlette.datastructures import Headers
-            origin = Headers(scope=scope).get("origin")
-            if origin and not self.is_allowed_origin(origin):
+            headers = Headers(scope=scope)
+            origin = headers.get("origin")
+            same_origin = origin == scope.get("scheme", "http") + "://" + headers.get("host", "")
+            if origin and not same_origin and not self.is_allowed_origin(origin):
                 response = JSONResponse({"error": "cors_origin_denied", "detail": "Origin is not allowed by SIGNALWATCH_CORS_ORIGINS."},
                                         status_code=403, headers={"Vary": "Origin"})
                 await response(scope, receive, send)
