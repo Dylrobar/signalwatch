@@ -47,7 +47,7 @@ CORS headers indicate policy or a second header-injecting proxy.
 The active frontend handshake transitions from checking health to retrying
 health (network, 502/503/504 only), then checking API authentication, then
 connected or an explicit error. Four health attempts, each capped at 25 seconds,
-with two-second retry delays share a 120-second overall deadline. Invalid
+with 10/20/30-second retry delays share a 120-second overall deadline. Invalid
 responses and auth failures are not retried; mutations are never retried by
 this handshake. Closing/editing cancels the attempt. Only a successful health
 and status handshake saves the connection. Errors retain the inputs for retry.
