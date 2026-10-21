@@ -27,6 +27,10 @@ app.conf.update(
     worker_pool="prefork",
     worker_concurrency=1,
     worker_prefetch_multiplier=1,
+    # Recycle only after a task returns, preserving active collection and its
+    # durable checkpoint while releasing retained allocator/cache memory.
+    worker_max_tasks_per_child=100,
+    worker_max_memory_per_child=768 * 1024,  # Celery uses KiB, not bytes.
     worker_enable_remote_control=False,
     worker_cancel_long_running_tasks_on_connection_loss=True,
     broker_connection_timeout=BROKER_TIMEOUT,

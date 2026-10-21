@@ -1,5 +1,7 @@
 """Inventory-driven historical lookup uses explicit product IDs and bounded pages."""
 import json
+import gzip
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,13 +69,13 @@ class NVDInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.collector.http.get = AsyncMock(return_value=self.response([], total=2))
         result = await self.collector._nvd_inventory()
         self.assertTrue(result["errors"])
-        self.assertNotIn("inventory_lookup", self.store.source_state("nvd"))
+        self.assertEqual(self.store.source_state("nvd")["inventory_lookup"][TARGET].get("next_index", 0), 0)
         self.collector.http.get.return_value = self.response([cve()])
         self.collector.nvd_next_request = 0
         with patch.object(self.collector, "emit", AsyncMock(side_effect=RuntimeError("write failed"))):
             result = await self.collector._nvd_inventory()
         self.assertTrue(result["errors"])
-        self.assertNotIn("inventory_lookup", self.store.source_state("nvd"))
+        self.assertEqual(self.store.source_state("nvd")["inventory_lookup"][TARGET].get("next_index", 0), 0)
 
     async def test_request_budget_and_auth_rate_failures_stop_additional_requests(self):
         self.collector.config["nvd_inventory_requests"] = 4
@@ -101,3 +103,57 @@ class NVDInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.collector._nvd_inventory = AsyncMock()
         self.assertEqual(await self.collector.collect_nvd(), {"advisories": 3})
         self.collector._nvd_inventory.assert_not_awaited()
+
+    async def test_partial_and_failed_products_do_not_starve_other_products(self):
+        targets = [TARGET, TARGET.replace("router", "switch")]
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                self.store.update_source("nvd", inventory_lookup={})
+                self.collector.http.get = AsyncMock(return_value=self.response([] if failed else [cve()], total=2))
+                self.collector.nvd_next_request = 0
+                with patch.object(self.store, "nvd_product_targets", return_value=targets):
+                    await self.collector._nvd_inventory()
+                    self.collector.nvd_next_request = 0
+                    await self.collector._nvd_inventory()
+                self.assertEqual([call.kwargs["params"]["virtualMatchString"] for call in self.collector.http.get.call_args_list], targets)
+
+    async def test_duplicate_and_invalid_records_do_not_complete_lookup(self):
+        for rows in ([cve(), cve()], [{"cve": {"id": "not-a-cve"}}], [None]):
+            with self.subTest(rows=rows):
+                self.collector.http.get = AsyncMock(return_value=self.response(rows))
+                self.collector.nvd_next_request = 0
+                result = await self.collector._nvd_inventory()
+                self.assertTrue(result["errors"])
+                self.assertEqual(result["completed_products"], 0)
+                self.assertEqual(self.store.advisories()["total"], 0)
+
+    async def test_excess_rows_are_rejected_before_ingestion(self):
+        self.collector.http.get = AsyncMock(return_value=self.response([cve(10000 + i) for i in range(201)]))
+        result = await self.collector._nvd_inventory()
+        self.assertTrue(result["errors"])
+        self.assertEqual(self.store.advisories()["total"], 0)
+
+    async def test_compressed_oversize_page_does_not_mark_product_complete(self):
+        path = Path(self.temp.name) / "large.gz"
+        with gzip.open(path, "wb") as stream:
+            for _ in range(17):
+                stream.write(b" " * 1024 * 1024)
+        self.collector.http.get = AsyncMock(return_value=SimpleNamespace(path=path))
+        result = await self.collector._nvd_inventory()
+        self.assertIn("expanded size limit", result["errors"][0])
+        self.assertEqual(result["completed_products"], 0)
+
+    async def test_bulk_checksum_mismatch_never_ingests_partial_snapshot(self):
+        meta = Path(self.temp.name) / "feed.meta"
+        body = json.dumps({"vulnerabilities": [cve()]}).encode()
+        meta.write_text("sha256:" + hashlib.sha256(body).hexdigest())
+        feed = Path(self.temp.name) / "feed.gz"
+        feed.write_bytes(gzip.compress(b'{"vulnerabilities": []}'))
+        self.collector.http.get = AsyncMock(side_effect=[SimpleNamespace(path=meta), SimpleNamespace(path=feed)])
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            await self.collector._nvd_feed("modified", None)
+        self.assertEqual(self.store.advisories()["total"], 0)
+        feed.write_bytes(gzip.compress(body))
+        self.collector.http.get = AsyncMock(side_effect=[SimpleNamespace(path=meta), SimpleNamespace(path=feed)])
+        counts, _ = await self.collector._nvd_feed("modified", None)
+        self.assertEqual(counts["advisories"], 1)

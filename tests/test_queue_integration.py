@@ -224,6 +224,26 @@ class QueueIntegrationTests(unittest.TestCase):
         self.assertEqual(completed["result"]["sources"], [])
         self.assertEqual(len(self.request("/api/jobs")["jobs"]), 1)
 
+    def test_prefork_recycles_after_task_limit_and_continues_processing(self):
+        from celery import Celery
+        from signalwatch.celery_app import app
+
+        client = Celery("recycling-test", broker=self.broker_url)
+        try:
+            # No sources are enabled in this fixture, so these are cheap scheduler
+            # checks. Cross the actual production lifetime limit, then run a job.
+            for _ in range(app.conf.worker_max_tasks_per_child + 1):
+                delivery_id = "recycle-" + uuid.uuid4().hex
+                client.send_task("signalwatch.enqueue_scheduled", task_id=delivery_id,
+                                 queue="signalwatch", ignore_result=True, retry=False)
+            self.wait_for(lambda: f"signalwatch.enqueue_scheduled[{delivery_id}] succeeded" in self.log(),
+                          timeout=90, description="tasks after child replacement")
+            self.assertIn("ForkPoolWorker-2", self.log())
+            accepted = self.request("/api/collect", {"sources": [], "idempotency_key": "after-recycle"})
+            self.assertEqual(self.wait_job(accepted["job"]["id"])["attempts"], 1)
+        finally:
+            client.close()
+
 
 if __name__ == "__main__":
     unittest.main()

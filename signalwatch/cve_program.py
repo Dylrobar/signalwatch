@@ -14,6 +14,9 @@ from .matching import cpe_fields
 DELTA_URL = "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/delta.json"
 RELEASE_URL = "https://api.github.com/repos/CVEProject/cvelistV5/releases/latest"
 RAW_BASE = "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/"
+MAX_RECORD_BYTES = 8 * 1024 * 1024
+
+
 CVE_ID = re.compile(r"CVE-(\d{4})-(\d{4,})")
 
 
@@ -93,26 +96,37 @@ def changed(record, digest, seen):
     return True
 
 
-def read_archive(path, seen, excluded, limit):
-    selected = []
-    pending = False
+class CVEIngestionError(RuntimeError):
+    """Keep storage failures separate from recoverable archive failures."""
+
+
+def read_record(stream):
+    body = stream.read(MAX_RECORD_BYTES + 1)
+    if len(body) > MAX_RECORD_BYTES:
+        raise ValueError("CVE record exceeds the uncompressed record size limit")
+    return json.loads(body), hashlib.sha256(body).hexdigest()
+
+
+def read_archive(path, seen, excluded, limit, consume):
+    count = 0
     with zipfile.ZipFile(path) as archive:
         for member in sorted(archive.infolist(), key=lambda item: item.filename):
             if member.is_dir() or not member.filename.endswith(".json"):
                 continue
-            body = archive.read(member)
-            record = json.loads(body)
+            if member.file_size > MAX_RECORD_BYTES:
+                raise ValueError("CVE archive member exceeds the uncompressed record size limit")
+            with archive.open(member) as stream:
+                record, digest = read_record(stream)
             if not isinstance(record, dict) or "cveMetadata" not in record:
                 continue
             native_id = record["cveMetadata"].get("cveId", "").upper()
-            digest = hashlib.sha256(body).hexdigest()
             if native_id in excluded or not changed(record, digest, seen):
                 continue
-            if len(selected) == limit:
-                pending = True
-                break
-            selected.append((record, digest))
-    return selected, pending
+            if count == limit:
+                return count, True
+            consume(record, digest)
+            count += 1
+    return count, False
 
 
 async def collect_cve_program(config, store, http):
@@ -154,19 +168,53 @@ async def collect_cve_program(config, store, http):
     pending = len(raw_ids) > limit
     semaphore = asyncio.Semaphore(min(8, int(config.get("concurrency", 32))))
 
+    counts = {}
+    record_count = 0
+    excluded = set()
+
+    def consume(record, digest):
+        nonlocal record_count
+        advisory = parse_cve5(record)
+        entities = product_entities([item for item in advisory["affected"] if item.get("criteria")], advisory["url"], advisory["modified"])
+        try:
+            result = store.ingest({"advisories": [advisory], "entities": entities}) or {}
+        except Exception as exc:
+            raise CVEIngestionError(str(exc)) from exc
+        for key, value in result.items():
+            counts[key] = counts.get(key, 0) + value
+        seen[record["cveMetadata"]["cveId"].upper()] = {"digest": digest, "modified": advisory["modified"]}
+        record_count += 1
+
     async def fetch_record(native_id):
         matched = CVE_ID.fullmatch(native_id)
         url = f"{RAW_BASE}{matched[1]}/{matched[2][:-3]}xxx/{native_id}.json"
         async with semaphore:
-            response = await http.get(url, max_bytes=8 * 1024 * 1024)
-            record = await asyncio.to_thread(lambda: json.loads(response.path.read_text(encoding="utf-8")))
-            if record.get("cveMetadata", {}).get("cveId", "").upper() != native_id:
-                raise ValueError("CVE record id differs from its delta manifest")
-            return record, response.digest
+            response = await http.get(url, max_bytes=MAX_RECORD_BYTES)
+            return native_id, response.path
 
-    records = await gather(*(fetch_record(native_id) for native_id in raw_ids[:limit]))
-    delta_done.update(raw_ids[:limit])
-    excluded = {record["cveMetadata"]["cveId"].upper() for record, _ in records}
+    def consume_path(native_id, path):
+        with path.open("rb") as stream:
+            record, digest = read_record(stream)
+        if record.get("cveMetadata", {}).get("cveId", "").upper() != native_id:
+            raise ValueError("CVE record id differs from its delta manifest")
+        consume(record, digest)
+
+    # Downloads remain concurrent and disk-backed; decoded records are released
+    # after each database write rather than retained for the entire collection.
+    paths = await gather(*(fetch_record(native_id) for native_id in raw_ids[:limit]), return_exceptions=True)
+    for native_id, result in zip(raw_ids[:limit], paths):
+        try:
+            if isinstance(result, BaseException):
+                raise result
+            await to_thread(consume_path, native_id, result[1])
+        except CVEIngestionError:
+            raise
+        except Exception as exc:
+            gaps.append(f"CVE record {native_id} unavailable: {str(exc)[:150]}")
+            pending = True
+            continue
+        excluded.add(native_id)
+        delta_done.add(native_id)
     archive_complete = False
     archive_digest = None
     if asset is None or cutoff is None:
@@ -178,19 +226,16 @@ async def collect_cve_program(config, store, http):
             archive_result = await http.get(asset["browser_download_url"], max_bytes=zip_limit)
             archive_digest = archive_result.digest
             if state.get("archive_complete_digest") == archive_digest:
-                archive_records, archive_pending = [], False
+                archive_pending = False
             else:
-                archive_records, archive_pending = await asyncio.to_thread(read_archive, archive_result.path, seen, excluded, limit - len(records))
-            records.extend(archive_records)
+                _, archive_pending = await to_thread(read_archive, archive_result.path, seen, excluded, limit - record_count, consume)
             pending = pending or archive_pending
             archive_complete = not archive_pending
+        except CVEIngestionError:
+            raise
         except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
             gaps.append(f"Cumulative hourly delta unavailable: {str(exc)[:200]}")
-    advisories = [parse_cve5(record) for record, _ in records]
-    entities = [entity for advisory in advisories for entity in product_entities([item for item in advisory["affected"] if item.get("criteria")], advisory["url"], advisory["modified"])]
-    counts = await to_thread(store.ingest, {"advisories": advisories, "entities": entities}) if advisories else {}
-    for (record, digest), advisory in zip(records, advisories):
-        seen[record["cveMetadata"]["cveId"].upper()] = {"digest": digest, "modified": advisory["modified"]}
+            pending = True
     if delta.get("error"):
         gaps.append("CVE Program reports errors in its latest update manifest.")
     gaps = list(dict.fromkeys(gaps))[-20:]
@@ -210,4 +255,4 @@ async def collect_cve_program(config, store, http):
     if archive_complete:
         fields["archive_complete_digest"] = archive_digest
     await to_thread(store.update_source, "cve_program", **fields)
-    return {**(counts or {}), "records": len(advisories), "pending": pending, "coverage_scope": "recent_delta", "coverage_floor": floor, "coverage_through": through, "raw_delta_fetch_time": fields["raw_delta_fetch_time"], "gap": fields["gap"], "history_complete": False}
+    return {**(counts or {}), "records": record_count, "pending": pending, "coverage_scope": "recent_delta", "coverage_floor": floor, "coverage_through": through, "raw_delta_fetch_time": fields["raw_delta_fetch_time"], "gap": fields["gap"], "history_complete": False}

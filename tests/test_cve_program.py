@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from signalwatch.cve_program import DELTA_URL, RAW_BASE, RELEASE_URL, collect_cve_program, parse_cve5
@@ -225,3 +226,56 @@ class CVECollectionTests(unittest.IsolatedAsyncioTestCase):
         result = await collect_cve_program({}, store, http)
         self.assertEqual(result["records"], 1)
         self.assertEqual(store.batches[-1]["advisories"][0]["id"], "CVE5:CVE-2026-12346")
+
+    async def test_raw_and_archive_records_are_ingested_in_bounded_batches(self):
+        http = self.fixture([cve_record(f"CVE-2026-{12000+i}") for i in range(20)],
+                            [cve_record(f"CVE-2026-{13000+i}") for i in range(20)])
+        store = MemoryStore()
+        result = await collect_cve_program({}, store, http)
+        self.assertEqual(result["records"], 40)
+        self.assertEqual(result["advisories"], 40)
+        self.assertEqual(max(len(batch["advisories"]) for batch in store.batches), 1)
+        self.assertFalse(result["pending"])
+
+    async def test_expanded_archive_member_limit_leaves_coverage_incomplete(self):
+        http = self.fixture([cve_record()])
+        store = MemoryStore()
+        with patch("signalwatch.cve_program.MAX_RECORD_BYTES", 100):
+            result = await collect_cve_program({}, store, http)
+        self.assertIn("uncompressed record size limit", result["gap"])
+        self.assertIsNone(result["coverage_through"])
+        self.assertNotIn("archive_complete_digest", store.state)
+        self.assertEqual(store.batches, [])
+
+    async def test_partial_storage_failure_never_checkpoints_completed_archive(self):
+        http = self.fixture([cve_record(), cve_record("CVE-2026-12346")])
+        store = MemoryStore()
+        original = store.ingest
+        def ingest(batch):
+            if store.batches:
+                raise RuntimeError("Storage failed mid-archive")
+            return original(batch)
+        store.ingest = ingest
+        with self.assertRaisesRegex(RuntimeError, "Storage failed mid-archive"):
+            await collect_cve_program({}, store, http)
+        self.assertEqual(store.state, {})
+        store.ingest = original
+        result = await collect_cve_program({}, store, http)
+        self.assertEqual(result["records"], 2)
+        self.assertFalse(result["pending"])
+
+    async def test_one_failed_record_does_not_discard_successful_records_and_retries(self):
+        http = self.fixture(raw_records=[cve_record(), cve_record("CVE-2026-12346")])
+        failed_url = RAW_BASE + "2026/12xxx/CVE-2026-12345.json"
+        http.errors.add(failed_url)
+        store = MemoryStore()
+        result = await collect_cve_program({}, store, http)
+        self.assertEqual(result["records"], 1)
+        self.assertTrue(result["pending"])
+        self.assertIn("CVE-2026-12345 unavailable", result["gap"])
+        self.assertEqual(store.state["delta_done"], ["CVE-2026-12346"])
+        http.errors.clear()
+        result = await collect_cve_program({}, store, http)
+        self.assertEqual(result["records"], 1)
+        self.assertFalse(result["pending"])
+        self.assertEqual(store.state["delta_done"], ["CVE-2026-12345", "CVE-2026-12346"])

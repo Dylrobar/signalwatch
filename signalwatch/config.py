@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.20.6"
+VERSION = "0.20.7"
 
 
 DEFAULTS = {

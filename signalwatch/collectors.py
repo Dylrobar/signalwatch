@@ -34,6 +34,24 @@ WEB_RESPONSE_BYTES = 1024 * 1024
 WEB_HTML_SAMPLE_BYTES = 250 * 1024
 
 
+def _verify_nvd_feed(path, digest):
+    checksum = hashlib.sha256()
+    with open_payload(path) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    if checksum.hexdigest().lower() != digest.lower():
+        raise ValueError("NVD feed checksum mismatch; snapshot was not ingested")
+
+
+def _read_nvd_page(path):
+    # Limit expanded JSON too: a small compressed response can expand enormously.
+    with open_payload(path) as stream:
+        body = stream.read(16 * 1024 * 1024 + 1)
+    if len(body) > 16 * 1024 * 1024:
+        raise ValueError("NVD API response exceeds the expanded size limit")
+    return json.loads(body)
+
+
 def _html_sample(path):
     with path.open("rb") as stream:
         return stream.read(WEB_HTML_SAMPLE_BYTES).decode("utf-8", errors="replace")
@@ -255,9 +273,12 @@ class Collector:
         metadata = await self.http.get(f"{NVD_BASE}{label}.meta")
         meta = dict(line.split(":", 1) for line in metadata.path.read_text().splitlines() if ":" in line)
         digest = meta.get("sha256", "").strip()
-        if digest and digest == previous_hash:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            raise ValueError("NVD feed metadata lacks a valid SHA-256 checksum")
+        if digest == previous_hash:
             return {"advisories": 0, "entities": 0}, digest
         result = await self.http.get(f"{NVD_BASE}{label}.json.gz", max_bytes=1024 ** 3)
+        await to_thread(_verify_nvd_feed, result.path, digest)
         counts = await to_thread(self._ingest_nvd_path, result.path)
         if counts["advisories"] == 0:
             raise ValueError(f"NVD {label} feed has no CVE records")
@@ -311,7 +332,7 @@ class Collector:
             end = min(start + timedelta(days=119), now)
             index = 0
             while True:
-                params = {"lastModStartDate": start.isoformat(timespec="milliseconds"), "lastModEndDate": end.isoformat(timespec="milliseconds"), "resultsPerPage": 2000, "startIndex": index}
+                params = {"lastModStartDate": start.isoformat(timespec="milliseconds"), "lastModEndDate": end.isoformat(timespec="milliseconds"), "resultsPerPage": 200, "startIndex": index}
                 payload = await self._nvd_page(params, headers)
                 rows = payload["vulnerabilities"]
                 total_results = payload["totalResults"]
@@ -331,16 +352,19 @@ class Collector:
         if wait > 0:
             await asyncio.sleep(wait)
         self.nvd_next_request = time.monotonic() + (0.7 if headers else 6.1)
-        response = await self.http.get("https://services.nvd.nist.gov/rest/json/cves/2.0", params=params, headers=headers, cache=False)
-        payload = await asyncio.to_thread(read_json, response.path)
+        response = await self.http.get("https://services.nvd.nist.gov/rest/json/cves/2.0", params=params, headers=headers, cache=False, max_bytes=16 * 1024 * 1024)
+        payload = await asyncio.to_thread(_read_nvd_page, response.path)
         if (not isinstance(payload, dict) or not isinstance(payload.get("vulnerabilities"), list)
                 or any(type(payload.get(key)) is not int or payload[key] < 0
                        for key in ("totalResults", "startIndex", "resultsPerPage"))):
             raise ValueError("NVD API response lacks valid records and pagination metadata")
         rows, index = payload["vulnerabilities"], params["startIndex"]
-        if (payload["startIndex"] != index or payload["resultsPerPage"] != len(rows)
+        if (len(rows) > params["resultsPerPage"] or payload["startIndex"] != index or payload["resultsPerPage"] != len(rows)
                 or index + len(rows) > payload["totalResults"] or not rows and index < payload["totalResults"]):
             raise ValueError("NVD API returned an incomplete or inconsistent page; the current collection window was not completed")
+        ids = [row.get("cve", {}).get("id") if isinstance(row, dict) and isinstance(row.get("cve"), dict) else None for row in rows]
+        if any(not isinstance(value, str) or not re.fullmatch(r"CVE-\d{4}-\d{4,}", value) for value in ids) or len(set(ids)) != len(ids):
+            raise ValueError("NVD API returned invalid or duplicate CVE records")
         return payload
 
     async def _nvd_inventory(self):
@@ -354,7 +378,7 @@ class Collector:
         result = {"requests": 0, "advisories": 0, "completed_products": 0, "errors": []}
         headers = {"apiKey": self.config["nvd_api_key"]} if self.config.get("nvd_api_key") else {}
         budget = min(20, max(0, int(self.config.get("nvd_inventory_requests", 4))))
-        for cpe in sorted(targets, key=lambda key: (progress.get(key, {}).get("checked_at", ""), key)):
+        for cpe in sorted(targets, key=lambda key: (progress.get(key, {}).get("attempted_at", ""), key)):
             previous = progress.get(cpe, {})
             checked = previous.get("checked_at")
             if checked and now - datetime.fromisoformat(checked) < timedelta(days=7):
@@ -363,6 +387,7 @@ class Collector:
                 break
             index = int(previous.get("next_index", 0))
             result["requests"] += 1
+            progress[cpe] = {**previous, "attempted_at": now.isoformat()}
             try:
                 payload = await self._nvd_page({"virtualMatchString": cpe, "resultsPerPage": 200, "startIndex": index}, headers)
                 records = [parse_nvd(row["cve"]) for row in payload["vulnerabilities"]]
@@ -371,12 +396,13 @@ class Collector:
                 result["advisories"] += len(records)
                 next_index = index + len(records)
                 complete = next_index >= payload["totalResults"]
-                progress[cpe] = {"next_index": 0 if complete else next_index,
+                progress[cpe] = {"attempted_at": now.isoformat(), "next_index": 0 if complete else next_index,
                                  "checked_at": now.isoformat() if complete else ""}
                 await self.checkpoint("nvd", inventory_lookup=progress)
                 result["completed_products"] += int(complete)
             except Exception as error:
                 result["errors"].append("NVD inventory lookup: " + str(error)[:500])
+                await self.checkpoint("nvd", inventory_lookup=progress)
                 if isinstance(error, HTTPError) and error.status in {401, 403, 429}:
                     break
         return result
