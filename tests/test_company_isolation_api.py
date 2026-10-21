@@ -219,7 +219,7 @@ class CompanyIsolationAPITests(unittest.TestCase):
         self.stage({"entities": documents, "advisories": [{"id": "CVE-2026-12345",
                     "affected": [{"vendor": "postgresql", "product": "postgresql", "part": "a"}]}]})
         self.assertTrue(self.detail(self.acme)["observations"])
-        self.assertTrue(self.detail(self.acme)["alerts"])
+        self.assertEqual(self.detail(self.acme)["alerts"], [])
         self.assert_no_projection(self.nebula)
 
         self.profile("Nebula Labs", "example.org", company_id=self.nebula)
@@ -255,7 +255,7 @@ class CompanyIsolationAPITests(unittest.TestCase):
         self.stage({"entities": [self.article(self.acme, "example.com", "article:acme"),
                                   self.article(self.nebula, "example.org", "article:nebula")],
                     "advisories": [{"id": "CVE-2026-12345", "severity": 9.1,
-                                    "affected": [{"vendor": "postgresql", "product": "postgresql", "part": "a"}]}]})
+                                    "affected": [{"vendor": "postgresql", "product": "postgresql", "part": "a", "version": "14.1"}]}]})
         for domain in ("example.com", "example.org"):
             self.post("/api/observations", {"asset_url": "https://" + domain,
                       "vendor": "postgresql", "product": "postgresql", "version": "14.1",
@@ -289,7 +289,7 @@ class CompanyIsolationAPITests(unittest.TestCase):
         self.stage({"entities": [document], "advisories": [{"id": "CVE-2026-12345",
                     "affected": [{"vendor": "postgresql", "product": "postgresql", "part": "a"}]}]})
         self.assertTrue(self.detail(self.acme)["observations"])
-        self.assertTrue(self.detail(self.acme)["alerts"])
+        self.assertEqual(self.detail(self.acme)["alerts"], [])
         changed = copy.deepcopy(document)
         changed["source_url"] = "https://example.org/feed.xml"
         changed["metadata"]["company_context"]["domain"] = "example.org"

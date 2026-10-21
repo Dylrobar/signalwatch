@@ -275,8 +275,10 @@ class Engine:
         worker = StagingWorker(self.store, self.config)
         remaining = max(1, int(self.config.get("staging_max_records", 10000)))
         counts = {"claimed": 0, "processed": 0, "retried": 0, "dead": 0, "lease_lost": 0}
+        import time
+        deadline = time.monotonic() + 30
         while remaining:
-            limit = min(500, remaining)
+            limit = min(25, remaining)
             result = await to_thread(worker.drain, limit, reconcile=False)
             for key in counts:
                 counts[key] += int(result.get(key, 0))
@@ -285,6 +287,10 @@ class Engine:
             remaining -= claimed
             if claimed < limit:
                 break
+            if time.monotonic() >= deadline:
+                counts["budget_exhausted"] = True
+                break
+            await asyncio.sleep(0.05)
         return counts
 
     def busy(self):

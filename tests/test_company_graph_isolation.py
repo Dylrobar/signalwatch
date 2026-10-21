@@ -227,24 +227,17 @@ class CompanyGraphIsolationTests(unittest.TestCase):
         }], 'advisories': [{'id': 'CVE-2026-12345', 'source': 'nvd',
                            'affected': [{'vendor': 'postgresql', 'product': 'postgresql', 'part': 'a'}]}]})
         self.store.reconcile()
-        with self.store.connection() as conn:
-            alert = conn.execute("SELECT id FROM alerts WHERE asset_id='company:acme'").fetchone()[0]
-        self.assertIn(alert, {node['id'] for node in self.graph.graph('company:acme', 5)['nodes']})
-        risk = self.graph.company_risk('company:acme')
-        public_match = next(item for item in risk['items'] if item['id'] == alert)
-        self.assertEqual(public_match['evidence_basis'], 'company_public_text')
-        self.assertEqual(public_match['paths'][0][0]['relation'], 'public_text_match')
+        self.assertEqual(self.graph.company_risk('company:acme')['items'], [])
         self.assertEqual(self.graph.company_risk('company:nebula')['items'], [])
-        # A retained alert with mismatched provenance must not regain scope
-        # just because its asset_id still points at this company.
+        self.assertTrue(self.store.detail('company:acme')['observations'])
+        self.assertFalse(any(node['kind'] == 'alert' for node in self.graph.graph('company:acme', 5)['nodes']))
+        # Even an explicit version in public text cannot establish a deployment.
+        self.store.ingest({'advisories': [{'id': 'CVE-2026-12345', 'source': 'nvd',
+                           'affected': [{'vendor': 'postgresql', 'product': 'postgresql', 'version': '14.1'}]}]})
         with self.store.connection(write=True) as conn:
-            conn.execute("UPDATE alerts SET source_url='https://example.org/engineering' WHERE id=?", (alert,))
-        self.assertNotIn(alert, {node['id'] for node in self.graph.graph('company:acme', 5)['nodes']})
-        self.assertNotIn(alert, {item['id'] for item in self.graph.company_risk('company:acme')['items']})
-        with self.store.connection(write=True) as conn:
-            conn.execute("UPDATE alerts SET source_url='https://example.com/engineering' WHERE id=?", (alert,))
-            conn.execute("UPDATE observations SET origin='imported' WHERE asset_id='company:acme'")
-        self.assertNotIn(alert, {node['id'] for node in self.graph.graph('company:acme', 5)['nodes']})
+            conn.execute("UPDATE observations SET version='14.1' WHERE asset_id='company:acme'")
+        self.store.reconcile()
+        self.assertEqual(self.store.alerts()['items'], [])
 
 
 class NetworkSnapshotTests(unittest.TestCase):

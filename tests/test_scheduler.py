@@ -281,11 +281,11 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_staging_drain_batches_are_bounded_and_stop_when_available_work_is_exhausted(self):
         self.config["staging_max_records"] = 600
-        drain = Mock(side_effect=[{"claimed": 500, "processed": 500}, {"claimed": 40, "processed": 40}])
+        drain = Mock(side_effect=[{"claimed": 25, "processed": 25}, {"claimed": 10, "processed": 10}])
         with patch("signalwatch.ingestion.StagingWorker", return_value=SimpleNamespace(drain=drain)):
             counts = await self.engine._drain_staging()
-        self.assertEqual(counts["processed"], 540)
-        self.assertEqual(drain.call_args_list, [call(500, reconcile=False), call(100, reconcile=False)])
+        self.assertEqual(counts["processed"], 35)
+        self.assertEqual(drain.call_args_list, [call(25, reconcile=False), call(25, reconcile=False)])
 
     def test_default_interval_catalog_and_invalid_provider_success(self):
         for name in ("news", "threat"):

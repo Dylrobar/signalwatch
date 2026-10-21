@@ -6,7 +6,7 @@ from .cors import PREVIEW_ORIGINS
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "0.20.9"
+VERSION = "0.21.0"
 
 
 DEFAULTS = {

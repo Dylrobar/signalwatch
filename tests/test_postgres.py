@@ -64,6 +64,14 @@ class PostgresContractMixin:
 
 @unittest.skipUnless(TEST_URL, 'Set SIGNALWATCH_TEST_POSTGRES_URL for real PostgreSQL tests')
 class PostgresMigrationTests(unittest.TestCase):
+    def test_read_statement_timeout_does_not_affect_subsequent_connections(self):
+        store = Store(self.target)
+        with self.assertRaises(TimeoutError):
+            with store.connection(read_timeout=0.02) as conn:
+                conn.execute('SELECT pg_sleep(0.2)').fetchone()
+        with store.connection() as conn:
+            self.assertEqual(conn.execute('SELECT 1').fetchone()[0], 1)
+
     def setUp(self):
         self.environment = PostgresEnvironment()
         self.addCleanup(self.environment.cleanup)
@@ -85,7 +93,8 @@ class PostgresMigrationTests(unittest.TestCase):
             'edges': [{'from_id': 'company:acme', 'to_id': 'domain:acme.test', 'relation': 'official_website'}]})
         self.source.ingest({'entities': [posting('We use PostgreSQL in production.')],
             'advisories': [{'id': 'CVE-2026-12345', 'title': 'PostgreSQL vulnerability',
-                            'affected': [{'vendor': 'postgresql', 'product': 'postgresql', 'version': '*'}]}],
+                            'affected': [{'vendor': 'postgresql', 'product': 'postgresql', 'version': '14.1'}]}],
+            'observations': [{'asset_id': 'domain:acme.test', 'vendor': 'postgresql', 'product': 'postgresql', 'version': '14.1', 'source_url': 'https://acme.test/inventory'}],
             'articles': [{'url': 'https://news.example/report', 'title': 'PostgreSQL vulnerability', 'cves': ['CVE-2026-12345']}],
             'kev': [{'cveID': 'CVE-2026-12345'}]})
         self.source.reconcile()
@@ -307,6 +316,7 @@ class PostgresConfigurationTests(unittest.TestCase):
 # SQLite VM profiling, journal settings and inode-lock mechanics remain tested
 # in the SQLite suite; native locking/migration assertions are above.
 CONTRACTS = {
+    'test_priority_evidence': ('VerifiedPriorityTests',),
     'test_companies': ('CompanyTests',),
     'test_staging': ('StagingTests',),
     'test_technographic_store': ('TechnographicStoreTests',),

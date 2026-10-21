@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from signalwatch.store import SCHEMA, Store
+from signalwatch.reviews import ensure_schema as ensure_review_schema
 from signalwatch.technographic_constraints import ensure_constraints
 from signalwatch.technographic_store import SCHEMA as TECH_SCHEMA
 
@@ -16,6 +17,7 @@ class TechnographicConstraintsTests(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         self.addCleanup(self.conn.close)
         self.conn.executescript(SCHEMA + TECH_SCHEMA)
+        ensure_review_schema(self.conn)
         for name, kind in (("company:a", "company"), ("company:b", "company"), ("domain:x", "domain"),
                            ("raw:a", "job_posting"), ("raw:b", "job_posting"), ("raw:shared", "job_posting")):
             self.conn.execute("INSERT INTO entities(id,kind,name,value,updated_at) VALUES(?,?,?,?,?)", (name, kind, name, name, "now"))
