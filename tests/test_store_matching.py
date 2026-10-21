@@ -29,7 +29,7 @@ class VersionTests(unittest.TestCase):
         self.assertTrue(github_version_match("1.5.0", affected)[0])
         self.assertFalse(github_version_match("2.0.0", affected)[0])
         affected["version_range"] = "< 1.2.0 || >= 2.0.0"
-        self.assertEqual(github_version_match("1.5.0", affected)[1], "version_unverified")
+        self.assertFalse(github_version_match("1.5.0", affected)[0])
         self.assertEqual(ecosystem_identity("pip"), ecosystem_identity("PyPI"))
         self.assertEqual(ecosystem_identity("Rust"), ecosystem_identity("crates.io"))
 
@@ -171,6 +171,37 @@ class StoreTests(unittest.TestCase):
         filtered = self.store.alerts(group_by="advisory", version_state="affected_range")
         self.assertTrue(all(row["asset_count"] == 1 for row in filtered["items"]))
         self.assertEqual(self.store.alerts(q="asset:0", group_by="advisory")["items"][0]["asset_count"], 1)
+
+    def test_nvd_lookup_targets_require_matching_explicit_cpe_identity(self):
+        self.store.ingest({"observations": [
+            self.observation(cpe="cpe:2.3:a:acme:edge_router:1.5:*:*:*:*:*:*:*"),
+            self.observation(asset_id="asset:second", cpe="cpe:2.3:a:acme:edge_router:1.6:*:*:*:*:*:*:*"),
+            self.observation(asset_id="asset:no-cpe", vendor="other", product="different"),
+            self.observation(asset_id="asset:unknown-version", vendor="other", product="unknown", version=None,
+                             cpe="cpe:2.3:a:other:unknown:*:*:*:*:*:*:*:*"),
+            self.observation(asset_id="asset:mismatch", vendor="mismatch", cpe="cpe:2.3:a:another:product:*:*:*:*:*:*:*:*"),
+            self.observation(asset_id="asset:escaped", product="edge:router", cpe=r"cpe:2.3:a:acme:edge\:router:*:*:*:*:*:*:*:*"),
+        ]})
+        self.assertEqual(self.store.nvd_product_targets(), [r"cpe:2.3:a:acme:edge\:router:*:*:*:*:*:*:*:*",
+                                                          "cpe:2.3:a:acme:edge_router:*:*:*:*:*:*:*:*"])
+
+    def test_native_cve_status_rules_match_then_clear_patched_version(self):
+        from signalwatch.cve_program import parse_cve5
+        from test_cve_program import cve_record
+        record = cve_record()
+        product = record["containers"]["cna"]["affected"][0]
+        product["versions"] = [{"version": "1.0.0", "lessThan": "2.0.0", "versionType": "semver", "status": "affected",
+                                "changes": [{"at": "1.5.0", "status": "unaffected"}]}]
+        observation = self.observation(vendor="vendor", product="device", part="h", version="1.4.0")
+        nvd = self.advisory(id="CVE-2026-12345", affected=[{"vendor": "vendor", "product": "device", "part": "h",
+                            "versionStartIncluding": "1.0.0", "versionEndExcluding": "1.5.0"}])
+        self.store.ingest({"advisories": [nvd, parse_cve5(record)], "observations": [observation]})
+        self.store.reconcile()
+        warning = self.store.alerts()["items"][0]
+        self.assertEqual(warning["version_state"], "affected_range")
+        self.store.ingest({"observations": [{**observation, "version": "1.5.0"}]})
+        self.assertEqual(self.store.reconcile()["removed"], 1)
+        self.assertEqual(self.store.alerts()["total"], 0)
 
     def test_patched_observation_removes_alert(self):
         self.store.ingest({"advisories": [self.advisory()], "observations": [self.observation()]})

@@ -49,8 +49,11 @@ def parse_cve5(record):
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 10:
                     scores.append(float(value))
         for product in container.get("affected", []):
-            versions = product.get("versions", [])
-            if product.get("defaultStatus") != "affected" and not any(item.get("status") == "affected" for item in versions):
+            versions = product.get("versions") or []
+            has_affected_status = any(isinstance(item, dict) and (
+                item.get("status") == "affected" or any(isinstance(change, dict) and change.get("status") == "affected"
+                    for change in (item.get("changes") or []))) for item in versions)
+            if product.get("defaultStatus") != "affected" and not has_affected_status:
                 continue
             identities = []
             for cpe in product.get("cpes", []):
