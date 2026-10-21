@@ -81,6 +81,9 @@ a historical confirmation is not a current risk determination.
 
 ## Render performance controls
 
+- Company-risk polling no longer loads or reparses ATS/article documents. Graph
+  attribution hydrates at most one source document at a time instead of retaining
+  up to 1,000 full documents in a list.
 - Graph, company-risk and intelligence HTTP reads share at most two expensive
   computations per API process. Identical in-flight reads coalesce. Excess work
   returns JSON 503 with Retry-After: 3, rather than creating an unbounded backlog.

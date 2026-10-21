@@ -24,6 +24,10 @@ class VerifiedPriorityTests(unittest.TestCase):
 
     def test_verification_promotes_owned_asset_and_mutation_invalidates_snapshot(self):
         company, _, warning = self.fixture()
+        from unittest.mock import patch
+        graph = KnowledgeGraph(self.store)
+        with patch.object(graph, 'company_scope', side_effect=AssertionError('Risk polling must not parse public documents')):
+            self.assertTrue(graph.company_risk(company)['items'])
         before = self.client.get('/api/company-risk', params={'id': company}).json()['items'][0]['risk']
         self.assertLess(before['score'], 85)
         response = self.client.post('/api/reviews', json=self.payload(company, warning))

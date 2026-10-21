@@ -156,13 +156,13 @@ class KnowledgeGraph:
         assets, truncated = company_assets(conn, company_id)
         coverage['truncated'] |= truncated
         evidence, documents = set(), set()
-        rows = conn.execute("""SELECT DISTINCT e.* FROM entities e WHERE e.id IN (
+        rows = conn.execute("""SELECT DISTINCT e.id FROM entities e WHERE e.id IN (
          SELECT source_entity_id FROM technographic_sources WHERE organization_id=?
          UNION SELECT to_id FROM edges WHERE from_id=? AND relation IN ('has_public_evidence','candidate_evidence','registry_candidate'))
          ORDER BY e.id LIMIT 1001""", (company_id, company_id)).fetchall()
         coverage['truncated'] |= len(rows) > 1000
         for row in rows[:1000]:
-            entity = dict(row)
+            entity = dict(conn.execute("SELECT * FROM entities WHERE id=?", (row["id"],)).fetchone())
             entity['metadata'] = json.loads(entity['metadata'])
             doc = document_input(entity)
             if doc is not None:
@@ -371,10 +371,8 @@ class KnowledgeGraph:
             results, contexts = {}, []
             total=0
             for cid,group_path in groups:
-                scope_coverage = {'truncated': False}
-                scope = self.company_scope(conn, cid, scope_coverage)
-                assets = list(scope['assets'].values())
-                truncated |= scope_coverage['truncated']
+                assets, assets_truncated = company_assets(conn, cid)
+                truncated |= assets_truncated
                 included = [a for a in assets if a['included']]
                 contexts.extend({'company_id':cid,**a} for a in assets if not a['included'])
                 ids=[a['id'] for a in included]
