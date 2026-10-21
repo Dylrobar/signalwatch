@@ -451,8 +451,10 @@ def create_app(config, auto_collect=True):
 
     @app.get("/api/alerts")
     def alerts(q: str = "", limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0), kev: bool = False,
-               version_state: Literal["", "exact", "affected_range", "unknown", "version_unverified"] = "", sort: Literal["rank", "newest"] = "rank"):
-        return store.alerts(q, limit, offset, kev=kev, version_state=version_state, sort=sort)
+               version_state: Literal["", "exact", "affected_range", "unknown", "version_unverified"] = "", sort: Literal["rank", "newest"] = "rank",
+               group_by: Literal["", "advisory"] = "", advisory_id: str = ""):
+        return store.alerts(q, limit, offset, kev=kev, version_state=version_state, sort=sort,
+                            group_by=group_by, advisory_id=advisory_id)
 
     @app.get("/api/articles")
     def articles(q: str = "", limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
@@ -736,10 +738,10 @@ def create_app(config, auto_collect=True):
 
     @app.get("/api/export")
     def export(kind: str = "advisories", q: str = "", entity_kind: str = "", kev: bool = False,
-               version_state: Literal["", "exact", "affected_range", "unknown", "version_unverified"] = "", sort: Literal["rank", "newest"] = "rank", event_kind: EventKind = ""):
+               version_state: Literal["", "exact", "affected_range", "unknown", "version_unverified"] = "", sort: Literal["rank", "newest"] = "rank", event_kind: EventKind = "", advisory_id: str = ""):
         methods = {"entities": lambda offset: store.search(q, entity_kind, 500, offset),
                    "advisories": lambda offset: store.advisories(q, kev, 500, offset, sort=sort),
-                   "alerts": lambda offset: store.alerts(q, 500, offset, kev=kev, version_state=version_state, sort=sort),
+                   "alerts": lambda offset: store.alerts(q, 500, offset, kev=kev, version_state=version_state, sort=sort, advisory_id=advisory_id),
                    "articles": lambda offset: store.articles(q, 500, offset),
                    "events": lambda offset: store.events(q, event_kind, 500, offset)}
         if kind not in methods:

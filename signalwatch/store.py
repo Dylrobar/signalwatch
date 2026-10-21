@@ -945,12 +945,17 @@ class Store:
         with self.connection() as conn:
             return self._page(conn, ADVISORY_TABLE, " AND ".join(filters), values, order, limit, offset, ADVISORY_SELECT)
 
-    def alerts(self, q="", limit=50, offset=0, *, kev=False, version_state="", sort="rank"):
+    def alerts(self, q="", limit=50, offset=0, *, kev=False, version_state="", sort="rank", group_by="", advisory_id=""):
         if sort not in {"rank", "newest"}:
             raise ValueError("Invalid alert sort")
         if version_state not in {"", "exact", "affected_range", "unknown", "version_unverified"}:
             raise ValueError("Invalid version state")
+        if group_by not in {"", "advisory"}:
+            raise ValueError("Invalid alert grouping")
         filters, values = [], []
+        if advisory_id:
+            filters.append("a.advisory_id=?")
+            values.append(identifier(advisory_id))
         if q:
             filters.append("(a.advisory_id LIKE ? OR a.title LIKE ? OR e.name LIKE ? OR a.product LIKE ? OR a.vendor LIKE ?)")
             values.extend(["%" + q + "%"] * 5)
@@ -961,6 +966,21 @@ class Store:
             values.append(version_state)
         order = "a.rank DESC,a.last_seen DESC,a.id" if sort == "rank" else "a.first_seen DESC,a.rank DESC,a.id"
         with self.connection() as conn:
+            if group_by == "advisory":
+                where = " WHERE " + " AND ".join(filters) if filters else ""
+                # Group before pagination: one CVE cannot occupy successive pages.
+                grouped = """(SELECT a.*,e.name AS asset_name,e.kind AS asset_kind,
+                    count(*) OVER (PARTITION BY a.advisory_id) AS asset_count,
+                    sum(CASE WHEN a.version_state IN ('exact','affected_range') THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY a.advisory_id) AS version_matched_assets,
+                    row_number() OVER (PARTITION BY a.advisory_id ORDER BY
+                        CASE a.version_state WHEN 'exact' THEN 3 WHEN 'affected_range' THEN 2
+                            WHEN 'version_unverified' THEN 1 ELSE 0 END DESC,
+                        a.confidence DESC,a.rank DESC,a.id) AS group_row
+                    FROM alerts a LEFT JOIN entities e ON e.id=a.asset_id""" + where + ") a"
+                result = self._page(conn, grouped, "a.group_row=1", values, order, limit, offset)
+                result["group_by"] = "advisory"
+                return result
             return self._page(conn, "alerts a LEFT JOIN entities e ON e.id=a.asset_id", " AND ".join(filters), values, order, limit, offset, "a.*,e.name AS asset_name,e.kind AS asset_kind")
 
     def events(self, q="", kind="", limit=50, offset=0):

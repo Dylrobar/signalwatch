@@ -152,6 +152,26 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.events(kind="warning_opened")["total"], 0)
         self.assertEqual(self.store.reconcile()["alerts"], 2)
 
+    def test_alert_groups_paginate_advisories_and_preserve_asset_drilldown(self):
+        self.store.ingest({"advisories": [self.advisory(), self.advisory(id="CVE-2025-123456")],
+                           "observations": [self.observation(asset_id="asset:" + str(i), version="1.5" if i == 0 else None)
+                                            for i in range(105)]})
+        self.store.reconcile()
+        page = self.store.alerts(group_by="advisory", limit=1)
+        self.assertEqual(page["total"], 2)
+        group = page["items"][0]
+        self.assertEqual(group["asset_count"], 105)
+        self.assertEqual(group["version_matched_assets"], 1)
+        self.assertEqual(group["version_state"], "affected_range")
+        next_page = self.store.alerts(group_by="advisory", limit=1, offset=1)
+        self.assertNotEqual(group["advisory_id"], next_page["items"][0]["advisory_id"])
+        detail = self.store.alerts(advisory_id="cve-2025-12345", limit=500)
+        self.assertEqual(detail["total"], 105)
+        self.assertTrue(all(row["advisory_id"] == "CVE-2025-12345" for row in detail["items"]))
+        filtered = self.store.alerts(group_by="advisory", version_state="affected_range")
+        self.assertTrue(all(row["asset_count"] == 1 for row in filtered["items"]))
+        self.assertEqual(self.store.alerts(q="asset:0", group_by="advisory")["items"][0]["asset_count"], 1)
+
     def test_patched_observation_removes_alert(self):
         self.store.ingest({"advisories": [self.advisory()], "observations": [self.observation()]})
         self.store.reconcile()
