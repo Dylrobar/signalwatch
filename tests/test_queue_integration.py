@@ -224,10 +224,6 @@ class QueueIntegrationTests(unittest.TestCase):
         self.assertEqual(completed["result"]["sources"], [])
         self.assertEqual(len(self.request("/api/jobs")["jobs"]), 1)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_prefork_recycles_after_task_limit_and_continues_processing(self):
         from celery import Celery
         from signalwatch.celery_app import app
@@ -247,3 +243,7 @@ if __name__ == "__main__":
             self.assertEqual(self.wait_job(accepted["job"]["id"])["attempts"], 1)
         finally:
             client.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
