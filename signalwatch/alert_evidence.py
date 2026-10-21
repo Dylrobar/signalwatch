@@ -19,7 +19,7 @@ class EvidenceIndex:
     def observations(self, asset_id):
         if asset_id not in self.inventory:
             self.inventory[asset_id] = [dict(row) for row in self.conn.execute(
-                "SELECT * FROM observations WHERE asset_id=? ORDER BY observed_at DESC,id", (asset_id,))]
+                "SELECT id,asset_id,vendor,product,part,version,cpe FROM observations WHERE asset_id=? ORDER BY observed_at DESC,id", (asset_id,))]
         return self.inventory[asset_id]
 
     def document(self, asset_id, document_id):
@@ -102,7 +102,7 @@ class EvidenceIndex:
                     host = None
                 sources.add("origin:" + (host or item["source_url"] or item["id"]))
         factors = ["Exact normalized vendor, product and CPE part are required.",
-                   "Confidence is the strongest retained observation; corroboration does not inflate it.",
+                   "Confidence describes the selected observation, prioritizing verified version matches; corroboration does not inflate it.",
                    "Source count deduplicates syndicated document content and HTTP origins; it is not a probability of independence.",
                    "Version assessment: " + record["version_state"] + "."]
         if any(item["kind"] == "public_text_assertion" for item in supporting):

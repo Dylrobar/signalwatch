@@ -678,6 +678,34 @@ class Store:
         return counts
 
     def reconcile(self, *, asset_ids=None, conn=None):
+        """Reconcile one asset at a time, atomically across the requested scope.
+
+        Include existing alert assets so removing the last observation still
+        clears its warnings. Page IDs rather than retaining all joined evidence.
+        """
+        totals = dict(evaluated=0, alerts=0, removed=0, previous=0)
+        with self.connection(write=True) if conn is None else nullcontext(conn) as conn:
+            if asset_ids is None:
+                def all_asset_ids():
+                    after = None
+                    while True:
+                        query = "SELECT asset_id FROM (SELECT asset_id FROM observations UNION SELECT asset_id FROM alerts) assets"
+                        rows = conn.execute(query + (" WHERE asset_id>?" if after is not None else "") +
+                                            " ORDER BY asset_id LIMIT 100", (() if after is None else (after,))).fetchall()
+                        if not rows:
+                            return
+                        yield from (row["asset_id"] for row in rows)
+                        after = rows[-1]["asset_id"]
+                ids = all_asset_ids()
+            else:
+                ids = iter(sorted(set(asset_ids)))
+            for asset_id in ids:
+                result = self._reconcile_asset(asset_ids=(asset_id,), conn=conn)
+                for key in totals:
+                    totals[key] += result[key]
+        return totals
+
+    def _reconcile_asset(self, *, asset_ids, conn):
         from .alert_evidence import EvidenceIndex
         from .applicability import ensure_schema, evaluate
 
@@ -740,7 +768,7 @@ class Store:
                 key = (row["asset_id"], row["canonical_id"])
                 previous = candidates.get(key)
                 strengths = {"exact": 3, "affected_range": 2, "version_unverified": 1, "unknown": 0}
-                if previous is None or (record["confidence"], strengths[state], record["rank"], record["observed_at"]) > (previous["confidence"], strengths[previous["version_state"]], previous["rank"], previous["observed_at"]):
+                if previous is None or (strengths[state], record["confidence"], record["rank"], record["observed_at"]) > (strengths[previous["version_state"]], previous["confidence"], previous["rank"], previous["observed_at"]):
                     candidates[key] = record
             for key, record in candidates.items():
                 record["assessment"]["evidence"] = evidence_index.assessment(key, record)
@@ -917,12 +945,17 @@ class Store:
         with self.connection() as conn:
             return self._page(conn, ADVISORY_TABLE, " AND ".join(filters), values, order, limit, offset, ADVISORY_SELECT)
 
-    def alerts(self, q="", limit=50, offset=0, *, kev=False, version_state="", sort="rank"):
+    def alerts(self, q="", limit=50, offset=0, *, kev=False, version_state="", sort="rank", group_by="", advisory_id=""):
         if sort not in {"rank", "newest"}:
             raise ValueError("Invalid alert sort")
         if version_state not in {"", "exact", "affected_range", "unknown", "version_unverified"}:
             raise ValueError("Invalid version state")
+        if group_by not in {"", "advisory"}:
+            raise ValueError("Invalid alert grouping")
         filters, values = [], []
+        if advisory_id:
+            filters.append("a.advisory_id=?")
+            values.append(identifier(advisory_id))
         if q:
             filters.append("(a.advisory_id LIKE ? OR a.title LIKE ? OR e.name LIKE ? OR a.product LIKE ? OR a.vendor LIKE ?)")
             values.extend(["%" + q + "%"] * 5)
@@ -933,6 +966,21 @@ class Store:
             values.append(version_state)
         order = "a.rank DESC,a.last_seen DESC,a.id" if sort == "rank" else "a.first_seen DESC,a.rank DESC,a.id"
         with self.connection() as conn:
+            if group_by == "advisory":
+                where = " WHERE " + " AND ".join(filters) if filters else ""
+                # Group before pagination: one CVE cannot occupy successive pages.
+                grouped = """(SELECT a.*,e.name AS asset_name,e.kind AS asset_kind,
+                    count(*) OVER (PARTITION BY a.advisory_id) AS asset_count,
+                    sum(CASE WHEN a.version_state IN ('exact','affected_range') THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY a.advisory_id) AS version_matched_assets,
+                    row_number() OVER (PARTITION BY a.advisory_id ORDER BY
+                        CASE a.version_state WHEN 'exact' THEN 3 WHEN 'affected_range' THEN 2
+                            WHEN 'version_unverified' THEN 1 ELSE 0 END DESC,
+                        a.confidence DESC,a.rank DESC,a.id) AS group_row
+                    FROM alerts a LEFT JOIN entities e ON e.id=a.asset_id""" + where + ") a"
+                result = self._page(conn, grouped, "a.group_row=1", values, order, limit, offset)
+                result["group_by"] = "advisory"
+                return result
             return self._page(conn, "alerts a LEFT JOIN entities e ON e.id=a.asset_id", " AND ".join(filters), values, order, limit, offset, "a.*,e.name AS asset_name,e.kind AS asset_kind")
 
     def events(self, q="", kind="", limit=50, offset=0):
